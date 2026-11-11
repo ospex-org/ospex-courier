@@ -4,6 +4,7 @@ import pg from 'pg';
 import { LOOPBACK_HOSTS } from '../config';
 import { createConditions, type Conditions } from './conditions';
 import { createEvents, type Events } from './events';
+import { createGames, createOrders, type Games, type Orders } from './orders';
 import { createRuns, type Runs } from './runs';
 
 // The courier's own Postgres (db/schema.sql): how it is reached, and the
@@ -180,14 +181,36 @@ export const COLUMNS_USED: ReadonlyArray<readonly [table: string, column: string
   ['conditions', 'facts'],
   ['orders', 'hash'],
   ['orders', 'role'],
+  ['orders', 'account'],
   ['orders', 'game_id'],
   ['orders', 'scorer'],
   ['orders', 'line_ticks'],
-  ['orders', 'side'],
+  ['orders', 'position_type'],
   ['orders', 'odds_tick'],
+  ['orders', 'risk_amount'],
+  ['orders', 'nonce'],
   ['orders', 'expiry'],
+  ['orders', 'min_fill'],
+  ['orders', 'signature'],
+  ['orders', 'market_key'],
+  ['orders', 'side'],
   ['orders', 'record_number'],
+  ['orders', 'received_at'],
+  ['orders', 'received_block'],
+  ['orders', 'received_hash'],
   ['orders', 'ended'],
+  ['orders', 'ended_at'],
+  ['orders', 'bet_state'],
+  ['stops', 'hash'],
+  ['accounts', 'account'],
+  ['accounts', 'budget'],
+  ['accounts', 'budget_at'],
+  ['accounts', 'refused'],
+  ['accounts', 'last_refused_at'],
+  ['games', 'game_id'],
+  ['games', 'start'],
+  ['games', 'reporters_published'],
+  ['games', 'start_unreadable_at'],
 ];
 
 /** The tables the schema makes, all of which must exist. */
@@ -206,11 +229,14 @@ export async function missingSchema(pool: pg.Pool): Promise<string[]> {
   return missing;
 }
 
-export interface LiveMarketRow {
-  scorer: string;
-  lineTicks: number;
-  side: number;
-  live: number;
+/** A table's size and its rows, as the database reports them: the estimate of rows the planner keeps, and the bytes with indexes. */
+export interface TableFigures {
+  table: string;
+  /** The planner's estimate of live rows, refreshed by analyze; -1 before the first. */
+  rowsEstimated: number;
+  bytesWithIndexes: number;
+  /** bytesWithIndexes over the rows, where there are rows enough for the figure to mean anything (1,000 or more); else null. */
+  bytesPerRow: number | null;
 }
 
 export interface Store {
@@ -218,19 +244,16 @@ export interface Store {
   runs: Runs;
   events: Events;
   conditions: Conditions;
+  orders: Orders;
+  games: Games;
   /** The database's size in bytes, as the database reports it. */
   databaseSize(): Promise<number>;
   /** The number of the newest report line (a condition's opening or clearing, or an incident), or null. */
   newestReportLine(): Promise<number | null>;
-  /**
-   * The markets of a game that hold a live quote, with how many live quotes
-   * each side has within the bound of rows read, and whether the bound ended
-   * the count. Live: a resting order not marked ended whose expiry is past
-   * the block's time plus one. This build's book is empty; the read is here
-   * so the book has an address, and its index and its cost are the orders
-   * build's to make and measure.
-   */
-  liveMarkets(gameId: bigint, blockTime: bigint, bound: number): Promise<{ markets: LiveMarketRow[]; boundReached: boolean }>;
+  /** The orders table's maintenance settings, as the database holds them (pg_class.reloptions). */
+  maintenance(): Promise<Record<string, string>>;
+  /** The size and rows of the tables that grow with every admitted request. */
+  growth(): Promise<TableFigures[]>;
   close(): Promise<void>;
 }
 
@@ -245,6 +268,8 @@ export function createStore(pool: pg.Pool, log: (line: string) => void = () => u
     runs: createRuns(pool),
     events: createEvents(pool),
     conditions: createConditions(pool),
+    orders: createOrders(pool),
+    games: createGames(),
     async databaseSize() {
       const { rows } = await pool.query<{ size: string }>('SELECT pg_database_size(current_database())::text AS size');
       return Number(rows[0]?.size ?? '0');
@@ -254,23 +279,27 @@ export function createStore(pool: pg.Pool, log: (line: string) => void = () => u
       const n = rows[0]?.number;
       return n === null || n === undefined ? null : Number(n);
     },
-    async liveMarkets(gameId, blockTime, bound) {
-      const { rows } = await pool.query<{ scorer: string; line_ticks: number; side: number; live: string; read: string }>(
-        `WITH read AS (
-           SELECT scorer, line_ticks, side
-           FROM orders
-           WHERE role = 'rest' AND ended IS NULL AND game_id = $1 AND expiry > $2
-           ORDER BY record_number
-           LIMIT $3
-         )
-         SELECT scorer, line_ticks, side, count(*)::text AS live, (SELECT count(*) FROM read)::text AS read
-         FROM read GROUP BY scorer, line_ticks, side ORDER BY scorer, line_ticks, side`,
-        [gameId.toString(), (blockTime + 1n).toString(), bound],
+    async maintenance() {
+      const { rows } = await pool.query<{ reloptions: string[] | null }>(`SELECT reloptions FROM pg_class WHERE relname = 'orders' AND relkind = 'r'`);
+      const out: Record<string, string> = {};
+      for (const option of rows[0]?.reloptions ?? []) {
+        const i = option.indexOf('=');
+        if (i > 0) out[option.slice(0, i)] = option.slice(i + 1);
+      }
+      return out;
+    },
+    async growth() {
+      const { rows } = await pool.query<{ table: string; rows: string; bytes: string }>(
+        `SELECT c.relname AS table, c.reltuples::text AS rows, pg_total_relation_size(c.oid)::text AS bytes
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = current_schema() AND c.relkind = 'r' AND c.relname IN ('orders', 'events', 'stops', 'crosses', 'legs', 'accounts')
+         ORDER BY c.relname`,
       );
-      return {
-        markets: rows.map((r) => ({ scorer: r.scorer, lineTicks: r.line_ticks, side: r.side, live: Number(r.live) })),
-        boundReached: rows.length > 0 && Number(rows[0]?.read) >= bound,
-      };
+      return rows.map((r) => {
+        const estimated = Math.round(Number(r.rows));
+        const bytes = Number(r.bytes);
+        return { table: r.table, rowsEstimated: estimated, bytesWithIndexes: bytes, bytesPerRow: estimated >= 1000 ? Math.round(bytes / estimated) : null };
+      });
     },
     async close() {
       await pool.end();

@@ -92,6 +92,27 @@ CREATE INDEX IF NOT EXISTS orders_live_quotes_per_account
   ON orders (account, market_key, side, expiry DESC)
   WHERE role = 'rest' AND ended IS NULL;
 
+-- The table's maintenance, set from the measurement (docs/COST.md). The mark of an expired quote, a stop or a
+-- fill leaves a dead version in the table and an entry in the index until vacuum removes them, and a scan along
+-- the book's index visits the dead entries that stand in its range ahead of the rows it returns. At Postgres's
+-- defaults a table is due for vacuum once its dead versions pass 50 plus a fifth of its rows, which is a number
+-- history sets: the dead a scan can meet would grow with the orders kept. Here the table is due once 2,000 dead
+-- versions have gathered, whatever its size: the bound of rows one request is returned, and so the most one
+-- request marks. The threshold is when the table becomes due, not a ceiling on its dead versions: autovacuum's
+-- workers can be busy elsewhere, and a version an older transaction can still see is not removed until it
+-- cannot. And a vacuum left to itself skips the indexes when the dead items are under two per cent of the
+-- table's pages, which at 2,000 dead on a table of some hundred thousand rows is every time, so the dead index
+-- entries a scan visits would stand through vacuum after vacuum; vacuum_index_cleanup = on makes each vacuum of
+-- this table clean its indexes, which is where the scan's cost lives. The status address serves these settings
+-- as the database holds them.
+ALTER TABLE orders SET (
+  autovacuum_vacuum_threshold = 2000,
+  autovacuum_vacuum_scale_factor = 0,
+  autovacuum_analyze_threshold = 2000,
+  autovacuum_analyze_scale_factor = 0,
+  vacuum_index_cleanup = on
+);
+
 -- ──────────────────────────── stops ───────────────────────────────────────
 -- One row per order hash a stop stopped, keyed by the hash: the account, the
 -- stop message as received and its signature, the time; for a stop recorded
