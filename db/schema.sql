@@ -92,6 +92,14 @@ CREATE INDEX IF NOT EXISTS orders_live_quotes_per_account
   ON orders (account, market_key, side, expiry DESC)
   WHERE role = 'rest' AND ended IS NULL;
 
+-- The door's count of the bets waiting their turn (two an account, 32 in all), and later the pre-check's next bet:
+-- the bets not yet final, in record order. The count is of rows returned along this index, bounded by the counts it
+-- enforces; without it the count would be a scan of every order ever kept, and the plan has a post, a bet and a
+-- read each go through an index made for the lookup.
+CREATE INDEX IF NOT EXISTS orders_bets_waiting
+  ON orders (record_number)
+  WHERE role = 'take' AND bet_state IN ('waiting', 'held') AND ended IS NULL;
+
 -- The table's maintenance, set from the measurement (docs/COST.md). The mark of an expired quote, a stop or a
 -- fill leaves a dead version in the table and an entry in the index until vacuum removes them, and a scan along
 -- the book's index visits the dead entries that stand in its range ahead of the rows it returns. At Postgres's

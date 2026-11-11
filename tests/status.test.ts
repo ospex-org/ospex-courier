@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import { openPool } from '../courier/records/store';
 import { get } from './support/courier';
+import { orderOn, postOrder } from './support/orders';
 import { startStack, type Stack } from './support/stack';
 
 // The status address and the conditions it can see in this build: the chain
@@ -77,6 +78,17 @@ test('with the database stopped, the status answers 503 and claims nothing; /rea
     assert.equal((await get(url, '/readyz')).status, 503);
     assert.equal((await get(url, '/v1/runs')).status, 503);
     assert.deepEqual((await get(url, '/healthz')).body, { ok: true });
+    // The book and the door say the same, and neither claims a record: nothing was written.
+    const book = await get(url, `/v1/book?gameId=${stack.rig.gameId}`);
+    assert.equal(book.status, 503, JSON.stringify(book.body));
+    assert.equal(book.body.code, 'DATABASE_UNREADABLE');
+    const market = await get(url, `/v1/book?gameId=${stack.rig.gameId}&scorer=${stack.rig.addresses.moneyline}&lineTicks=0`);
+    assert.equal(market.body.code, 'DATABASE_UNREADABLE');
+    const T = await stack.rig.time();
+    const posted = await postOrder(url, stack.rig, stack.rig.accounts.maker, 'rest', orderOn(stack.rig, stack.rig.accounts.maker, { expiry: T + 600n }));
+    assert.equal(posted.status, 503, JSON.stringify(posted.body));
+    assert.equal(posted.body.code, 'DATABASE_UNREADABLE');
+    assert.match(String(posted.body.error), /nothing was recorded/);
   } finally {
     stack.dbRelay.restore();
   }

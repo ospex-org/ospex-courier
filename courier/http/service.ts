@@ -148,8 +148,10 @@ export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, 
     handle(req, res).catch((err: unknown) => {
       const node = describeNodeFailure(err);
       const code = failureCode(err);
+      // Logged by class and code; nothing is recorded, and the answer does not say otherwise. The one failure the
+      // courier records as its own fault is the door's hash mismatch, which the door writes itself.
       deps.log(`request ${req.method ?? ''} ${(req.url ?? '').split('?')[0] ?? ''} failed: ${node.kind}${code === undefined ? '' : ` (${code})`}`);
-      if (!res.headersSent) send(res, refusal(500, 'INTERNAL_ERROR', 'The courier failed on this request; it is recorded as its own fault.'));
+      if (!res.headersSent) send(res, refusal(500, 'INTERNAL_ERROR', 'The courier failed on this request.'));
       else res.destroy();
     });
   };

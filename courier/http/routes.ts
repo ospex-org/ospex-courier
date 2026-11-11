@@ -2,11 +2,15 @@ import { getAddress, isAddress, type Address, type Hex } from 'viem';
 import { readGameBook, readMarketBook } from '../book/read';
 import { ChainUnreachable } from '../chain/snapshot';
 import { orderRecord, postOrder } from '../orders/door';
+import { failureCode } from '../records/store';
 import { DatabaseUnreadable, status, type StatusDeps } from '../status/status';
 import { BOUNDS } from './limits';
 
 // The routes, each answering with a status and a body. A refusal is {error,
-// code}: a plain sentence and an UPPER_SNAKE code.
+// code}: a plain sentence and an UPPER_SNAKE code. A refusal before admission
+// is counted by code and logged by route and code, never with the caller's
+// address; a database that cannot be read is 503, and no answer claims a record
+// that was not written.
 
 export interface HttpAnswer {
   status: number;
@@ -20,6 +24,18 @@ export interface RouteDeps extends StatusDeps {
 }
 
 const refusal = (status: number, code: string, error: string): HttpAnswer => ({ status, body: { error, code } });
+
+/** A refusal before admission: answered, counted and logged, and nothing written. */
+function before(deps: RouteDeps, route: string, status: number, code: string, error: string): HttpAnswer {
+  deps.counters.count(code);
+  deps.log(`refused before admission: ${route} ${code}`);
+  return refusal(status, code, error);
+}
+
+const DATABASE_UNREADABLE = refusal(503, 'DATABASE_UNREADABLE', 'The database could not be read; nothing was recorded.');
+
+/** Whether a failure is the database's (a driver or server code), and not a fault of the courier's own. */
+const isDatabaseFailure = (err: unknown) => !(err instanceof ChainUnreachable) && failureCode(err) !== undefined;
 
 /** A whole number from a query string, or null where it is not one. */
 function wholeNumber(text: string | null, max = 18): bigint | null {
@@ -49,8 +65,8 @@ export async function getReady(deps: RouteDeps): Promise<HttpAnswer> {
 export async function getRuns(deps: RouteDeps, query: URLSearchParams): Promise<HttpAnswer> {
   const after = query.get('after') === null ? 0n : wholeNumber(query.get('after'));
   const limit = query.get('limit') === null ? BigInt(BOUNDS.page) : wholeNumber(query.get('limit'), 4);
-  if (after === null) return refusal(400, 'INVALID_PARAM', 'after must be a run number.');
-  if (limit === null || limit < 1n || limit > BigInt(BOUNDS.page)) return refusal(400, 'INVALID_PARAM', `limit must be a whole number from 1 to ${BOUNDS.page}.`);
+  if (after === null) return before(deps, 'GET /v1/runs', 400, 'INVALID_PARAM', 'after must be a run number.');
+  if (limit === null || limit < 1n || limit > BigInt(BOUNDS.page)) return before(deps, 'GET /v1/runs', 400, 'INVALID_PARAM', `limit must be a whole number from 1 to ${BOUNDS.page}.`);
   try {
     const runs = await deps.store.runs.page(Number(after), Number(limit) + 1);
     const page = runs.slice(0, Number(limit));
@@ -74,48 +90,56 @@ const CHAIN_UNREACHABLE = refusal(503, 'CHAIN_UNREACHABLE', "The chain could not
  * GET /v1/book?gameId=&scorer=&lineTicks=[&side=A|B&after=tick:record&limit=]   one market's quotes, a page a side
  */
 export async function getBook(deps: RouteDeps, query: URLSearchParams): Promise<HttpAnswer> {
+  const route = 'GET /v1/book';
   const gameId = wholeNumber(query.get('gameId'), 78);
-  if (gameId === null) return refusal(400, 'INVALID_PARAM', 'gameId must be a game number.');
+  if (gameId === null) return before(deps, route, 400, 'INVALID_PARAM', 'gameId must be a game number.');
   const scorer = query.get('scorer');
   const lineText = query.get('lineTicks');
   if (scorer === null && lineText === null) {
-    if (query.get('side') !== null || query.get('after') !== null || query.get('limit') !== null) return refusal(400, 'INVALID_PARAM', 'side, after and limit go with scorer and lineTicks: one market\'s quotes.');
+    if (query.get('side') !== null || query.get('after') !== null || query.get('limit') !== null) return before(deps, route, 400, 'INVALID_PARAM', 'side, after and limit go with scorer and lineTicks: one market\'s quotes.');
     try {
       return { status: 200, body: { ...(await readGameBook(deps, gameId)) } };
     } catch (err) {
       if (err instanceof ChainUnreachable) return CHAIN_UNREACHABLE;
+      if (isDatabaseFailure(err)) return DATABASE_UNREADABLE;
       throw err;
     }
   }
-  if (scorer === null || !isAddress(scorer, { strict: false })) return refusal(400, 'INVALID_PARAM', 'scorer must be the market contract\'s address.');
-  if (lineText === null || !/^-?[0-9]{1,7}$/.test(lineText) || Math.abs(Number(lineText)) > 1_000_000) return refusal(400, 'INVALID_PARAM', 'lineTicks must be a whole number within 1,000,000 either side of zero.');
+  if (scorer === null || !isAddress(scorer, { strict: false })) return before(deps, route, 400, 'INVALID_PARAM', 'scorer must be the market contract\'s address.');
+  if (lineText === null || !/^-?[0-9]{1,7}$/.test(lineText) || Math.abs(Number(lineText)) > 1_000_000) return before(deps, route, 400, 'INVALID_PARAM', 'lineTicks must be a whole number within 1,000,000 either side of zero.');
   const sideText = query.get('side');
-  if (sideText !== null && sideText !== 'A' && sideText !== 'B') return refusal(400, 'INVALID_PARAM', 'side must be A or B.');
+  if (sideText !== null && sideText !== 'A' && sideText !== 'B') return before(deps, route, 400, 'INVALID_PARAM', 'side must be A or B.');
   const afterText = query.get('after');
   let after = null;
   if (afterText !== null) {
     const m = /^([0-9]{1,5}):([0-9]{1,18})$/.exec(afterText);
-    if (m === null || sideText === null) return refusal(400, 'INVALID_PARAM', 'after must be the last quote\'s tick and record number, tick:record, and goes with side.');
+    if (m === null || sideText === null) return before(deps, route, 400, 'INVALID_PARAM', 'after must be the last quote\'s tick and record number, tick:record, and goes with side.');
     after = { oddsTick: Number(m[1]), recordNumber: Number(m[2]) };
   }
   const limit = query.get('limit') === null ? BigInt(BOUNDS.pageQuotesPerSide) : wholeNumber(query.get('limit'), 3);
-  if (limit === null || limit < 1n || limit > BigInt(BOUNDS.pageQuotesPerSide)) return refusal(400, 'INVALID_PARAM', `limit must be a whole number from 1 to ${BOUNDS.pageQuotesPerSide}.`);
+  if (limit === null || limit < 1n || limit > BigInt(BOUNDS.pageQuotesPerSide)) return before(deps, route, 400, 'INVALID_PARAM', `limit must be a whole number from 1 to ${BOUNDS.pageQuotesPerSide}.`);
   try {
     return { status: 200, body: { ...(await readMarketBook(deps, { gameId, scorer: getAddress(scorer), lineTicks: Number(lineText), side: sideText, after, limit: Number(limit) })) } };
   } catch (err) {
     if (err instanceof ChainUnreachable) return CHAIN_UNREACHABLE;
+    if (isDatabaseFailure(err)) return DATABASE_UNREADABLE;
     throw err;
   }
 }
 
-/** POST /v1/orders: the door. */
+/** POST /v1/orders: the door. A database that fails under it is 503, and the order's transaction was rolled back. */
 export async function postOrders(deps: RouteDeps, body: unknown): Promise<HttpAnswer> {
-  return postOrder({ store: deps.store, chain: deps.chain, set: deps.set, run: deps.run, counters: deps.counters, published: deps.published, coinDecimals: deps.set.coinDecimals, log: deps.log }, body);
+  try {
+    return await postOrder({ store: deps.store, chain: deps.chain, set: deps.set, run: deps.run, counters: deps.counters, published: deps.published, coinDecimals: deps.set.coinDecimals, log: deps.log }, body);
+  } catch (err) {
+    if (isDatabaseFailure(err)) return refusal(503, 'DATABASE_UNREADABLE', 'The database could not be read; nothing was recorded for this order.');
+    throw err;
+  }
 }
 
 /** GET /v1/orders/{hash}: the courier's record of one order. */
 export async function getOrder(deps: RouteDeps, hash: string): Promise<HttpAnswer> {
-  if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) return refusal(400, 'INVALID_PARAM', 'An order is read by its hash: 0x and 64 hex characters.');
+  if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) return before(deps, 'GET /v1/orders/{hash}', 400, 'INVALID_PARAM', 'An order is read by its hash: 0x and 64 hex characters.');
   try {
     const row = await deps.store.orders.get(hash.toLowerCase() as Hex);
     if (row === null) return refusal(404, 'UNKNOWN_ORDER', 'The courier holds no order of this hash.');

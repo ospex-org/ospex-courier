@@ -33,10 +33,13 @@ export async function startCourier(env: CourierEnv): Promise<CourierProcess> {
     env: { PATH: process.env.PATH, SYSTEMROOT: process.env.SYSTEMROOT, PORT: '0', ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  // The courier never outlives the test process.
-  process.once('exit', () => {
+  // The courier never outlives the test process; the listener leaves with the child, so a file that starts many
+  // couriers does not pile listeners on the process.
+  const onExit = () => {
     if (child.exitCode === null) child.kill();
-  });
+  };
+  process.once('exit', onExit);
+  child.once('exit', () => process.off('exit', onExit));
   const lines: string[] = [];
   let buffer = '';
   const onData = (chunk: Buffer) => {

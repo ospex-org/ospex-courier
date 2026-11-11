@@ -94,6 +94,7 @@ test('the indexes the plan names are there, with their conditions', async () => 
   assert.match(open, /WHERE \(state <> ALL/);
   assert.match(def('conditions_one_open_per_key'), /^CREATE UNIQUE INDEX .* \(key\) WHERE \(cleared_at IS NULL\)/);
   assert.match(def('events_report_lines'), /\(number\) WHERE \(kind = ANY/);
+  assert.match(def('orders_bets_waiting'), /\(record_number\) WHERE \(\(role = 'take'::text\) AND \(bet_state = ANY \(ARRAY\['waiting'::text, 'held'::text\]\)\) AND \(ended IS NULL\)\)$/);
   assert.match(def('orders_record_number_key'), /UNIQUE INDEX .* \(record_number\)/);
   assert.match(def('crosses_tx_hash_key'), /UNIQUE INDEX .* \(tx_hash\)/);
 });

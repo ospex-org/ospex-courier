@@ -133,11 +133,13 @@ async function startAnvil(): Promise<ChainProcess> {
     env: { ...process.env, FOUNDRY_DISABLE_NIGHTLY_WARNING: '1' },
   });
   // The chain never outlives the test process, and never keeps it alive: a test that fails before its rig is
-  // closed must not leave a chain running or a runner waiting on it.
+  // closed must not leave a chain running or a runner waiting on it. The listener leaves with the child.
   child.unref();
-  process.once('exit', () => {
+  const onExit = () => {
     if (child.exitCode === null) child.kill();
-  });
+  };
+  process.once('exit', onExit);
+  child.once('exit', () => process.off('exit', onExit));
   const url = `http://127.0.0.1:${port}`;
   const started = Date.now();
   for (;;) {

@@ -61,8 +61,10 @@ export function lockKey(hash: Hex): string {
 }
 
 export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswer> {
+  // A refusal before admission: answered, counted and logged by its code, never with the caller's address or a value.
   const counted = (answer: HttpAnswer): HttpAnswer => {
     deps.counters.count(String(answer.body.code));
+    deps.log(`refused before admission: POST /v1/orders ${String(answer.body.code)}`);
     return answer;
   };
 

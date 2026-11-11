@@ -238,7 +238,8 @@ export function createOrders(pool: pg.Pool): Orders {
     },
     async waiting(on, account) {
       const { rows } = await on.query<{ mine: string; all: string }>(
-        `SELECT count(*) FILTER (WHERE account = $1)::text AS mine, count(*)::text AS all FROM orders WHERE role = 'take' AND bet_state = 'waiting'`,
+        `SELECT count(*) FILTER (WHERE account = $1)::text AS mine, count(*)::text AS all FROM orders
+         WHERE role = 'take' AND bet_state IN ('waiting', 'held') AND ended IS NULL AND bet_state = 'waiting'`,
         [account.toLowerCase()],
       );
       return { account: Number(rows[0]?.mine ?? 0), all: Number(rows[0]?.all ?? 0) };
