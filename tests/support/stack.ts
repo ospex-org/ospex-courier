@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { testServer } from './database';
 import { startCourier, type CourierProcess } from './courier';
 export type { CourierProcess };
@@ -20,8 +23,18 @@ export interface Stack {
   relayedUrl: string;
   dbRelay: TcpRelay;
   courier: CourierProcess;
-  env: { DATABASE_URL: string; POLYGON_RPC_URL: string; SIGNPOST_ADDRESS: string; BETTING_ENTRY_ID: string };
+  env: { DATABASE_URL: string; POLYGON_RPC_URL: string; SIGNPOST_ADDRESS: string; BETTING_ENTRY_ID: string; PUBLISHED_REPORTERS_FILE: string };
+  /** A published list naming the rig's reporter: what the courier under test is given. */
+  publishedListFile: string;
   close(): Promise<void>;
+}
+
+/** Writes a published list naming these reporters to a fresh temporary file and returns its path. */
+export function publishedList(reporters: string[]): string {
+  const dir = mkdtempSync(join(tmpdir(), 'courier-published-'));
+  const file = join(dir, 'published-reporters.json');
+  writeFileSync(file, JSON.stringify({ reporters }), 'utf8');
+  return file;
 }
 
 export async function startStack(prefix: string): Promise<Stack> {
@@ -34,11 +47,13 @@ export async function startStack(prefix: string): Promise<Stack> {
   const relayed = new URL(url);
   relayed.hostname = '127.0.0.1';
   relayed.port = String(dbRelay.port);
+  const publishedListFile = publishedList([rig.addresses.reporter]);
   const env = {
     DATABASE_URL: relayed.toString(),
     POLYGON_RPC_URL: proxy.url,
     SIGNPOST_ADDRESS: rig.addresses.signpost,
     BETTING_ENTRY_ID: rig.bettingEntryId.toString(),
+    PUBLISHED_REPORTERS_FILE: publishedListFile,
   };
   let courier: CourierProcess;
   try {
@@ -60,6 +75,7 @@ export async function startStack(prefix: string): Promise<Stack> {
     dbRelay,
     courier,
     env,
+    publishedListFile,
     async close() {
       await courier.stop();
       await dbRelay.close();

@@ -67,12 +67,11 @@ test('the courier read the set from the signpost and the status names every addr
   assert.equal((body.bounds as { scanRows: number }).scanRows, 2000);
 });
 
-test('the book of the game is empty, at a block named by number, hash and time', async () => {
+test('the book of the game is empty, at a block named by number, hash and time, with the final block beside it', async () => {
   const requestsBefore = stack.proxy.count('eth_getBlockByNumber');
   const { status, body } = await get(stack.courier.url, `/v1/book?gameId=${rig.gameId}`);
   assert.equal(status, 200, JSON.stringify(body));
   assert.deepEqual(body.markets, []);
-  assert.equal(body.boundReached, false);
   assert.equal(body.bound, 2000);
   assert.equal(body.gameId, rig.gameId.toString());
   const block = body.block as { number: string; hash: Hex; time: string };
@@ -80,24 +79,34 @@ test('the book of the game is empty, at a block named by number, hash and time',
   assert.equal(block.number, latest.number.toString());
   assert.equal(block.hash, latest.hash);
   assert.equal(block.time, latest.timestamp.toString());
-  assert.equal(stack.proxy.count('eth_getBlockByNumber'), requestsBefore + 1, 'one header read, through the proxy');
+  const final = body.final as { number: string; hash: Hex; time: string };
+  assert.ok(BigInt(final.number) <= latest.number, 'the final block is at or under the latest');
+  assert.equal(stack.proxy.count('eth_getBlockByNumber'), requestsBefore + 2, 'two header reads, the latest and the final block, through the proxy');
   const after = await get(stack.courier.url, '/v1/status');
   const last = after.body.lastBlockRead as { number: string; hash: string };
   assert.equal(last.hash, latest.hash);
 });
 
-test('the book refuses a game id that is not a number, and a market read this build does not serve', async () => {
+test('the book refuses a game id that is not a number, and serves one market empty', async () => {
   assert.equal((await get(stack.courier.url, '/v1/book?gameId=abc')).body.code, 'INVALID_PARAM');
   assert.equal((await get(stack.courier.url, '/v1/book')).body.code, 'INVALID_PARAM');
-  assert.equal((await get(stack.courier.url, `/v1/book?gameId=${rig.gameId}&scorer=${rig.addresses.moneyline}&lineTicks=0`)).body.code, 'INVALID_PARAM');
+  const market = await get(stack.courier.url, `/v1/book?gameId=${rig.gameId}&scorer=${rig.addresses.moneyline}&lineTicks=0`);
+  assert.equal(market.status, 200, JSON.stringify(market.body));
+  const sides = market.body.sides as Record<string, { quotes: unknown[]; endedBy: string }>;
+  assert.deepEqual(sides.A?.quotes, []);
+  assert.deepEqual(sides.B?.quotes, []);
+  assert.equal(sides.A?.endedBy, 'book');
 });
 
 test('/healthz and /readyz answer; an unknown path is refused by code', async () => {
   assert.deepEqual((await get(stack.courier.url, '/healthz')).body, { ok: true });
   assert.deepEqual((await get(stack.courier.url, '/readyz')).body, { ok: true });
-  const missing = await get(stack.courier.url, '/v1/orders/0x00');
+  const missing = await get(stack.courier.url, '/v1/nothing');
   assert.equal(missing.status, 404);
   assert.equal(missing.body.code, 'NOT_FOUND');
+  const notAHash = await get(stack.courier.url, '/v1/orders/0x00');
+  assert.equal(notAHash.status, 400);
+  assert.equal(notAHash.body.code, 'INVALID_PARAM');
 });
 
 test('https only: a request the router says came plain is refused, one it says came over https is served', async () => {

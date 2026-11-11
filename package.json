@@ -14,7 +14,7 @@
     "check:node": "node --import tsx scripts/check-node.ts",
     "typecheck": "tsc --noEmit",
     "build:contracts": "cd contracts && forge build --skip test",
-    "test": "tsx --test tests/config.test.ts tests/limits.test.ts tests/schema.test.ts tests/store.test.ts tests/abi.test.ts tests/rig.test.ts tests/node.test.ts tests/status.test.ts"
+    "test": "tsx --test tests/config.test.ts tests/limits.test.ts tests/schema.test.ts tests/store.test.ts tests/abi.test.ts tests/rig.test.ts tests/node.test.ts tests/status.test.ts tests/orders.test.ts tests/book.test.ts tests/budgets.test.ts tests/cost.test.ts"
   },
   "dependencies": {
     "pg": "8.23.0",

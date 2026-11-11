@@ -23,6 +23,7 @@ export interface CourierEnv {
   BETTING_ENTRY_ID: string;
   PORT?: string;
   COURIER_LOW_POL?: string;
+  PUBLISHED_REPORTERS_FILE?: string;
 }
 
 /** Starts the courier; resolves when it listens, or rejects with its refusal line when it does not start. */
