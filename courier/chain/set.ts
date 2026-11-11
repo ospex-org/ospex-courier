@@ -1,5 +1,5 @@
 import { getAddress, keccak256, type Address, type Hex } from 'viem';
-import { CORE_ABI, MATCHING_ABI, MODULE_TYPES, RELAY_ABI, SIGNPOST_ABI, SIGNPOST_KIND, SIGNPOST_STATUS, type ModuleName } from './abi';
+import { COIN_ABI, CORE_ABI, MATCHING_ABI, MODULE_TYPES, RELAY_ABI, SIGNPOST_ABI, SIGNPOST_KIND, SIGNPOST_STATUS, type ModuleName } from './abi';
 import { byHash, codeAt, headerByTag, readAt, type Header, type JsonRpc } from './rpc';
 
 // The set, read from the signpost at start. Every address is a setting of the
@@ -33,6 +33,8 @@ export interface BettingSet {
   total: Address;
   relay: Address;
   coin: Address;
+  /** The coin's decimals, read once: how an amount in its smallest unit is said in a sentence. */
+  coinDecimals: number;
   games: Address;
   /** The matching contract's timelock, which the relay answers too. */
   timelock: Address;
@@ -95,6 +97,7 @@ export async function readSet(rpc: JsonRpc, where: { signpostAddress: Address; b
   }
   const coin = getAddress(entry.coin);
   if ((await codeAt(rpc, coin, at)) === '0x') throw new SetRefused(`entry ${where.bettingEntryId}: its coin ${coin} holds no code`);
+  const coinDecimals = Number(await readAt<number>(rpc, COIN_ABI, coin, 'decimals', [], at));
 
   // The core is the one a reader starts from; its registry names the modules.
   const core = getAddress(entry.contracts[0] as Address);
@@ -133,6 +136,7 @@ export async function readSet(rpc: JsonRpc, where: { signpostAddress: Address; b
     ...modules,
     relay,
     coin,
+    coinDecimals,
     games,
     timelock,
     sender,

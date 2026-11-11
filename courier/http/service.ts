@@ -1,24 +1,26 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { describeNodeFailure } from '../chain/rpc';
 import { failureCode } from '../records/store';
-import { createAddressLimiter, type AddressLimiter, type Counters } from './limits';
-import { getBook, getReady, getRuns, getStatus, type HttpAnswer, type RouteDeps } from './routes';
+import { BOUNDS, createAddressLimiter, type AddressLimiter, type Counters } from './limits';
+import { getBook, getOrder, getReady, getRuns, getStatus, postOrders, type HttpAnswer, type RouteDeps } from './routes';
 
 // The courier's HTTP service: node:http and routes by hand. JSON under /v1;
 // no sign-in and no shared secret, since a signed order is its own permission
 // and the book is public. https only, behind Heroku's router; plain http only
 // from this machine, which is how the tests reach it.
 //
-//   GET /healthz          the process answers; nothing more
-//   GET /readyz           the database answers
-//   GET /v1/status        what stands now
-//   GET /v1/runs          the runs, paged
-//   GET /v1/book?gameId=  the markets of a game that hold a live quote, at one block
+//   GET  /healthz              the process answers; nothing more
+//   GET  /readyz               the database answers
+//   GET  /v1/status            what stands now
+//   GET  /v1/runs              the runs, paged
+//   GET  /v1/book?gameId=      the markets of a game that hold a live quote, at one block
+//   GET  /v1/book?gameId=&scorer=&lineTicks=   one market's quotes, a page a side, at one block
+//   POST /v1/orders            the door: a signed order, under a role
+//   GET  /v1/orders/{hash}     the courier's record of one order
 
 export interface ServiceDeps extends RouteDeps {
   counters: Counters;
   limiter?: AddressLimiter;
-  log(line: string): void;
 }
 
 const THIS_MACHINE = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
@@ -61,8 +63,36 @@ function send(res: ServerResponse, answer: HttpAnswer, extra: Record<string, str
 
 const refusal = (status: number, code: string, error: string): HttpAnswer => ({ status, body: { error, code } });
 
+/**
+ * The body of a POST, read up to its bound and no further: a body over the
+ * bound is refused before it is read whole, and before anything is parsed.
+ */
+function readBody(req: IncomingMessage, bound: number): Promise<{ ok: true; text: string } | { ok: false }> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    const finish = (value: { ok: true; text: string } | { ok: false }) => {
+      if (done) return;
+      done = true;
+      resolve(value);
+    };
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > bound) {
+        req.removeAllListeners('data');
+        req.resume();
+        return finish({ ok: false });
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => finish({ ok: true, text: Buffer.concat(chunks).toString('utf8') }));
+    req.on('error', () => finish({ ok: false }));
+  });
+}
+
 export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, res: ServerResponse) => void {
-  const limiter = deps.limiter ?? createAddressLimiter(600);
+  const limiter = deps.limiter ?? createAddressLimiter(BOUNDS.requestsPerAddressPerMinute);
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', 'http://courier');
@@ -91,6 +121,25 @@ export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, 
     if (req.method === 'GET' && path === '/v1/status') return send(res, await getStatus(deps));
     if (req.method === 'GET' && path === '/v1/runs') return send(res, await getRuns(deps, url.searchParams));
     if (req.method === 'GET' && path === '/v1/book') return send(res, await getBook(deps, url.searchParams));
+    if (req.method === 'POST' && path === '/v1/orders') {
+      const body = await readBody(req, BOUNDS.orderBodyBytes);
+      if (!body.ok) {
+        deps.counters.count('BODY_TOO_LARGE');
+        return send(res, refusal(413, 'BODY_TOO_LARGE', `An order's body is at most ${BOUNDS.orderBodyBytes} bytes.`), { connection: 'close' });
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body.text);
+      } catch {
+        deps.counters.count('INVALID_PARAM');
+        return send(res, refusal(400, 'INVALID_PARAM', 'The body is not JSON.'));
+      }
+      const answer = await postOrders(deps, parsed);
+      const retry = answer.body.retryAfterSeconds;
+      return send(res, answer, typeof retry === 'number' ? { 'retry-after': String(retry) } : {});
+    }
+    const order = /^\/v1\/orders\/([^/]+)$/.exec(path);
+    if (req.method === 'GET' && order !== null) return send(res, await getOrder(deps, order[1] ?? ''));
     deps.counters.count('NOT_FOUND');
     return send(res, refusal(404, 'NOT_FOUND', 'Not found.'));
   }

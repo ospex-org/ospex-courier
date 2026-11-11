@@ -35,7 +35,16 @@ export const MODULE_TYPES = {
 
 export type ModuleName = keyof typeof MODULE_TYPES;
 
-/** The matching contract: what the courier reads of it in this build, and the registration the rig makes. */
+/** The signed order's struct, as the contract's cross, cancelOrder and getOrderHash take it. */
+const ORDER_STRUCT = '(address account, uint256 gameId, address scorer, int32 lineTicks, uint8 positionType, uint16 oddsTick, uint256 riskAmount, uint256 nonce, uint256 expiry, uint256 minFill)';
+
+/**
+ * The matching contract: what the courier reads of it (the door's and the
+ * book's reads, the constants the door holds to), the registration the rig
+ * makes, and the calls the tests make from the chain's side (a cancel, a
+ * raised floor, the lift, and one Cross sent by the test from the relay's
+ * sender to show the contract's own boundary).
+ */
 export const MATCHING_ABI = parseAbi([
   'function i_timelock() view returns (address)',
   'function i_ospexCore() view returns (address)',
@@ -44,7 +53,20 @@ export const MATCHING_ABI = parseAbi([
   'function TAKING_STAKE_CAP() view returns (uint256)',
   'function s_takingStakeCapLifted() view returns (bool)',
   'function getDomainSeparator() view returns (bytes32)',
-  'function getOrderHash((address account, uint256 gameId, address scorer, int32 lineTicks, uint8 positionType, uint16 oddsTick, uint256 riskAmount, uint256 nonce, uint256 expiry, uint256 minFill) order) view returns (bytes32)',
+  `function getOrderHash(${ORDER_STRUCT} order) view returns (bytes32)`,
+  'function ORDER_TYPEHASH() view returns (bytes32)',
+  'function MIN_ODDS() view returns (uint16)',
+  'function MAX_ODDS() view returns (uint16)',
+  'function MAX_LINE_TICKS() view returns (int32)',
+  'function LOT() view returns (uint256)',
+  'function MAX_TAKING_LIFE() view returns (uint256)',
+  'function s_cancelledOrders(bytes32 orderHash) view returns (bool)',
+  'function s_minNonces(address account, bytes32 marketKey) view returns (uint256)',
+  'function s_filledRisk(bytes32 orderHash) view returns (uint256)',
+  `function cancelOrder(${ORDER_STRUCT} order)`,
+  'function raiseMinNonce(uint256 gameId, address scorer, int32 lineTicks, uint256 newMinNonce)',
+  'function liftTakingStakeCap()',
+  `function cross((${ORDER_STRUCT} order, bytes signature) taking, (${ORDER_STRUCT} order, bytes signature)[] resting)`,
 ]);
 
 /** The relay: the courier's address on chain. */
@@ -52,6 +74,7 @@ export const RELAY_ABI = parseAbi([
   'function i_matching() view returns (address)',
   'function i_timelock() view returns (address)',
   'function s_sender() view returns (address)',
+  `function cross((${ORDER_STRUCT} order, bytes signature) taking, (${ORDER_STRUCT} order, bytes signature)[] resting)`,
 ]);
 
 /** The games set, for the reads the courier makes of a game. */
@@ -63,7 +86,7 @@ export const GAMES_ABI = parseAbi([
   'function getGameReporters(uint256 gameId) view returns (address[] reporters, uint8[] kinds)',
 ]);
 
-/** The coin: the two reads the book and the pre-check make of it. */
+/** The coin: the reads the book and the pre-check make of it. */
 export const COIN_ABI = parseAbi([
   'function balanceOf(address account) view returns (uint256)',
   'function allowance(address owner, address spender) view returns (uint256)',

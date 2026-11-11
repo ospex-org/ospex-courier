@@ -6,6 +6,7 @@ import { createChainReader, type ChainReader } from './chain/snapshot';
 import { readCourierConfig, type CourierConfig } from './config';
 import { createCounters } from './http/limits';
 import { createRequestHandler } from './http/service';
+import { PublishedListRefused, readPublishedReporters } from './orders/published';
 import { applySchema, createStore, databaseRefusal, missingSchema, openPool, pinnedAuthority, StoreRefused, type Store } from './records/store';
 import type { Run } from './records/runs';
 
@@ -23,11 +24,11 @@ export class StartupRefused extends Error {
 
 /** What this build does not yet do, published on the status address. */
 export const NOT_YET_BUILT = [
-  "orders in, and the book's quotes (the orders build)",
-  'stops (the stop build)',
-  'the lanes and the pre-check (the pre-check build)',
-  'the sender and the key (the sender build)',
+  'stops (the stop build): a stop on record is honoured at the door, but none can be recorded yet',
+  'the lanes and the pre-check (the pre-check build): a bet posted is recorded and waits, and nothing examines it',
+  'the sender and the key (the sender build): nothing is signed or sent',
   'incidents and their cursor (the reports build)',
+  "the netted pull's payable (the order-4 build): the book's payable is what a balance and an allowance cover",
 ] as const;
 
 export interface RunningService {
@@ -57,6 +58,14 @@ export async function startService(env: Record<string, string | undefined>, opti
   const read = readCourierConfig(env);
   if (!read.ok) throw new StartupRefused(`settings: ${read.problems.join('; ')}`);
   const config = read.config;
+
+  // The published list of reporters: a file, read once.
+  let published;
+  try {
+    published = readPublishedReporters(config.publishedReportersFile);
+  } catch (err) {
+    throw new StartupRefused(err instanceof PublishedListRefused ? `the published list: ${err.message}` : 'the published list could not be read');
+  }
 
   // The database.
   let store: Store;
@@ -104,7 +113,7 @@ export async function startService(env: Record<string, string | undefined>, opti
 
   const counters = createCounters(now);
   const chain = createChainReader({ rpc, conditions: store.conditions, run: run.id, now, log });
-  const handler = createRequestHandler({ store, chain, set, node, run, counters, settings: { lowPol: config.lowPol }, notYetBuilt: NOT_YET_BUILT, log });
+  const handler = createRequestHandler({ store, chain, set, node, run, counters, settings: { lowPol: config.lowPol }, published, notYetBuilt: NOT_YET_BUILT, log });
   const server: Server = createServer(handler);
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
