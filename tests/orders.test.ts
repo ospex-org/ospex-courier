@@ -129,7 +129,7 @@ test('a quote posted is recorded: 201, resting, a record number, the chain\'s ti
   assert.equal(posted.body.chainTime, T.toString());
   const hash = posted.body.orderHash as string;
   assert.equal(hash, await contractHash(rig, order), 'the record\'s hash is the contract\'s');
-  assert.equal((posted.body.receivedBlock as { number: string }).number, (await rig.publicClient.getBlockNumber()).toString());
+  assert.equal((posted.body.receivedBlock as { number: string }).number, (await rig.publicClient.getBlock()).number.toString());
 
   // The row, whole: every field as signed, lowercase where it is an address, and the market key as the contract computes it.
   const row = await orderRow(hash);

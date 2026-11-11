@@ -216,7 +216,8 @@ export async function startRig(): Promise<Rig> {
 
   // The betting set: the core with the games set and the coin, the six modules on the core, bootstrapped under
   // their types, finalized.
-  const coreDeployBlock = await publicClient.getBlockNumber();
+  // The block itself, not getBlockNumber, which the client caches for its polling interval.
+  const coreDeployBlock = (await publicClient.getBlock()).number;
   const core = await deploy(accounts.deployer, 'OspexBetting.sol', 'OspexBetting', [games, coin]);
   const markets = await deploy(accounts.deployer, 'OspexMarkets.sol', 'OspexMarkets', [core]);
   const positions = await deploy(accounts.deployer, 'OspexPositions.sol', 'OspexPositions', [core]);

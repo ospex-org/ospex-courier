@@ -45,10 +45,12 @@ const url = () => stack.courier.url;
  * answer for the finalized tag is the block 64 behind the head, which on this
  * rig would hold the final block behind every expiry a test sets; on the live
  * chain the final block trails the head by seconds. A test that wants the final
- * block behind an expiry names an older block itself.
+ * block behind an expiry names an older block itself. The block is read whole,
+ * not by the client's getBlockNumber, which is cached for the polling interval
+ * and on a fast machine can answer with the block before the one just mined.
  */
 async function finalIsLatest(): Promise<void> {
-  stack.proxy.setFinal(await rig.publicClient.getBlockNumber());
+  stack.proxy.setFinal((await rig.publicClient.getBlock()).number);
 }
 
 interface Page {
