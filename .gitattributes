@@ -1,0 +1,4 @@
+# One line ending everywhere, so a byte-exact comparison of a file is the same on every machine.
+* text=auto eol=lf
+# Certificate bundles stay byte for byte as published, so their checksums can be compared.
+*.pem -text

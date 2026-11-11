@@ -1,0 +1,7 @@
+{
+  "what": "The published list of reporters: the courier carries a game only when its reporters are exactly this list. It is a file in this repository, changed by a reviewed commit, and is never read from the chain's approved list.",
+  "reporters": [
+    "0x2Fa61B65Cd1CC04b2B910fB665FCc48237561c01"
+  ],
+  "note": "One address today: the reporter the games set on Polygon holds for every game it has created, as read on chain in November 2026. The build that reads this file against a game's reporters is the orders build; this build ships the list."
+}

@@ -1,0 +1,17 @@
+node_modules/
+*.log
+
+# Settings kept in a local env file: the node's URL, the database's URL, and from the sender's build on, the key.
+.env
+.env.*
+!.env.example
+
+# No key material belongs in this tree.
+*.keystore
+*.keystore.json
+keystore*.json
+*.password
+*.pass
+
+# Records of local runs (yarn check:node writes one).
+runs/
