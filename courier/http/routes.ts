@@ -34,8 +34,17 @@ function before(deps: RouteDeps, route: string, status: number, code: string, er
 
 const DATABASE_UNREADABLE = refusal(503, 'DATABASE_UNREADABLE', 'The database could not be read; nothing was recorded.');
 
-/** Whether a failure is the database's (a driver or server code), and not a fault of the courier's own. */
-const isDatabaseFailure = (err: unknown) => !(err instanceof ChainUnreachable) && failureCode(err) !== undefined;
+/**
+ * The driver's connection failures that carry no code: a socket closed under
+ * it ("Connection terminated unexpectedly"), its connection time-out, a client
+ * no longer queryable. On one platform the same cut gives ECONNRESET with a
+ * code, on another this sentence with none; both are the database's failure.
+ */
+const CODELESS_DATABASE_FAILURES = /connection terminated|connection timeout|timeout expired|not queryable|connection ended|terminating connection|connection refused/i;
+
+/** Whether a failure is the database's (a driver or server code, or the driver's codeless connection message), and not a fault of the courier's own. */
+const isDatabaseFailure = (err: unknown) =>
+  !(err instanceof ChainUnreachable) && (failureCode(err) !== undefined || (err instanceof Error && CODELESS_DATABASE_FAILURES.test(err.message)));
 
 /** A whole number from a query string, or null where it is not one. */
 function wholeNumber(text: string | null, max = 18): bigint | null {
