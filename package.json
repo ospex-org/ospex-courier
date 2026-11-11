@@ -13,7 +13,7 @@
     "db:apply": "node --import tsx scripts/apply-schema.ts",
     "check:node": "node --import tsx scripts/check-node.ts",
     "typecheck": "tsc --noEmit",
-    "build:contracts": "cd contracts && forge build --skip test src/betting src/games/OspexGames.sol src/games/IOspexGames.sol src/games/IOspexReporter.sol src/signpost test/games/GamesBase.sol test/games/CoinFixtures.sol",
+    "build:contracts": "cd contracts && forge build --skip test",
     "test": "tsx --test tests/config.test.ts tests/limits.test.ts tests/schema.test.ts tests/store.test.ts tests/abi.test.ts tests/rig.test.ts tests/node.test.ts tests/status.test.ts"
   },
   "dependencies": {
