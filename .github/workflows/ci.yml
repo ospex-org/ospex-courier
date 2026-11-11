@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck-and-test:
+    name: install / typecheck / build the contracts / test
+    runs-on: ubuntu-latest
+
+    # The schema, store, rig and status tests run against a real Postgres; they create and drop their own
+    # databases on this throwaway server. The major version is the one the app's add-on will run, read at the
+    # first release; until then, the current one.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      FOUNDRY_DISABLE_NIGHTLY_WARNING: '1'
+
+    steps:
+      - name: Checkout, with the contracts submodule
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # The contracts' own libraries: the two the rig's build needs, and not the oracle vendor's tree.
+      - name: Fetch the contracts' libraries
+        run: git -C contracts submodule update --init lib/forge-std lib/openzeppelin-contracts
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'yarn'
+
+      # forge builds the set the rig deploys; anvil is the local chain the tests run against.
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Typecheck
+        run: yarn typecheck
+
+      - name: Build the contracts at the pinned commit
+        run: yarn build:contracts
+
+      - name: Test
+        run: yarn test
