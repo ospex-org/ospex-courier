@@ -463,6 +463,38 @@ test('an account holds at most 16 live quotes on one side of one market; an expi
   assert.equal(otherSide.status, 201);
 });
 
+test('the count of live quotes looks past the ended ones standing in front: sixteen quotes cancelled on chain, with later expiries than their replacements, hide no live quote behind them; sixteen replacements are taken and the seventeenth is refused', async () => {
+  const who = rig.account(10);
+  await rig.fund(who);
+  const T = await rig.time();
+  const market = { scorer: rig.addresses.total, lineTicks: 2_305 };
+  const first: Order[] = [];
+  for (let i = 0; i < 16; i++) {
+    const q = orderOn(rig, who, { expiry: T + 3_600n, ...market });
+    const answer = await postOrder(url(), rig, who, 'rest', q);
+    assert.equal(answer.status, 201, `${i}: ${JSON.stringify(answer.body)}`);
+    first.push(q);
+  }
+  for (const q of first) await cancelOnChain(rig, who, q);
+  // The replacements expire an hour earlier than the cancelled sixteen, so in the index, newest expiry first, every
+  // one of them stands behind all sixteen. Each is taken: the cancelled ones are read at the block and not counted.
+  for (let i = 0; i < 16; i++) {
+    const answer = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 1_800n, ...market }));
+    assert.equal(answer.status, 201, `replacement ${i + 1}: ${JSON.stringify(answer.body)}`);
+  }
+  const seventeenth = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 1_800n, ...market }));
+  assert.equal(seventeenth.status, 422, JSON.stringify(seventeenth.body));
+  assert.equal(seventeenth.body.code, 'TOO_MANY_QUOTES');
+  assert.equal(seventeenth.body.error, 'This account holds 16 live quotes on this side of this market; the bound is 16.');
+  const unended = await pool.query<{ n: number }>(`SELECT count(*)::int AS n FROM orders WHERE account = $1 AND role = 'rest' AND ended IS NULL`, [who.address.toLowerCase()]);
+  assert.equal(unended.rows[0]?.n, 32, 'the cancelled sixteen stand unmarked in the records: what the chain knows is read at the block, never stored');
+  // One replacement cancelled makes room for one, found behind the cancelled sixteen as well.
+  const replacement = orderOn(rig, who, { expiry: T + 1_800n, ...market });
+  assert.equal((await postOrder(url(), rig, who, 'rest', replacement)).body.code, 'TOO_MANY_QUOTES');
+  await cancelOnChain(rig, who, first[0] as Order);
+  assert.equal((await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 1_800n, ...market }))).body.code, 'TOO_MANY_QUOTES', 'a cancelled quote that was not counted makes no room');
+});
+
 test('a stop on record for the hash is honoured at the door: STOPPED, as a line (the stop build writes the record; the door reads it)', async () => {
   const maker = rig.accounts.maker;
   const T = await rig.time();

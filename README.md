@@ -87,8 +87,10 @@ courier's own fault); a stop on record (`STOPPED`); the game, whose start must b
 be exactly the published list, which must not have ended and whose close must not have passed (`UNKNOWN_GAME`,
 `NO_WRITTEN_START`, `REPORTERS_NOT_THE_PUBLISHED_LIST`, `GAME_ENDED`, `BETS_CLOSED`); the order's standing on chain
 (`CANCELLED`, `EXPIRED`, `FILLED`), the expiry exact with no margin; for a quote, fewer than 16 live quotes of the
-account on that side of that market (`TOO_MANY_QUOTES`); for a bet, the signed stake not above the cap until the
-lift (`ABOVE_CAP`), the expiry at most 30 seconds past the chain's time (`EXPIRY_TOO_FAR`), and fewer than two of
+account on that side of that market (`TOO_MANY_QUOTES`), the unexpired ones gathered sixteen at a time and the
+chain asked which of them it shows ended, so that cancelled or filled quotes standing in front hide none behind
+them; for a bet, the signed stake not above the cap until the lift, both read from the matching contract at the
+block (`ABOVE_CAP`), the expiry at most 30 seconds past the chain's time (`EXPIRY_TOO_FAR`), and fewer than two of
 the account's bets, and 32 in all, waiting their turn (`QUEUE_FULL`). Checks 5 and 8 to 16 run in one database
 transaction under the order's hash lock. A quote accepted is `201 resting`; a bet accepted is `202 queued`, recorded
 and waiting, and in this build nothing examines or sends it.

@@ -181,27 +181,59 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
     if (order.riskAmount - read.filled < ORDER_RULES.lot) return await refuse(422, 'FILLED', 'This order has less than a lot of its stake left on chain.');
 
     if (role === 'rest') {
-      // 13. Fewer than 16 live quotes on this side of this market. The index lists the live ones first; at 16 the chain is asked about them.
-      const quotes = await deps.store.orders.quotesOfAccount(client, order.account, key, order.positionType);
-      let live = quotes.filter((q) => q.expiry > T + 1n);
-      if (live.length >= BOUNDS.liveQuotesPerAccountSideMarket) {
-        // At the bound, the chain is asked about those quotes, and the ones it shows ended are not counted: cancelled,
-        // under the account's floor, or with less than a lot left.
+      // 13. Fewer than 16 live quotes on this side of this market. The account's quotes the courier has not marked
+      // ended are walked newest expiry first, a page at a time; the walk ends at the first expired row, since the
+      // rest of the index is expired too. Unexpired quotes are gathered until sixteen stand, and the chain is then
+      // asked about those sixteen: the ones it shows ended (cancelled, under the account's floor, or with less than
+      // a lot left) are not counted, and the walk goes on past them, so that ended quotes standing in front with
+      // later expiries never hide live ones behind them. A post with fewer than sixteen unexpired quotes on the
+      // side asks the chain nothing here; one with more asks once for every sixteen gathered, which is bounded by
+      // the account's own posts.
+      const bound = BOUNDS.liveQuotesPerAccountSideMarket;
+      let live = 0;
+      let gathered: Array<{ hash: Hex; expiry: bigint; riskAmount: bigint; nonce: bigint }> = [];
+      let after: { expiry: bigint; recordNumber: number } | null = null;
+      let exhausted = false;
+      const countLive = async (): Promise<HttpAnswer | null> => {
         let state;
         try {
-          state = await readQuotes(deps.chain, deps.set, read.header, key, live.map((q) => ({ hash: q.hash, account: order.account })));
+          state = await readQuotes(deps.chain, deps.set, read.header, key, gathered.map((q) => ({ hash: q.hash, account: order.account })));
         } catch (err) {
           if (err instanceof ChainUnreachable) return await refuse(503, 'CHAIN_UNREACHABLE', "The chain could not be read, twice, for the account's standing quotes.");
           throw err;
         }
         const floor = state.accounts.get(order.account.toLowerCase())?.floor ?? 0n;
-        live = live.filter((q) => {
+        for (const q of gathered) {
           const s = state.quotes.get(q.hash.toLowerCase());
-          return s !== undefined && !s.cancelled && q.nonce >= floor && q.riskAmount - s.filled >= ORDER_RULES.lot;
-        });
+          if (s !== undefined && !s.cancelled && q.nonce >= floor && q.riskAmount - s.filled >= ORDER_RULES.lot) live++;
+        }
+        gathered = [];
+        return null;
+      };
+      while (live < bound && !exhausted) {
+        const page = await deps.store.orders.quotesOfAccount(client, order.account, key, order.positionType, after);
+        for (const q of page) {
+          if (q.expiry <= T + 1n) {
+            exhausted = true;
+            break;
+          }
+          gathered.push(q);
+          if (gathered.length >= bound) {
+            const refused = await countLive();
+            if (refused !== null) return refused;
+            if (live >= bound) break;
+          }
+        }
+        if (page.length < bound + 1) exhausted = true;
+        const last = page[page.length - 1];
+        if (last !== undefined) after = { expiry: last.expiry, recordNumber: last.recordNumber };
       }
-      if (live.length >= BOUNDS.liveQuotesPerAccountSideMarket) {
-        return await refuse(422, 'TOO_MANY_QUOTES', `This account holds ${live.length} live quotes on this side of this market; the bound is ${BOUNDS.liveQuotesPerAccountSideMarket}.`);
+      if (live < bound && gathered.length > 0 && live + gathered.length >= bound) {
+        const refused = await countLive();
+        if (refused !== null) return refused;
+      }
+      if (live >= bound) {
+        return await refuse(422, 'TOO_MANY_QUOTES', `This account holds ${live} live quotes on this side of this market; the bound is ${bound}.`);
       }
     } else {
       // 14. Before the lift, the signed stake is not above the cap, both read from the matching contract.

@@ -85,9 +85,11 @@ CREATE INDEX IF NOT EXISTS orders_book
   ON orders (market_key, side, odds_tick, record_number)
   WHERE role = 'rest' AND ended IS NULL;
 
--- The door's count of an account's live quotes on one side of one market: the live ones first, so the count
--- ends at the first expired row and is returned at most 17 rows whatever the account has posted. Again a
--- count of rows returned; what the database passes over to return them is the paragraph above.
+-- The door's count of an account's live quotes on one side of one market: the live ones first, so the walk
+-- ends at the first expired row, a page of at most 17 rows at a time whatever the account has posted. The door
+-- walks it page by page, since quotes the chain shows ended (cancelled, under the account's floor, filled) stand
+-- in it with their expiries and are told apart only at the block. Again a count of rows returned; what the
+-- database passes over to return them is the paragraph above.
 CREATE INDEX IF NOT EXISTS orders_live_quotes_per_account
   ON orders (account, market_key, side, expiry DESC)
   WHERE role = 'rest' AND ended IS NULL;

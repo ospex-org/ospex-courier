@@ -54,6 +54,20 @@ export interface Cursor {
   recordNumber: number;
 }
 
+export interface AccountQuote {
+  hash: Hex;
+  expiry: bigint;
+  riskAmount: bigint;
+  nonce: bigint;
+  recordNumber: number;
+}
+
+/** Where the next page of an account's quotes starts: the last row's expiry and record number. */
+export interface AccountQuoteCursor {
+  expiry: bigint;
+  recordNumber: number;
+}
+
 export interface ScanResult {
   /** Rows the index's range returned to this request, at most the bound. */
   scanned: number;
@@ -174,11 +188,13 @@ export interface Orders {
   /** How many bets wait their turn: the account's, and everyone's. */
   waiting(on: Writer, account: Address): Promise<{ account: number; all: number }>;
   /**
-   * An account's quotes on one side of one market the courier has not marked
-   * ended, newest expiry first, at most the bound plus one: the live ones come
-   * first, so a count of the live ones ends at the first expired row.
+   * One page of an account's quotes on one side of one market the courier has
+   * not marked ended, newest expiry first, at most the bound plus one rows,
+   * from after the cursor: the live ones come first, so a walk along it ends
+   * at the first expired row. The door walks it page by page, since quotes the
+   * chain shows ended can stand in front with later expiries.
    */
-  quotesOfAccount(on: Writer, account: Address, marketKey: Hex, side: 0 | 1): Promise<Array<{ hash: Hex; expiry: bigint; riskAmount: bigint; nonce: bigint }>>;
+  quotesOfAccount(on: Writer, account: Address, marketKey: Hex, side: 0 | 1, after: AccountQuoteCursor | null): Promise<AccountQuote[]>;
   /** The book's scan with the mark, one statement. */
   scan(on: Writer, args: ScanArgs): Promise<ScanResult>;
   /**
@@ -244,14 +260,15 @@ export function createOrders(pool: pg.Pool): Orders {
       );
       return { account: Number(rows[0]?.mine ?? 0), all: Number(rows[0]?.all ?? 0) };
     },
-    async quotesOfAccount(on, account, marketKey, side) {
-      const { rows } = await on.query<{ hash: Hex; expiry: string; risk_amount: string; nonce: string }>(
-        `SELECT hash, expiry::text AS expiry, risk_amount::text AS risk_amount, nonce::text AS nonce FROM orders
+    async quotesOfAccount(on, account, marketKey, side, after) {
+      const { rows } = await on.query<{ hash: Hex; expiry: string; risk_amount: string; nonce: string; record_number: string }>(
+        `SELECT hash, expiry::text AS expiry, risk_amount::text AS risk_amount, nonce::text AS nonce, record_number::text AS record_number FROM orders
          WHERE role = 'rest' AND ended IS NULL AND account = $1 AND market_key = $2 AND side = $3
-         ORDER BY expiry DESC LIMIT $4`,
-        [account.toLowerCase(), marketKey.toLowerCase(), side, BOUNDS.liveQuotesPerAccountSideMarket + 1],
+           AND ($5::numeric IS NULL OR (expiry, record_number) < ($5::numeric, $6::bigint))
+         ORDER BY expiry DESC, record_number DESC LIMIT $4`,
+        [account.toLowerCase(), marketKey.toLowerCase(), side, BOUNDS.liveQuotesPerAccountSideMarket + 1, after === null ? null : after.expiry.toString(), after === null ? null : after.recordNumber],
       );
-      return rows.map((r) => ({ hash: r.hash, expiry: BigInt(r.expiry), riskAmount: BigInt(r.risk_amount), nonce: BigInt(r.nonce) }));
+      return rows.map((r) => ({ hash: r.hash, expiry: BigInt(r.expiry), riskAmount: BigInt(r.risk_amount), nonce: BigInt(r.nonce), recordNumber: Number(r.record_number) }));
     },
     async scan(on, args) {
       const { rows } = await on.query<{ scanned: number; marked: number; live: number; last_tick: number | null; last_record: string | null; rows: Array<Record<string, unknown>> }>(
