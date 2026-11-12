@@ -89,8 +89,8 @@ async function run(client: pg.PoolClient, args: ScanArgs): Promise<{ scanned: nu
 /** Lays rows: live quotes or history, in record order, so that what a scan returns sits on the same pages at both sizes. */
 async function lay(client: pg.PoolClient, n: number, tick: number, expiry: bigint, from: number): Promise<void> {
   await client.query(
-    `INSERT INTO orders (hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, market_key, side, received_block, received_hash)
-     SELECT '0x' || lpad(to_hex(i), 64, '0'), 'rest', $1, 1, $2, 0, 0, $3, 1000000, i, $4, 0, '0x' || repeat('ab', 65), $5, 0, 1, '0x' || repeat('cd', 32)
+    `INSERT INTO orders (hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, market_key, side, received_block, received_hash, received_time)
+     SELECT '0x' || lpad(to_hex(i), 64, '0'), 'rest', $1, 1, $2, 0, 0, $3, 1000000, i, $4, 0, '0x' || repeat('ab', 65), $5, 0, 1, '0x' || repeat('cd', 32), 1
      FROM generate_series($6::bigint, $7::bigint) AS i`,
     [ACCOUNT, SCORER, tick, expiry.toString(), MARKET, from, from + n - 1],
   );

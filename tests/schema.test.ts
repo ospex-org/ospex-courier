@@ -36,6 +36,7 @@ async function insertOrder(hash: string, role: 'rest' | 'take', overrides: Recor
     side: 0,
     received_block: '100',
     received_hash: HASH('e'),
+    received_time: '1794268000',
     bet_state: role === 'take' ? 'waiting' : null,
     ...overrides,
   };

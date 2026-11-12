@@ -46,6 +46,7 @@ export function orderRecord(row: OrderRow): Record<string, unknown> {
     recordNumber: row.recordNumber,
     receivedAt: row.receivedAt.toISOString(),
     receivedBlock: { number: row.receivedBlock.toString(), hash: row.receivedHash },
+    chainTime: row.receivedTime.toString(),
     order: orderToJson(row.order),
     signature: row.signature,
     marketKey: row.marketKey,
@@ -252,13 +253,11 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
     }
 
     // Recorded, with its line.
-    const row = await deps.store.orders.insert(client, { hash, role, order, signature, marketKey: key, receivedBlock: read.header.number, receivedHash: read.header.hash });
+    const row = await deps.store.orders.insert(client, { hash, role, order, signature, marketKey: key, receivedBlock: read.header.number, receivedHash: read.header.hash, receivedTime: T });
     await line('order received', undefined, { recordNumber: row.recordNumber, chainTime: T.toString() });
     await client.query('COMMIT');
-    const record = orderRecord(row);
-    return role === 'rest'
-      ? { status: 201, body: { ...record, chainTime: T.toString() } }
-      : { status: 202, body: record };
+    // The record carries the chain's time it was taken at, so the first answer and a repeat's are the same answer.
+    return { status: role === 'rest' ? 201 : 202, body: orderRecord(row) };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw err;

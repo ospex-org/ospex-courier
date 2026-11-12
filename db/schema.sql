@@ -62,6 +62,9 @@ CREATE TABLE IF NOT EXISTS orders (
   received_at     timestamptz NOT NULL DEFAULT now(),
   received_block  numeric(78, 0) NOT NULL,
   received_hash   text NOT NULL CHECK (received_hash ~ '^0x[0-9a-f]{64}$'),
+  -- The receipt block's time: the chain's time the order was taken at, which the first answer carries and a repeat
+  -- post is answered from, with no chain read.
+  received_time   numeric(78, 0) NOT NULL,
   -- Empty while the order is live as far as the courier itself knows; else how it ended here. What only the
   -- chain knows (a cancel, a floor, a fill sent by another courier) is read at a block, never stored.
   ended           text CHECK (ended IN ('stopped', 'expired', 'filled')),

@@ -78,8 +78,8 @@ courier, the first one posted.
 Sixteen checks, in order; the first that fails is the answer. Before admission (no row, no line; counted by code
 on the status address): the body's shape and its size (8 KB), the caller's minute, the order's own rules as the
 contract has them (`PRICE_OUT_OF_RANGE`, `STAKE_NOT_IN_LOTS`, `MIN_FILL_ABOVE_STAKE`, `UNKNOWN_MARKET_CONTRACT`,
-`INVALID_LINE`), the signature (`BAD_SIGNATURE`), the hash on record (a repeat is answered from the record;
-the other role is `ROLE_CONFLICT`), one read of the chain at the latest block named by its hash
+`INVALID_LINE`), the signature (`BAD_SIGNATURE`), the hash on record (a repeat is answered from the record, the
+first answer whole, with no chain read; the other role is `ROLE_CONFLICT`), one read of the chain at the latest block named by its hash
 (`CHAIN_UNREACHABLE`), the account's registration of the relay (`NOT_REGISTERED`), and the two budgets
 (`RATE_LIMIT_EXCEEDED`, naming which). From then on the request is admitted, and whatever becomes of it is a line:
 the contract's own `getOrderHash` must equal the hash computed here (else `INTERNAL_ERROR`, recorded as the
@@ -93,7 +93,8 @@ them; for a bet, the signed stake not above the cap until the lift, both read fr
 block (`ABOVE_CAP`), the expiry at most 30 seconds past the chain's time (`EXPIRY_TOO_FAR`), and fewer than two of
 the account's bets, and 32 in all, waiting their turn (`QUEUE_FULL`). Checks 5 and 8 to 16 run in one database
 transaction under the order's hash lock. A quote accepted is `201 resting`; a bet accepted is `202 queued`, recorded
-and waiting, and in this build nothing examines or sends it.
+and waiting, and in this build nothing examines or sends it. Either answer is the order's record, which carries the
+chain's time it was taken at as `chainTime`; a repeat post is answered with the same record.
 
 The two budgets are rows in the database, one count for every process and across a restart: an account's 240
 admitted requests at once and 12 a minute after; the courier's 2,400 at once and 60 a minute after, for all

@@ -21,6 +21,8 @@ export interface OrderRow {
   receivedAt: Date;
   receivedBlock: bigint;
   receivedHash: Hex;
+  /** The receipt block's time: the chain's time the order was taken at, which a repeat is answered from. */
+  receivedTime: bigint;
   ended: 'stopped' | 'expired' | 'filled' | null;
   endedAt: Date | null;
   betState: 'waiting' | 'held' | 'sent' | 'refused' | 'lapsed' | null;
@@ -34,6 +36,7 @@ export interface NewOrder {
   marketKey: Hex;
   receivedBlock: bigint;
   receivedHash: Hex;
+  receivedTime: bigint;
 }
 
 /** A quote as the book's scan returns it. */
@@ -83,7 +86,7 @@ export interface ScanResult {
 
 const ORDER_COLUMNS = `hash, role, account, game_id::text AS game_id, scorer, line_ticks, position_type, odds_tick, risk_amount::text AS risk_amount,
   nonce::text AS nonce, expiry::text AS expiry, min_fill::text AS min_fill, signature, market_key, side, record_number::text AS record_number,
-  received_at, received_block::text AS received_block, received_hash, ended, ended_at, bet_state`;
+  received_at, received_block::text AS received_block, received_hash, received_time::text AS received_time, ended, ended_at, bet_state`;
 
 function toRow(r: Record<string, unknown>): OrderRow {
   return {
@@ -108,6 +111,7 @@ function toRow(r: Record<string, unknown>): OrderRow {
     receivedAt: r.received_at as Date,
     receivedBlock: BigInt(r.received_block as string),
     receivedHash: r.received_hash as Hex,
+    receivedTime: BigInt(r.received_time as string),
     ended: (r.ended as OrderRow['ended']) ?? null,
     endedAt: (r.ended_at as Date | null) ?? null,
     betState: (r.bet_state as OrderRow['betState']) ?? null,
@@ -222,8 +226,8 @@ export function createOrders(pool: pg.Pool): Orders {
     async insert(on, o) {
       const { rows } = await on.query(
         `INSERT INTO orders (hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill,
-           signature, market_key, side, received_block, received_hash, bet_state)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+           signature, market_key, side, received_block, received_hash, bet_state, received_time)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
          RETURNING ${ORDER_COLUMNS}`,
         [
           o.hash.toLowerCase(),
@@ -244,6 +248,7 @@ export function createOrders(pool: pg.Pool): Orders {
           o.receivedBlock.toString(),
           o.receivedHash.toLowerCase(),
           o.role === 'take' ? 'waiting' : null,
+          o.receivedTime.toString(),
         ],
       );
       return toRow(rows[0] as Record<string, unknown>);

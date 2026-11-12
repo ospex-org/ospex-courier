@@ -168,11 +168,22 @@ test('a quote posted is recorded: 201, resting, a record number, the chain\'s ti
   assert.equal((await get(url(), `/v1/orders/0x${'1'.repeat(64)}`)).body.code, 'UNKNOWN_ORDER');
   assert.equal((await get(url(), '/v1/orders/abc')).body.code, 'INVALID_PARAM');
 
-  // The same order again: the record, 200, and nothing written.
+  assert.equal(served.body.chainTime, T.toString(), 'the record carries the chain\'s time it was taken at');
+
+  // The same order again: the record, 200, and nothing written. It is the first answer, the chain's time included,
+  // and stays so after the chain's clock has moved: a repeat is answered from the record and asks the chain nothing.
   const again = await post(url(), '/v1/orders', { role: 'rest', order: wire(order), signature: posted.signature });
   assert.equal(again.status, 200);
   assert.equal(again.body.recordNumber, posted.body.recordNumber);
+  assert.equal(again.body.chainTime, T.toString(), 'the repeat carries the first answer\'s chain time');
   assert.equal((await lines()).length, linesBefore + 1, 'a repeat writes no line');
+  await rig.increaseTime(7n);
+  assert.ok((await rig.time()) > T, 'the chain\'s clock has moved');
+  const chainCalls = stack.proxy.count();
+  const later = await post(url(), '/v1/orders', { role: 'rest', order: wire(order), signature: posted.signature });
+  assert.equal(later.status, 200);
+  assert.deepEqual(later.body, posted.body, 'the repeat is the first answer, whole');
+  assert.equal(stack.proxy.count(), chainCalls, 'a repeat asks the chain nothing');
   // Under the other role: a conflict, counted, and nothing written.
   const conflict = await post(url(), '/v1/orders', { role: 'take', order: wire(order), signature: posted.signature });
   assert.equal(conflict.status, 409);
@@ -402,6 +413,7 @@ test('a bet: 202 queued, with no Cross; the cap before the lift refuses 10,100 w
   assert.equal(at.status, 202, JSON.stringify(at.body));
   assert.equal(at.body.state, 'queued');
   assert.equal(at.body.cross, null);
+  assert.equal(at.body.chainTime, T.toString(), 'a bet\'s record carries the chain\'s time too');
   const row = await orderRow(at.body.orderHash as string);
   assert.equal(row?.bet_state, 'waiting');
   assert.equal(row?.role, 'take');

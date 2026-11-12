@@ -105,8 +105,8 @@ test('one market\'s quotes are listed lowest tick first, then record number, wha
   const q6 = { hash: stale, record: 0 };
   {
     const { rows } = await pool.query<{ record_number: string }>(
-      `INSERT INTO orders (hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, market_key, side, received_block, received_hash, received_at)
-       SELECT $1, 'rest', $2, $3, $4, 0, 0, 150, 1000000, 0, $5, 0, '0x' || repeat('ab', 65), market_key, 0, 1, '0x' || repeat('cd', 32), now() - interval '1 hour'
+      `INSERT INTO orders (hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, market_key, side, received_block, received_hash, received_time, received_at)
+       SELECT $1, 'rest', $2, $3, $4, 0, 0, 150, 1000000, 0, $5, 0, '0x' || repeat('ab', 65), market_key, 0, 1, '0x' || repeat('cd', 32), 1, now() - interval '1 hour'
        FROM orders WHERE hash = $6 RETURNING record_number::text`,
       [stale, maker.address.toLowerCase(), rig.gameId.toString(), rig.addresses.moneyline.toLowerCase(), (T + 3_600n).toString(), q1.hash.toLowerCase()],
     );
@@ -291,8 +291,8 @@ test('remaining is the stake less what the chain shows filled; payable is what t
 /** Plants quotes straight into the records: a backlog the door never saw, as the fixture of the cost contract plants them. */
 async function plant(n: number, fields: { marketKey: Hex; gameId: bigint; scorer: Address; lineTicks: number; oddsTick: number; expiry: bigint; account: Address }): Promise<void> {
   await pool.query(
-    `INSERT INTO orders (hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, market_key, side, received_block, received_hash)
-     SELECT '0x' || lpad(to_hex(i), 64, '0'), 'rest', $1, $2, $3, $4, 0, $5, 1000000, i, $6, 0, '0x' || repeat('ab', 65), $7, 0, 1, '0x' || repeat('cd', 32)
+    `INSERT INTO orders (hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, market_key, side, received_block, received_hash, received_time)
+     SELECT '0x' || lpad(to_hex(i), 64, '0'), 'rest', $1, $2, $3, $4, 0, $5, 1000000, i, $6, 0, '0x' || repeat('ab', 65), $7, 0, 1, '0x' || repeat('cd', 32), 1
      FROM generate_series($8::bigint, $9::bigint) AS i`,
     [fields.account.toLowerCase(), fields.gameId.toString(), fields.scorer.toLowerCase(), fields.lineTicks, fields.oddsTick, fields.expiry.toString(), fields.marketKey.toLowerCase(), planted + 1, planted + n],
   );
