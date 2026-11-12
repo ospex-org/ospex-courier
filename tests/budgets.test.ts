@@ -106,6 +106,43 @@ test('the budgets across two processes, and across a restart: one count', async 
   }
 });
 
+test("the budget's clock never goes back: a request that read an older block than the row's last refill refills nothing and writes no older time, so the same minute cannot refill twice", async () => {
+  const who = rig.account(31);
+  await rig.fund(who);
+  const T1 = await rig.time();
+  const olderBlock = (await rig.publicClient.getBlock()).number;
+  // The account's 240 at once, every one read at T1.
+  const first = await many(240, 8, (i, headers) => postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T1 - BigInt(i) }), headers));
+  assert.equal(first.filter((a) => a.body.code === 'EXPIRED').length, 240, JSON.stringify(first.find((a) => a.body.code !== 'EXPIRED')?.body));
+  // A minute later on the chain's clock: twelve more, and the thirteenth refused.
+  await rig.setNextBlockTime(T1 + 60n);
+  await rig.mine(1);
+  assert.equal(await rig.time(), T1 + 60n);
+  const minute = await many(13, 8, (i, headers) => postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T1 - 300n - BigInt(i) }), headers));
+  assert.equal(minute.filter((a) => a.body.code === 'EXPIRED').length, 12, JSON.stringify(minute.map((a) => a.body.code)));
+  assert.equal(minute.filter((a) => a.status === 429).length, 1);
+  const at = async () => (await pool.query<{ at: string }>(`SELECT floor(extract(epoch FROM budget_at))::bigint::text AS at FROM accounts WHERE account = $1`, [who.address.toLowerCase()])).rows[0]?.at;
+  assert.equal(await at(), (T1 + 60n).toString(), 'the row holds the time of its last refill');
+
+  // A request whose read of the chain is the older block, at T1: the proxy answers the latest tag with that block.
+  // It is refused, and the row keeps T1 + 60.
+  stack.proxy.rule('eth_getBlockByNumber', { kind: 'rewrite', params: (p) => (p[0] === 'latest' ? [`0x${olderBlock.toString(16)}`, p[1] ?? false] : p) });
+  try {
+    const stale = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T1 - 400n }));
+    assert.equal(stale.status, 429, JSON.stringify(stale.body));
+    assert.equal(stale.body.budget, 'account');
+  } finally {
+    stack.proxy.rule('eth_getBlockByNumber', null);
+  }
+  assert.equal(await at(), (T1 + 60n).toString(), 'the stored time did not go back');
+
+  // At T1 + 60 again: the minute does not refill twice.
+  const again = await many(12, 8, (i, headers) => postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T1 - 500n - BigInt(i) }), headers));
+  assert.equal(again.filter((a) => a.status === 429).length, 12, `admitted again: ${JSON.stringify(again.filter((a) => a.status !== 429).map((a) => a.body))}`);
+  const row = (await pool.query<{ refused: number }>('SELECT refused::int AS refused FROM accounts WHERE account = $1', [who.address.toLowerCase()])).rows[0];
+  assert.equal(row?.refused, 14, 'the thirteenth, the stale one and the twelve: a number, not a line');
+});
+
 test("the courier's budget: 2,400 admitted at once after a quiet hour, then 60 a minute; the two numbers are told apart, on the chain's clock", async () => {
   // Eleven fresh accounts, each with room for 240: the courier's bucket runs out first.
   const accounts: HDAccount[] = [];

@@ -10,6 +10,12 @@ import { BOUNDS } from '../http/limits';
 //
 // An admitted request takes one from each. A request over a budget is not
 // admitted, and the row counts how many and when last: a number, not a line.
+//
+// The stored time never goes back. A request that read an older block than the
+// one the row was last refilled at, by a reorder of reads between the chain
+// and the lock, refills nothing (the clamp below) and writes no older time: the
+// row keeps the newest time it has seen, so the same interval cannot refill
+// twice.
 
 export const COURIER_ROW = 'courier';
 
@@ -52,17 +58,20 @@ export async function takeBudgets(client: pg.PoolClient, account: string, chainT
   const own = await lockRow(client, account);
   const courierHeld = refilled(Number(courier.budget), BigInt(courier.at), chainTime, BOUNDS.courierBudget.atOnce, BOUNDS.courierBudget.perMinute);
   const ownHeld = refilled(Number(own.budget), BigInt(own.at), chainTime, BOUNDS.accountBudget.atOnce, BOUNDS.accountBudget.perMinute);
+  // Every write keeps the newer of the row's time and this request's: the stored time never goes back.
+  const refusedRow = `UPDATE accounts SET budget = $2, budget_at = GREATEST(budget_at, to_timestamp($3::bigint)), refused = refused + 1, last_refused_at = now() WHERE account = $1`;
+  const takenRow = `UPDATE accounts SET budget = $2, budget_at = GREATEST(budget_at, to_timestamp($3::bigint)) WHERE account = $1`;
   if (ownHeld < 1) {
-    await client.query(`UPDATE accounts SET budget = $2, budget_at = to_timestamp($3::bigint), refused = refused + 1, last_refused_at = now() WHERE account = $1`, [account, ownHeld.toFixed(6), time]);
+    await client.query(refusedRow, [account, ownHeld.toFixed(6), time]);
     return { ok: false, which: 'account', retryAfterSeconds: secondsUntilOne(ownHeld, BOUNDS.accountBudget.perMinute) };
   }
   if (courierHeld < 1) {
-    await client.query(`UPDATE accounts SET budget = $2, budget_at = to_timestamp($3::bigint), refused = refused + 1, last_refused_at = now() WHERE account = $1`, [COURIER_ROW, courierHeld.toFixed(6), time]);
-    await client.query(`UPDATE accounts SET budget = $2, budget_at = to_timestamp($3::bigint) WHERE account = $1`, [account, ownHeld.toFixed(6), time]);
+    await client.query(refusedRow, [COURIER_ROW, courierHeld.toFixed(6), time]);
+    await client.query(takenRow, [account, ownHeld.toFixed(6), time]);
     return { ok: false, which: 'courier', retryAfterSeconds: secondsUntilOne(courierHeld, BOUNDS.courierBudget.perMinute) };
   }
-  await client.query(`UPDATE accounts SET budget = $2, budget_at = to_timestamp($3::bigint) WHERE account = $1`, [COURIER_ROW, (courierHeld - 1).toFixed(6), time]);
-  await client.query(`UPDATE accounts SET budget = $2, budget_at = to_timestamp($3::bigint) WHERE account = $1`, [account, (ownHeld - 1).toFixed(6), time]);
+  await client.query(takenRow, [COURIER_ROW, (courierHeld - 1).toFixed(6), time]);
+  await client.query(takenRow, [account, (ownHeld - 1).toFixed(6), time]);
   return { ok: true };
 }
 
