@@ -25,6 +25,8 @@ export type Rule =
   | { kind: 'refuse'; code: number; message: string }
   | { kind: 'answer'; result: (params: unknown[]) => unknown }
   | { kind: 'rewrite'; params: (params: unknown[]) => unknown[] }
+  /** Pass the request on, and answer with the node's result changed: the chain made to say something else. */
+  | { kind: 'rewriteResult'; result: (params: unknown[], result: unknown) => unknown }
   | { kind: 'hold'; released: Promise<void> };
 
 export interface ChainProxy {
@@ -76,6 +78,12 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
     if (rule?.kind === 'rewrite') {
       const text = await upstream(JSON.stringify({ ...req, params: rule.params(params) }));
       return { text, how: 'passed' };
+    }
+    if (rule?.kind === 'rewriteResult') {
+      const text = await upstream(raw);
+      const answer = JSON.parse(text) as Record<string, unknown>;
+      if (!('result' in answer)) return { text, how: 'passed' };
+      return { text: JSON.stringify({ ...answer, result: rule.result(params, answer.result) }), how: 'answered' };
     }
     if (rule?.kind === 'hold') {
       await rule.released;

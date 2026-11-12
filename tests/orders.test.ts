@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import pg from 'pg';
-import { encodeAbiParameters, keccak256, toBytes, type Abi, type Address, type Hex } from 'viem';
+import { decodeFunctionData, decodeFunctionResult, encodeAbiParameters, encodeFunctionData, encodeFunctionResult, keccak256, toBytes, type Abi, type Address, type Hex } from 'viem';
+import { MULTICALL_ABI, MULTICALL_ADDRESS } from '../courier/chain/abi';
 import { orderHash, orderSigner } from '../courier/orders/order';
 import { openPool } from '../courier/records/store';
 import { get, startCourier } from './support/courier';
@@ -66,6 +67,24 @@ async function orderRow(hash: string): Promise<Record<string, unknown> | null> {
 
 async function refusedBeforeAdmission(): Promise<Record<string, number>> {
   return ((await get(url(), '/v1/status')).body.refusedBeforeAdmission as { byCode: Record<string, number> }).byCode;
+}
+
+/**
+ * The node's answer to the door's one call, with the matching contract's answer for its cap replaced: the chain
+ * made to say another cap. The contract's TAKING_STAKE_CAP is a constant, so the contracts cannot give the door
+ * another value; the proxy, the door's only source, can.
+ */
+function withCapAnswered(params: unknown[], result: unknown, capCall: Hex, cap: bigint): unknown {
+  const call = params[0] as { to?: string; data?: Hex } | undefined;
+  if (typeof result !== 'string' || call?.to?.toLowerCase() !== MULTICALL_ADDRESS.toLowerCase() || call.data === undefined) return result;
+  const decoded = decodeFunctionData({ abi: MULTICALL_ABI, data: call.data });
+  if (decoded.functionName !== 'aggregate3') return result;
+  const calls = decoded.args[0] as ReadonlyArray<{ callData: Hex }>;
+  const answers = [...(decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', data: result as Hex }) as ReadonlyArray<{ success: boolean; returnData: Hex }>)];
+  calls.forEach((c, i) => {
+    if (c.callData.toLowerCase() === capCall.toLowerCase()) answers[i] = { success: true, returnData: encodeAbiParameters([{ type: 'uint256' }], [cap]) };
+  });
+  return encodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', result: answers });
 }
 
 // ──────────────────────────── the hash ────────────────────────────────────
@@ -434,6 +453,23 @@ test('a bet: 202 queued, with no Cross; the cap before the lift refuses 10,100 w
   // A quote of 50 USDC is accepted: resting stakes are not capped.
   const large = await postOrder(url(), rig, maker, 'rest', orderOn(rig, maker, { expiry: T + 600n, riskAmount: 50_000_000n, oddsTick: 250 }));
   assert.equal(large.status, 201, JSON.stringify(large.body));
+
+  // The cap is the chain's answer, not a number the courier holds. The contract's cap is a constant, so the chain is
+  // made to answer 20,000 at the proxy, the door's only source: told 20,000, the door names it and takes 15,000,
+  // which the contract's own 10,000 would refuse; the chain answering 10,000 again, 15,000 is refused.
+  const capCall = encodeFunctionData({ abi: rig.abis.OspexMatching as Abi, functionName: 'TAKING_STAKE_CAP', args: [] } as never);
+  stack.proxy.rule('eth_call', { kind: 'rewriteResult', result: (params, result) => withCapAnswered(params, result, capCall, 20_000n) });
+  try {
+    const toldOver = await postOrder(url(), rig, maker, 'take', orderOn(rig, maker, { expiry: T + 20n, riskAmount: 20_100n, positionType: 1 }));
+    assert.equal(toldOver.body.code, 'ABOVE_CAP', JSON.stringify(toldOver.body));
+    assert.equal(toldOver.body.error, 'Bets are capped at 0.02 USDC until the cap is lifted. This bet is signed for 0.0201 USDC. Nothing was sent.');
+    const toldUnder = await postOrder(url(), rig, maker, 'take', orderOn(rig, maker, { expiry: T + 20n, riskAmount: 15_000n, positionType: 1 }));
+    assert.equal(toldUnder.status, 202, `told a cap of 20,000, 15,000 is taken: ${JSON.stringify(toldUnder.body)}`);
+  } finally {
+    stack.proxy.rule('eth_call', null);
+  }
+  const chainsOwn = await postOrder(url(), rig, maker, 'take', orderOn(rig, maker, { expiry: T + 20n, riskAmount: 15_000n, positionType: 1 }));
+  assert.equal(chainsOwn.body.code, 'ABOVE_CAP', `the chain's own answer again: ${JSON.stringify(chainsOwn.body)}`);
 
   // The lift, through the timelock: from then on nothing is refused for size.
   await liftCap(rig);
