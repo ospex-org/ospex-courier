@@ -37,7 +37,20 @@ interface Measured {
   marked: number;
   /** The scan node's shared buffer accesses: hit + read, non-distinct, index and table together. */
   buffers: number;
+  /**
+   * How the book index's cumulative counters moved across this statement: entries the index returned
+   * (idx_tup_read) and live rows fetched by them (idx_tup_fetch). Read as a negative control only, never as the
+   * figure: a dead entry the scan visits, once an earlier scan has marked it dead, is counted by neither.
+   */
+  counters: { read: number; fetch: number };
   last: { tick: number; record: number } | null;
+}
+
+/** The book index's cumulative counters, flushed first so this session's own statements are in them. */
+async function indexCounters(client: pg.PoolClient): Promise<{ read: number; fetch: number }> {
+  await client.query('SELECT pg_stat_force_next_flush()');
+  const { rows } = await client.query<{ read: string; fetch: string }>(`SELECT idx_tup_read::text AS read, idx_tup_fetch::text AS fetch FROM pg_stat_user_indexes WHERE indexrelname = 'orders_book'`);
+  return { read: Number(rows[0]?.read ?? 0), fetch: Number(rows[0]?.fetch ?? 0) };
 }
 
 type PlanNode = Record<string, unknown> & { Plans?: PlanNode[] };
@@ -56,7 +69,10 @@ function* walk(node: PlanNode): Generator<PlanNode> {
  */
 async function measure(client: pg.PoolClient, args: ScanArgs): Promise<Measured> {
   const params = scanParams(args);
+  const countersBefore = await indexCounters(client);
   const { rows } = await client.query<{ 'QUERY PLAN': Array<{ Plan: PlanNode }> }>(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${SCAN_SQL}`, params);
+  const countersAfter = await indexCounters(client);
+  const counters = { read: countersAfter.read - countersBefore.read, fetch: countersAfter.fetch - countersBefore.fetch };
   const root = rows[0]?.['QUERY PLAN'][0]?.Plan;
   assert.ok(root, 'a plan');
   const nodes = [...walk(root)];
@@ -74,6 +90,7 @@ async function measure(client: pg.PoolClient, args: ScanArgs): Promise<Measured>
     passedFilter: Number(liveFilter['Actual Rows']),
     marked: Number(update['Actual Rows']),
     buffers: Number(scan['Shared Hit Blocks'] ?? 0) + Number(scan['Shared Read Blocks'] ?? 0),
+    counters,
     last: null,
   };
 }
@@ -215,6 +232,14 @@ test('the book with 50,000 and with 500,000 orders ended by the mark: the counts
       }
       assert.ok(vacuumReport.removed >= n, `the vacuum cleared the planted versions, whole or already pruned: ${JSON.stringify(vacuumReport)}`);
       assert.equal(vacuumReport.notYetRemovable, 0, 'none dead but not yet removable');
+      // The two negative controls, asserted on the evidence itself. The dead cost is seen: the measurement before
+      // vacuum reads more buffers than the one after; a run after vacuum alone would show no difference. And the
+      // index's cumulative counters are not the figure: they move by the same amounts across the two measurements
+      // (the ten entries returned, the ten rows fetched) while the buffers differ by the dead planted, because a
+      // dead entry the scan visits, once an earlier scan has marked it dead, is counted by neither counter. Neither
+      // assertion is an equality or a ceiling on the before-vacuum figure.
+      assert.ok(before.buffers > after_.buffers, `${n}: the dead versions planted are seen before vacuum (${before.buffers}) and gone after (${after_.buffers})`);
+      assert.deepEqual(before.counters, after_.counters, `${n}: the cumulative counters moved the same before vacuum (${JSON.stringify(before.counters)}) and after (${JSON.stringify(after_.counters)}), seeing none of the ${n} dead entries the scan visited`);
     } finally {
       client.release();
       await pool.end();
@@ -227,7 +252,8 @@ test('the book with 50,000 and with 500,000 orders ended by the mark: the counts
     Math.abs(large.after.buffers - small.after.buffers) <= tolerance,
     `after vacuum, the scan's buffer accesses at ${SIZES[1]} (${large.after.buffers}) and at ${SIZES[0]} (${small.after.buffers}) differ by more than ${tolerance} pages`,
   );
-  report.markedHistory = Object.fromEntries(Object.entries(figures).map(([n, f]) => [n, { beforeVacuum: f.before.buffers, afterVacuum: f.after.buffers, deadPlanted: f.marks, vacuum: f.vacuumReport, indexLevel: f.level }]));
+  assert.ok(large.before.buffers > small.before.buffers, `before vacuum the dead cost grows with the dead planted: ${large.before.buffers} at ${SIZES[1]}, ${small.before.buffers} at ${SIZES[0]}`);
+  report.markedHistory = Object.fromEntries(Object.entries(figures).map(([n, f]) => [n, { beforeVacuum: f.before.buffers, afterVacuum: f.after.buffers, countersBeforeVacuum: f.before.counters, countersAfterVacuum: f.after.counters, deadPlanted: f.marks, vacuum: f.vacuumReport, indexLevel: f.level }]));
 });
 
 interface BacklogFigures {
@@ -235,6 +261,8 @@ interface BacklogFigures {
   beforeVacuum: number;
   afterVacuum: number;
   deadAhead: number;
+  /** The cumulative counters' movement across each measurement, reported beside the buffers and held to nothing: on this book the 2,000 dead ahead, not yet marked dead in the index by any scan, are returned by the index once and counted that once. */
+  counters: Record<'heldBehind' | 'beforeVacuum' | 'afterVacuum', { read: number; fetch: number }>;
   vacuum: VacuumReport;
   indexLevel: number;
 }
