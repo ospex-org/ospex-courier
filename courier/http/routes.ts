@@ -105,9 +105,19 @@ export async function getBook(deps: RouteDeps, query: URLSearchParams): Promise<
   const scorer = query.get('scorer');
   const lineText = query.get('lineTicks');
   if (scorer === null && lineText === null) {
-    if (query.get('side') !== null || query.get('after') !== null || query.get('limit') !== null) return before(deps, route, 400, 'INVALID_PARAM', 'side, after and limit go with scorer and lineTicks: one market\'s quotes.');
+    if (query.get('side') !== null) return before(deps, route, 400, 'INVALID_PARAM', "side goes with scorer and lineTicks: one market's quotes.");
+    // The game's markets, a page at a time: after is the last market of the page before, as scorer:lineTicks.
+    const afterText = query.get('after');
+    let after = null;
+    if (afterText !== null) {
+      const m = /^(0x[0-9a-fA-F]{40}):(-?[0-9]{1,7})$/.exec(afterText);
+      if (m === null || !isAddress(m[1] as string, { strict: false })) return before(deps, route, 400, 'INVALID_PARAM', "after must be the last market of the page before, scorer:lineTicks.");
+      after = { scorer: getAddress(m[1] as string), lineTicks: Number(m[2]) };
+    }
+    const limit = query.get('limit') === null ? BigInt(BOUNDS.page) : wholeNumber(query.get('limit'), 4);
+    if (limit === null || limit < 1n || limit > BigInt(BOUNDS.page)) return before(deps, route, 400, 'INVALID_PARAM', `limit must be a whole number from 1 to ${BOUNDS.page}.`);
     try {
-      return { status: 200, body: { ...(await readGameBook(deps, gameId)) } };
+      return { status: 200, body: { ...(await readGameBook(deps, gameId, after, Number(limit))) } };
     } catch (err) {
       if (err instanceof ChainUnreachable) return CHAIN_UNREACHABLE;
       if (isDatabaseFailure(err)) return DATABASE_UNREADABLE;

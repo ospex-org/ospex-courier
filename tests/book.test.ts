@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import pg from 'pg';
-import { type Abi, type Address, type Hex } from 'viem';
+import { encodeAbiParameters, getAddress, keccak256, type Abi, type Address, type Hex } from 'viem';
 import type { HDAccount } from 'viem/accounts';
 import { openPool } from '../courier/records/store';
 import { get, startCourier } from './support/courier';
@@ -348,4 +348,51 @@ test('a backlog of 2,500 expired quotes not yet marked, at better prices than on
   const game = await get(url(), `/v1/book?gameId=${rig.gameId}`);
   const m = (game.body.markets as Array<{ marketKey: Hex; live: { A: { live: number; boundReached: boolean; marked: number } } }>).find((x) => x.marketKey === marketKey.toLowerCase());
   assert.deepEqual(m?.live.A, { live: 0, boundReached: true, marked: 2_000 });
+});
+
+test('the markets of a game are paged, 100 a page in the order of the market contract and the line, and the cursor reaches the rest: 101 markets with a live quote each are listed once each, over two pages and over pages of seven', async () => {
+  const game = await rig.createGame();
+  const spread = rig.addresses.spread;
+  const lines = Array.from({ length: 101 }, (_, i) => -5_000 + i * 50);
+  const T = await rig.time();
+  for (const lineTicks of lines) {
+    const key = keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'address' }, { type: 'int32' }], [game, spread, lineTicks]));
+    await plant(1, { marketKey: key, gameId: game, scorer: spread, lineTicks, oddsTick: 200, expiry: T + 3_600n, account: rig.accounts.maker.address });
+  }
+  const page1 = await get(url(), `/v1/book?gameId=${game}`);
+  assert.equal(page1.status, 200, JSON.stringify(page1.body));
+  const m1 = page1.body.markets as Array<{ scorer: Address; lineTicks: number; live: { A: { live: number } } }>;
+  assert.deepEqual(m1.map((m) => m.lineTicks), lines.slice(0, 100), 'the first hundred, in order');
+  assert.deepEqual(m1[0]?.live.A, { live: 1, boundReached: false, marked: 0 });
+  assert.equal(page1.body.more, true);
+  assert.equal(page1.body.limit, 100);
+  assert.deepEqual(page1.body.next, { scorer: getAddress(spread), lineTicks: lines[99] }, 'where the next page starts: the last market of this one');
+  const next = page1.body.next as { scorer: string; lineTicks: number };
+  const page2 = await get(url(), `/v1/book?gameId=${game}&after=${next.scorer}:${next.lineTicks}`);
+  assert.equal(page2.status, 200, JSON.stringify(page2.body));
+  assert.deepEqual((page2.body.markets as Array<{ lineTicks: number }>).map((m) => m.lineTicks), [lines[100]], 'the cursor reaches the rest');
+  assert.equal(page2.body.more, false);
+  assert.equal(page2.body.next, null);
+
+  // Pages of seven walk the same list: every market once, in order.
+  const seen: number[] = [];
+  let after = '';
+  for (let pages = 0; ; pages++) {
+    assert.ok(pages < 20, 'the walk ends');
+    const page = await get(url(), `/v1/book?gameId=${game}&limit=7${after}`);
+    assert.equal(page.status, 200, JSON.stringify(page.body));
+    const markets = page.body.markets as Array<{ lineTicks: number }>;
+    assert.ok(markets.length <= 7);
+    seen.push(...markets.map((m) => m.lineTicks));
+    if (page.body.more !== true) {
+      assert.equal(page.body.next, null);
+      break;
+    }
+    const n = page.body.next as { scorer: string; lineTicks: number };
+    after = `&after=${n.scorer}:${n.lineTicks}`;
+  }
+  assert.deepEqual(seen, lines);
+  for (const bad of ['&limit=0', '&limit=101', '&after=abc', `&after=${spread}`, `&after=${spread}:x`, '&after=1:2']) {
+    assert.equal((await get(url(), `/v1/book?gameId=${game}${bad}`)).body.code, 'INVALID_PARAM', bad);
+  }
 });

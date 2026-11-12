@@ -121,9 +121,11 @@ addresses.
 - `GET /v1/runs?after=&limit=`: the runs, 100 to a page: each start of the process, and each stop the process
   wrote itself. A process that dies writes nothing, and no later start writes it for it. This is the courier's own
   account of when it was running, not a measure of whether a caller could reach it.
-- `GET /v1/book?gameId=`: the markets of a game that hold a live quote, each side's count within the bound of
+- `GET /v1/book?gameId=[&after=scorer:lineTicks&limit=]`: the markets of a game that hold a live quote, 100 to a
+  page in the order of the market contract's address and then the line, each side's count within the bound of
   2,000 rows and whether the bound ended the count, at one block named by number, hash and time, with the final
-  block beside it. `GET /v1/book?gameId=&scorer=&lineTicks=[&side=A|B&after=tick:record&limit=]`: one market's
+  block beside it; `more` says whether markets follow and `next` names the last market of the page, which the
+  next request passes as `after`. `GET /v1/book?gameId=&scorer=&lineTicks=[&side=A|B&after=tick:record&limit=]`: one market's
   quotes, 50 a side to a page at most, in the fill-priority order; each with `remaining` (the signed stake less
   what the chain shows filled) and `payable` (what the account's balance and allowance cover, this quote alone);
   once per account on the page, its balance and allowance; a page short of its limit says whether the book or the
