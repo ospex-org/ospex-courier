@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import pg from 'pg';
+import { getAddress } from 'viem';
 import { BOUNDS } from '../courier/http/limits';
 import { SCAN_SQL, scanParams, type ScanArgs } from '../courier/records/orders';
 import { openPool } from '../courier/records/store';
@@ -324,7 +325,32 @@ test('the book with 50,000 and with 500,000 expired quotes not yet marked, at be
   report.backlog = figures;
 });
 
-test('the growth: the bytes an order row and an event line take with their indexes, read from the database', async () => {
+/**
+ * The fixture rows of the three shapes the orders build does not yet write, in the frozen schema's shape, so that
+ * the bytes they take can be measured now; the figures are to be read again from real rows once the stop build
+ * and the sender build write them. How many of each are laid: enough rows that a table's size is many pages.
+ */
+const FIXTURE = {
+  /** Stops of 100 carried hashes: 100 rows each, every row carrying the message as received, 100 hashes, and its signature. */
+  stopsOf100: 20,
+  /** Stops ahead of 16 originals: 16 rows each, with the signed original and its expiry beside the message. */
+  stopsAheadOf16: 100,
+  /** Crosses confirmed with 40 legs each, and their bets. */
+  crosses: 1_000,
+  /** Lines of each kind laid to measure a line's bytes. */
+  lines: 3_000,
+} as const;
+const SIGNATURE = '0x' + 'ab'.repeat(65);
+const SENDER = '0x' + '0b'.repeat(20);
+const hashes = (from: number, n: number): string[] => Array.from({ length: n }, (_, i) => `0x${(from + i).toString(16).padStart(64, '0')}`);
+
+async function totalSize(client: pg.PoolClient, table: string): Promise<number> {
+  await client.query(`VACUUM ANALYZE ${table}`);
+  const { rows } = await client.query<{ bytes: string }>(`SELECT pg_total_relation_size($1::regclass)::text AS bytes`, [table]);
+  return Number(rows[0]?.bytes);
+}
+
+test('the growth: the bytes an order row and an event line take with their indexes, read from the database; and, from fixture rows of the frozen schema\'s shape, a stop of 100 carried hashes, a stop ahead of 16 originals and a 40-leg Cross', async () => {
   const { pool, client } = await freshBook('cost_growth');
   try {
     await lay(client, 100_000, 200, T + 3_600n, 1);
@@ -334,12 +360,99 @@ test('the growth: the bytes an order row and an event line take with their index
        SELECT 1, 'order received', '0x' || lpad(to_hex(i), 64, '0'), $1, 1, NULL, '{"role":"rest","block":"1","recordNumber":1,"chainTime":"2000"}'::jsonb FROM generate_series(1, 100000) AS i`,
       [ACCOUNT],
     );
-    await client.query('VACUUM ANALYZE orders');
-    await client.query('VACUUM ANALYZE events');
-    const { rows } = await client.query<{ table: string; bytes: string }>(`SELECT relname AS table, pg_total_relation_size(oid)::text AS bytes FROM pg_class WHERE relname IN ('orders', 'events')`);
-    const bytes = Object.fromEntries(rows.map((r) => [r.table, Math.round(Number(r.bytes) / 100_000)]));
-    assert.ok((bytes.orders ?? 0) > 0 && (bytes.events ?? 0) > 0);
+    const ordersBytes = await totalSize(client, 'orders');
+    const eventsBytes = await totalSize(client, 'events');
+    const bytes = { orders: Math.round(ordersBytes / 100_000), events: Math.round(eventsBytes / 100_000) };
+    assert.ok(bytes.orders > 0 && bytes.events > 0);
     report.bytesPerRow = bytes;
+
+    // Stops of 100 carried hashes: a row for each hash stopped, each carrying the whole message and its signature.
+    const account = getAddress(ACCOUNT);
+    for (let s = 0; s < FIXTURE.stopsOf100; s++) {
+      const stopped = hashes(1 + s * 100, 100);
+      await client.query(
+        `INSERT INTO stops (hash, account, message, signature) SELECT h, $1, $2::jsonb, $3 FROM unnest($4::text[]) AS h`,
+        [ACCOUNT, JSON.stringify({ account, orderHashes: stopped }), SIGNATURE, stopped],
+      );
+    }
+    const carriedRows = Number((await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM stops WHERE NOT ahead`)).rows[0]?.n);
+    assert.equal(carriedRows, FIXTURE.stopsOf100 * 100, 'the rows of the carried stops');
+    const short = Number((await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM stops WHERE NOT ahead AND jsonb_array_length(message -> 'orderHashes') <> 100`)).rows[0]?.n);
+    assert.equal(short, 0, 'every row of a carried stop carries the message of 100 hashes');
+    const stopsCarriedBytes = await totalSize(client, 'stops');
+
+    // Stops ahead of 16 originals: a row for each, the signed original and its expiry beside the message.
+    for (let s = 0; s < FIXTURE.stopsAheadOf16; s++) {
+      const ahead = hashes(10_000_000 + s * 16, 16);
+      const original = {
+        order: { account, gameId: '1', scorer: getAddress(SCORER), lineTicks: 0, positionType: 0, oddsTick: 200, riskAmount: '1000000', nonce: String(5_000_000 + s), expiry: String(T + 3_600n), minFill: '0' },
+        signature: SIGNATURE,
+      };
+      await client.query(
+        `INSERT INTO stops (hash, account, message, signature, ahead, original, original_expiry) SELECT h, $1, $2::jsonb, $3, true, $5::jsonb, $6 FROM unnest($4::text[]) AS h`,
+        [ACCOUNT, JSON.stringify({ account, orderHashes: ahead }), SIGNATURE, ahead, JSON.stringify(original), (T + 3_600n).toString()],
+      );
+    }
+    const aheadRows = Number((await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM stops WHERE ahead AND original IS NOT NULL`)).rows[0]?.n);
+    assert.equal(aheadRows, FIXTURE.stopsAheadOf16 * 16, 'the rows of the stops ahead, each with its original');
+    const stopsAheadBytes = (await totalSize(client, 'stops')) - stopsCarriedBytes;
+
+    // Crosses: a bet each, confirmed, with 40 legs recorded against the quotes laid above.
+    await client.query(
+      `INSERT INTO orders (hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, market_key, side, received_block, received_hash, received_time, bet_state)
+       SELECT '0x' || lpad(to_hex(20000000 + i), 64, '0'), 'take', $1, 1, $2, 0, 1, 200, 4000000, 7000000 + i, $3, 0, $4, $5, 1, 1, '0x' || repeat('cd', 32), 1, 'sent'
+       FROM generate_series(1, ${FIXTURE.crosses}) AS i`,
+      [ACCOUNT, SCORER, (T + 30n).toString(), SIGNATURE, MARKET],
+    );
+    await client.query(`INSERT INTO lanes (sender, epoch, owner_run) VALUES ($1, 1, 1)`, [SENDER]);
+    await client.query(
+      `INSERT INTO crosses (bet_hash, lane, epoch, reservation, block_number, block_hash, block_time, sender, nonce, gas_limit, max_fee_per_gas, max_priority_fee,
+         tx_hash, state, hand_offs, node_answer, receipt_block_number, receipt_block_hash, final_block_number, final_block_hash)
+       SELECT '0x' || lpad(to_hex(20000000 + i), 64, '0'), $1, 1, i, 1000 + i, '0x' || lpad(to_hex(30000000 + i), 64, '0'), 2000 + i, $1, i, 900000, 60000000000, 30000000000,
+         '0x' || lpad(to_hex(40000000 + i), 64, '0'), 'confirmed', 1, jsonb_build_object('result', '0x' || lpad(to_hex(40000000 + i), 64, '0')),
+         1001 + i, '0x' || lpad(to_hex(50000000 + i), 64, '0'), 1005 + i, '0x' || lpad(to_hex(60000000 + i), 64, '0')
+       FROM generate_series(1, ${FIXTURE.crosses}) AS i`,
+      [SENDER],
+    );
+    await client.query(
+      `INSERT INTO legs (bet_hash, position, order_hash, expected_maker_risk, expected_taker_risk, recorded_maker_risk, recorded_taker_risk)
+       SELECT '0x' || lpad(to_hex(20000000 + i), 64, '0'), p, '0x' || lpad(to_hex(((i * 40 + p) % 100000) + 1), 64, '0'), 100000, 104000, 100000, 104000
+       FROM generate_series(1, ${FIXTURE.crosses}) AS i, generate_series(0, 39) AS p`,
+    );
+    const crossRows = Number((await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM crosses WHERE state = 'confirmed' AND tx_hash IS NOT NULL`)).rows[0]?.n);
+    assert.equal(crossRows, FIXTURE.crosses, 'the Crosses, each confirmed with its transaction');
+    const legsPerCross = await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM (SELECT bet_hash FROM legs GROUP BY bet_hash HAVING count(*) = 40) AS whole`);
+    assert.equal(Number(legsPerCross.rows[0]?.n), FIXTURE.crosses, 'every Cross has its 40 legs');
+    const crossesBytes = await totalSize(client, 'crosses');
+    const legsBytes = await totalSize(client, 'legs');
+
+    // The lines: a stop's one line, and a Cross's three (sent, pending, confirmed), each laid in a batch of its own.
+    const eventsBefore = await totalSize(client, 'events');
+    await client.query(
+      `INSERT INTO events (run, kind, account, facts)
+       SELECT 1, 'stop received', $1, jsonb_build_object('hashes', 100, 'ahead', false, 'block', (1000 + i)::text) FROM generate_series(1, ${FIXTURE.lines}) AS i`,
+      [ACCOUNT],
+    );
+    const eventsWithStopLines = await totalSize(client, 'events');
+    await client.query(
+      `INSERT INTO events (run, kind, bet_hash, account, game_id, facts)
+       SELECT 1, (ARRAY['cross sent', 'cross pending', 'cross confirmed'])[(i % 3) + 1], '0x' || lpad(to_hex(20000000 + (i / 3) + 1), 64, '0'), $1, 1,
+         jsonb_build_object('txHash', '0x' || lpad(to_hex(40000000 + i), 64, '0'), 'block', (1000 + i)::text, 'legs', 40)
+       FROM generate_series(0, ${FIXTURE.lines - 1}) AS i`,
+      [ACCOUNT],
+    );
+    const eventsWithCrossLines = await totalSize(client, 'events');
+    const stopLine = Math.round((eventsWithStopLines - eventsBefore) / FIXTURE.lines);
+    const crossLine = Math.round((eventsWithCrossLines - eventsWithStopLines) / FIXTURE.lines);
+    const stopOf100 = { rows: 100, bytesRows: Math.round(stopsCarriedBytes / FIXTURE.stopsOf100), lines: 1, bytesLine: stopLine };
+    const stopAheadOf16 = { rows: 16, bytesRows: Math.round(stopsAheadBytes / FIXTURE.stopsAheadOf16), lines: 1, bytesLine: stopLine };
+    const cross40 = { crossRow: Math.round(crossesBytes / FIXTURE.crosses), legs: 40, bytesLegs: Math.round((legsBytes / FIXTURE.crosses)), lines: 3, bytesLines: 3 * crossLine };
+    report.fixtureShapes = {
+      stopOf100Hashes: { ...stopOf100, bytes: stopOf100.bytesRows + stopOf100.bytesLine },
+      stopAheadOf16Originals: { ...stopAheadOf16, bytes: stopAheadOf16.bytesRows + stopAheadOf16.bytesLine },
+      cross40Legs: { ...cross40, bytes: cross40.crossRow + cross40.bytesLegs + cross40.bytesLines, note: 'the bet\'s own row and line are the order\'s figures above' },
+    };
+    assert.ok(stopOf100.bytesRows > 0 && stopAheadOf16.bytesRows > 0 && cross40.crossRow > 0 && cross40.bytesLegs > 0 && stopLine > 0 && crossLine > 0);
   } finally {
     client.release();
     await pool.end();

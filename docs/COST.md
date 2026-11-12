@@ -83,3 +83,26 @@ order, one row and one line, is about 1,233 bytes. At the courier's budget refil
 day) that is about 107 MB a day, 39 GB a year; at one maker's defaults (13 games, 3 markets, 2 sides, re-signed
 every 10 minutes: 11,232 orders a day) about 14 MB a day, 5 GB a year. The status address computes the same from
 the database it has, once a table holds a thousand rows or more.
+
+### The three shapes this build does not yet write
+
+Measured from fixture rows the same test lays in the frozen schema's shape: every column as the schema has it,
+and the free parts (a line's `facts`, a Cross's `node_answer`, both `jsonb`) holding what this fixture puts there,
+small objects of a few fields. These are fixture figures, to be read again from real rows once the stop build and
+the sender build write them; the status address will then serve them under `database.tables` as it serves the
+orders table's.
+
+| shape | rows | bytes with indexes |
+| -- | -- | -- |
+| a stop of 100 carried hashes | 100 `stops` rows, each carrying the message as received (100 hashes, about 7 KB as JSON, stored compressed) and its signature; one `stop received` line | about 104,000 for the rows (1,040 a row) and about 200 for the line |
+| a stop ahead of 16 originals | 16 `stops` rows, each with the message of 16 hashes, the signed original and its expiry; one line | about 34,000 for the rows (2,140 a row) and about 200 for the line |
+| a 40-leg Cross | one `crosses` row, confirmed, with its transaction, receipt and final block; 40 `legs` rows with the stakes expected and recorded; three lines (sent, pending, confirmed). The bet's own row and line are the order's figures above | about 970 for the Cross, 13,200 for the legs (330 a leg), 1,050 for the lines: about 15,200 |
+
+What the first row says about the schema's shape: a stop's message is kept once for every hash it stops, so a
+stop of 100 hashes keeps its message a hundred times over, about 100 KB a stop against about 1.2 KB an order.
+That is the frozen schema measured as it stands. Whether the stop build keeps the message once is that build's
+call; this figure is what it costs not to. At the bounds: an account's 32 stops ahead whose orders have not
+expired are about 1.1 MB; a stop of carried orders is bounded by the orders stopped, one row each, about 1,040
+bytes on top of each stopped order's 1,233; a 40-leg Cross adds about 15 KB to its bet's 1.2 KB, which at the
+courier's budget refilling all day with every admitted request a 40-leg bet would be about 1.3 GB a day, the
+largest shape at the budget's rate and not a forecast.
