@@ -78,6 +78,11 @@ async function measure(client: pg.PoolClient, args: ScanArgs): Promise<Measured>
   };
 }
 
+/** The plan is the named index's scan: asserted on each measurement, before anything else is read of the index. */
+function plan(m: Measured, what: string): void {
+  assert.equal(m.indexName, 'orders_book', `${what}: the plan is the named index's scan, not ${m.plan}`);
+}
+
 /** Runs the statement plain, for its own summary: what it scanned, marked and where it ended. */
 async function run(client: pg.PoolClient, args: ScanArgs): Promise<{ scanned: number; marked: number; live: number; lastTick: number | null; lastRecord: string | null }> {
   const { rows } = await client.query<{ scanned: number; marked: number; live: number; last_tick: number | null; last_record: string | null }>(SCAN_SQL, scanParams(args));
@@ -199,12 +204,13 @@ test('the book with 50,000 and with 500,000 orders ended by the mark: the counts
       }
       assert.equal(marks, n, 'the whole history was marked, by the statement');
       const before = await measure(client, args(50, F_PAST));
+      plan(before, `${n} before vacuum`);
       const vacuumReport = await vacuum(client);
       const level = await treeLevel(client);
       const after_ = await measure(client, args(50, F_PAST));
+      plan(after_, `${n} after vacuum`);
       figures[n] = { before, after: after_, vacuumReport, level, marks };
       for (const [state, m] of [['before', before], ['after', after_]] as Array<[string, Measured]>) {
-        assert.equal(m.indexName, 'orders_book', `${n} ${state}: the plan is the named index's scan`);
         assert.deepEqual({ inner: m.innerRows, removed: m.removedByFilter, passed: m.passedFilter, marked: m.marked }, { inner: 10, removed: 0, passed: 10, marked: 0 }, `${n} ${state}: the counts`);
       }
       assert.ok(vacuumReport.removed >= n, `the vacuum cleared the planted versions, whole or already pruned: ${JSON.stringify(vacuumReport)}`);
@@ -251,6 +257,7 @@ test('the book with 50,000 and with 500,000 expired quotes not yet marked, at be
       assert.deepEqual({ scanned: held1.scanned, marked: held1.marked, live: held1.live }, { scanned: BOUNDS.scanRows, marked: 0, live: 0 }, `${n}: held behind`);
       assert.deepEqual(held2, held1, `${n}: the same rows again`);
       const heldMeasured = await measure(client, args(50, F_BEHIND));
+      plan(heldMeasured, `${n} held behind`);
       assert.deepEqual({ inner: heldMeasured.innerRows, removed: heldMeasured.removedByFilter, passed: heldMeasured.passedFilter, marked: heldMeasured.marked }, { inner: BOUNDS.scanRows, removed: BOUNDS.scanRows, passed: 0, marked: 0 });
 
       // Past: the first request marks what it was returned; the second is returned the next 2,000, visiting the
@@ -258,6 +265,7 @@ test('the book with 50,000 and with 500,000 expired quotes not yet marked, at be
       const first = await run(client, args(50, F_PAST));
       assert.deepEqual({ scanned: first.scanned, marked: first.marked, live: first.live }, { scanned: BOUNDS.scanRows, marked: BOUNDS.scanRows, live: 0 }, `${n}: marks what it was returned`);
       const before = await measure(client, args(50, F_PAST));
+      plan(before, `${n} before vacuum`);
       assert.deepEqual({ inner: before.innerRows, removed: before.removedByFilter, passed: before.passedFilter, marked: before.marked }, { inner: BOUNDS.scanRows, removed: BOUNDS.scanRows, passed: 0, marked: BOUNDS.scanRows }, `${n}: the second request`);
       const vacuumReport = await vacuum(client);
       // Two requests marked 2,000 each: the first batch, pruned on the pages the second request's scan read, is
@@ -267,9 +275,14 @@ test('the book with 50,000 and with 500,000 expired quotes not yet marked, at be
       const level = await treeLevel(client);
       // After vacuum: the next 2,000, with no dead ahead of them.
       const after_ = await measure(client, args(50, F_PAST));
+      plan(after_, `${n} after vacuum`);
       assert.deepEqual({ inner: after_.innerRows, removed: after_.removedByFilter, passed: after_.passedFilter, marked: after_.marked }, { inner: BOUNDS.scanRows, removed: BOUNDS.scanRows, passed: 0, marked: BOUNDS.scanRows }, `${n}: after vacuum`);
-      assert.equal(after_.indexName, 'orders_book');
-      figures[n] = { heldBehind: heldMeasured.buffers, beforeVacuum: before.buffers, afterVacuum: after_.buffers, deadAhead: BOUNDS.scanRows, vacuum: vacuumReport, indexLevel: level };
+      // The dead cost is seen: the 2,000 dead ahead cost the before-vacuum measurement more than the held-behind
+      // one, with none dead yet, and more than the one after vacuum; a run after vacuum alone would show neither.
+      // No equality or ceiling is put on the before-vacuum figure.
+      assert.ok(before.buffers > heldMeasured.buffers, `${n}: the 2,000 dead ahead are seen (${before.buffers}) against none yet (${heldMeasured.buffers})`);
+      assert.ok(before.buffers > after_.buffers, `${n}: the 2,000 dead ahead are seen (${before.buffers}) and gone after vacuum (${after_.buffers})`);
+      figures[n] = { heldBehind: heldMeasured.buffers, beforeVacuum: before.buffers, afterVacuum: after_.buffers, deadAhead: BOUNDS.scanRows, counters: { heldBehind: heldMeasured.counters, beforeVacuum: before.counters, afterVacuum: after_.counters }, vacuum: vacuumReport, indexLevel: level };
     } finally {
       client.release();
       await pool.end();
