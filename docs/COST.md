@@ -1,7 +1,8 @@
 # The cost of the book's scan, measured
 
 What one request to the book costs the database, measured against the three books the plan names, two of them at
-two sizes, each in two maintenance states; and the orders table's maintenance settings, set from the figures.
+two sizes, each in two maintenance states; and the orders table's maintenance settings, chosen with the figures in
+view.
 The statement measured is the one the courier runs (`SCAN_SQL` in `courier/records/orders.ts`): the book's index
 walked in its order for one side of one market, at most 2,000 rows returned, the expired among them marked where the
 final block's time plus one has reached their expiry, the live among them passed. The test is `tests/cost.test.ts`;
@@ -52,11 +53,12 @@ vacuum has not run; they are not promised flat, and this build enforces no bound
 Two things the measurement taught, kept here because they shape the settings below. On-access pruning: a page an
 update or a scan touches has its dead versions pruned to dead item identifiers before vacuum runs, so the vacuum's
 report counts most of the planted versions under "dead item identifiers removed", not "tuples removed"; the test
-reads both. Index cleanup: a vacuum left to itself skips the indexes when the dead items are under two per cent of
-the table's pages, and leaves their entries standing; the test vacuums with `INDEX_CLEANUP ON`, and the table's
-own setting makes autovacuum do the same.
+reads both. Index cleanup: a vacuum left to itself may skip the indexes when the pages holding dead items are under
+two per cent of the table's pages, and leave their entries standing; the test vacuums with `INDEX_CLEANUP ON`, and
+the table's own setting makes autovacuum do the same. Whether a vacuum left to itself would have skipped them on
+these books was not measured.
 
-## The maintenance settings, set from the figures
+## The maintenance settings, chosen with the figures in view
 
 In `db/schema.sql`, on the orders table:
 
@@ -66,15 +68,25 @@ autovacuum_analyze_threshold = 2000, autovacuum_analyze_scale_factor = 0,
 vacuum_index_cleanup = on
 ```
 
-At Postgres's defaults the table is due for vacuum at 50 dead versions plus a fifth of its rows: at 500,000 rows
-that is 100,000 dead, which at 0.025 accesses each is about 2,500 buffer accesses ahead of a scan that costs 166
-clean, fifteen times over, and the number grows with the table. At 2,000 the table is due after the most one request
-marks, whatever its size; the dead ahead of a scan are then at most a few thousand between vacuums, about 190
-accesses over the clean 166, as the third book's before-vacuum row shows. `vacuum_index_cleanup = on` is what makes
-each of those vacuums remove the index entries, which is where the cost lives: at 2,000 dead on a table of some
-hundred thousand rows the default would skip them every time. The threshold is when the table becomes due, not a
-ceiling: autovacuum's workers can be busy elsewhere, and a version an older transaction can still see is not
-removed until it cannot. The status address serves the settings as the database holds them.
+What the figures support is two things: removing dead index entries promptly, since they are where the cost
+lives, and a trigger that does not grow with the history kept. At Postgres's defaults the table is due for vacuum
+at 50 dead versions plus a fifth of its rows: at 500,000 rows that is 100,000 dead, which at 0.025 accesses each
+is about 2,500 buffer accesses ahead of a scan that costs 166 clean, fifteen times over, and the number grows with
+the table. A scale factor of 0 removes the growth. The threshold of 2,000 is a chosen batch: the bound of rows one
+request is returned, and so the most one request marks, so that the table is due after one request's worth of
+marking whatever its size; the dead ahead of a scan are then a few thousand between vacuums, about 190 accesses
+over the clean 166, as the third book's before-vacuum row shows. It is not a measured optimum (no other threshold
+was measured against it) and it is not a ceiling on the dead versions: the threshold is when the table becomes
+due, autovacuum's workers can be busy elsewhere, and a version an older transaction can still see is not removed
+until it cannot.
+
+`vacuum_index_cleanup = on` makes each vacuum of this table remove the index entries. A vacuum left to itself may
+skip the indexes when the pages holding dead items are under two per cent of the table's pages. The run above
+forces the cleanup on (`VACUUM (INDEX_CLEANUP ON)`), which is the state the setting aims at; it does not show what
+the default (`auto`) or `off` would have left standing on this table, nor how long production's autovacuum takes
+to come round to it, and neither is claimed here. Both are to be read from the live table's statistics
+(`pg_stat_user_tables`: `n_dead_tup`, `last_autovacuum`) once the courier runs, beside the settings the status
+address serves as the database holds them.
 
 ## The growth
 

@@ -105,19 +105,21 @@ CREATE INDEX IF NOT EXISTS orders_bets_waiting
   ON orders (record_number)
   WHERE role = 'take' AND bet_state IN ('waiting', 'held') AND ended IS NULL;
 
--- The table's maintenance, set from the measurement (docs/COST.md). The mark of an expired quote, a stop or a
--- fill leaves a dead version in the table and an entry in the index until vacuum removes them, and a scan along
--- the book's index visits the dead entries that stand in its range ahead of the rows it returns. At Postgres's
--- defaults a table is due for vacuum once its dead versions pass 50 plus a fifth of its rows, which is a number
--- history sets: the dead a scan can meet would grow with the orders kept. Here the table is due once 2,000 dead
--- versions have gathered, whatever its size: the bound of rows one request is returned, and so the most one
--- request marks. The threshold is when the table becomes due, not a ceiling on its dead versions: autovacuum's
--- workers can be busy elsewhere, and a version an older transaction can still see is not removed until it
--- cannot. And a vacuum left to itself skips the indexes when the dead items are under two per cent of the
--- table's pages, which at 2,000 dead on a table of some hundred thousand rows is every time, so the dead index
--- entries a scan visits would stand through vacuum after vacuum; vacuum_index_cleanup = on makes each vacuum of
--- this table clean its indexes, which is where the scan's cost lives. The status address serves these settings
--- as the database holds them.
+-- The table's maintenance, chosen with the measurement in view (docs/COST.md). The mark of an expired quote, a
+-- stop or a fill leaves a dead version in the table and an entry in the index until vacuum removes them, and a
+-- scan along the book's index visits the dead entries that stand in its range ahead of the rows it returns. At
+-- Postgres's defaults a table is due for vacuum once its dead versions pass 50 plus a fifth of its rows, which is
+-- a number history sets: the dead a scan can meet would grow with the orders kept. Here the table is due once
+-- 2,000 dead versions have gathered, whatever its size. 2,000 is a chosen batch, the bound of rows one request is
+-- returned and so the most one request marks; it is not a measured optimum, and the threshold is when the table
+-- becomes due, not a ceiling on its dead versions: autovacuum's workers can be busy elsewhere, and a version an
+-- older transaction can still see is not removed until it cannot. A vacuum left to itself may skip the indexes
+-- when the pages holding dead items are under two per cent of the table's pages, and leave the dead index
+-- entries a scan visits standing; vacuum_index_cleanup = on makes each vacuum of this table clean its indexes,
+-- which is where the scan's cost lives. What the measurement shows is the state after a vacuum with the cleanup
+-- forced on; it does not show what the default (auto) or off would have left standing here, nor how long
+-- production's autovacuum takes to come round: those are read from the live table's statistics once it runs. The
+-- status address serves these settings as the database holds them.
 ALTER TABLE orders SET (
   autovacuum_vacuum_threshold = 2000,
   autovacuum_vacuum_scale_factor = 0,

@@ -145,8 +145,9 @@ The courier's own Postgres, `db/schema.sql`: ten tables (orders, stops, lanes, c
 accounts, runs, games) and the indexes the book and the door read along. The schema's comments say what each bound
 counts: a scan along the book's index is bounded by the rows it is returned, which is what `LIMIT` counts, and not
 by the index entries it visits, the rows it fetches or the pages it reads to return them. That work is measured
-(`docs/COST.md`, `tests/cost.test.ts`), and the orders table's maintenance is set from the measurement: due for
-vacuum at 2,000 dead versions whatever its size, with its indexes cleaned at every vacuum. The status address
+(`docs/COST.md`, `tests/cost.test.ts`), and the orders table's maintenance is chosen with the measurement in view:
+due for vacuum at 2,000 dead versions whatever its size (a chosen batch, the bound of rows one request is returned,
+not a measured optimum or a ceiling), with its indexes cleaned at every vacuum. The status address
 serves the settings as the database holds them, under `database.maintenance`, and the bytes a row takes with its
 indexes under `database.tables` and `database.growth`.
 
