@@ -841,7 +841,10 @@ test('every refusal line is of an admitted request: no line carries a code of th
   const { rows } = await pool.query<{ reason: string }>(`SELECT DISTINCT reason FROM events WHERE kind = 'order refused'`);
   const reasons = rows.map((r) => r.reason);
   assert.ok(reasons.length >= 8, `the refusals seen: ${reasons.join(', ')}`);
-  for (const reason of reasons) assert.ok(!before.has(reason), `${reason} is a refusal before admission and must not be a line`);
+  // CHAIN_UNREACHABLE is the one code on both sides of admission: the door's own read (check 6) is before it and is
+  // counted; the sixteen's read (check 13) is inside the admitted transaction, and a refusal there is a line.
+  for (const reason of reasons) assert.ok(!before.has(reason) || reason === 'CHAIN_UNREACHABLE', `${reason} is a refusal before admission and must not be a line`);
+  assert.ok(reasons.includes('CHAIN_UNREACHABLE'), "the sixteen's read failing twice left its line");
   const counts = await refusedBeforeAdmission();
   for (const code of Object.keys(counts)) assert.ok(before.has(code) || code === 'NOT_FOUND' || code === 'HTTPS_REQUIRED', `${code} was counted before admission`);
 });
