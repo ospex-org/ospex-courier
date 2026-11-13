@@ -6,7 +6,7 @@ import type { HDAccount } from 'viem/accounts';
 import { MARKETS_OF_GAME_SQL, marketsOfGameParams } from '../courier/records/orders';
 import { openPool } from '../courier/records/store';
 import { get, startCourier } from './support/courier';
-import { cancelOnChain, crossFromTheTest, hashesOf, liftCap, orderOn, postOrder, raiseFloor, sign, type Order } from './support/orders';
+import { cancelOnChain, contractHash, crossFromTheTest, hashesOf, liftCap, orderOn, postOrder, raiseFloor, sign, type Order } from './support/orders';
 import type { Rig } from './support/rig';
 import { startStack, type Stack } from './support/stack';
 
@@ -61,6 +61,7 @@ interface Page {
   marked: number;
   live: number;
   endedOnChain: number;
+  markedCancelled: number;
   endedBy: 'book' | 'bound' | null;
   next: { oddsTick: number; recordNumber: number } | null;
   limit: number;
@@ -276,17 +277,61 @@ test('remaining is the stake less what the chain shows filled; payable is what t
   await raiseFloor(rig, extra2, floored, floored.nonce + 1n);
   await rig.write(taker, rig.addresses.matching, rig.abis.OspexMatching as Abi, 'unregisterCourier', [rig.addresses.relay]);
   try {
+    const head = await rig.publicClient.getBlock();
+    const quoteHash = (await contractHash(rig, quote)).toLowerCase();
     const after = await market(url(), spread.scorer, spread.lineTicks, '&side=A');
     page = after.sides.A as Page;
-    assert.deepEqual(hashesOf(page), [(await rig.read<Hex>(rig.addresses.matching, rig.abis.OspexMatching as Abi, 'getOrderHash', [quote])).toLowerCase()]);
+    assert.deepEqual(hashesOf(page), [quoteHash]);
     assert.equal(page.endedOnChain, 3);
-    assert.equal(page.live, 4, 'the courier itself knows nothing of the three: they are read at the block, never stored');
+    assert.equal(page.live, 4, 'the four stood unmarked in the records when this request scanned them');
+    assert.equal(page.markedCancelled, 2, "the cancelled quote and the floored one are marked by this request, the maker's own acts seen; the dropped account's is not");
     assert.equal(after.accounts[taker.address.toLowerCase()]?.registered, false);
+    // The records: the two marked cancelled at the block this request read; the dropped account's quote unmarked.
+    const hashes = await Promise.all([cancelled, floored, dropped].map((q) => contractHash(rig, q)));
+    const { rows } = await pool.query<{ hash: string; ended: string | null; block: string | null; block_hash: string | null }>(
+      `SELECT hash, ended, ended_block::text AS block, ended_block_hash AS block_hash FROM orders WHERE hash = ANY($1::text[])`,
+      [hashes.map((h) => h.toLowerCase())],
+    );
+    const byHash = new Map(rows.map((r) => [r.hash, r]));
+    for (const h of hashes.slice(0, 2)) assert.deepEqual(byHash.get(h.toLowerCase()), { hash: h.toLowerCase(), ended: 'cancelled', block: head.number.toString(), block_hash: head.hash.toLowerCase() });
+    assert.deepEqual(byHash.get((hashes[2] as Hex).toLowerCase()), { hash: (hashes[2] as Hex).toLowerCase(), ended: null, block: null, block_hash: null }, 'the relay dropped is not an end of the quote');
+    // Read again: the two marked are returned to no request; the dropped account's quote still is, and is still not listed.
+    const again = (await market(url(), spread.scorer, spread.lineTicks, '&side=A')).sides.A as Page;
+    assert.deepEqual({ live: again.live, endedOnChain: again.endedOnChain, markedCancelled: again.markedCancelled, quotes: hashesOf(again) }, { live: 2, endedOnChain: 1, markedCancelled: 0, quotes: [quoteHash] });
   } finally {
     await rig.write(taker, rig.addresses.matching, rig.abis.OspexMatching as Abi, 'registerCourier', [rig.addresses.relay]);
   }
   page = (await market(url(), spread.scorer, spread.lineTicks, '&side=A')).sides.A as Page;
-  assert.equal(page.quotes.length, 2, 'registered again, the dropped account\'s quote is listed again');
+  assert.equal(page.quotes.length, 2, 'registered again, the dropped account\'s quote is listed again, unmarked all along');
+});
+
+test("the list counts a quote its maker ended until a request asks the chain: posted and cancelled on chain, the list counts it; the market's page shows no quote and marks it at the block read; the list then counts none", async () => {
+  const maker = rig.accounts.maker;
+  const spread = { scorer: rig.addresses.spread, lineTicks: 255 };
+  const T = await rig.time();
+  const quote = orderOn(rig, maker, { expiry: T + 3_600n, oddsTick: 200, ...spread });
+  const posted = await postOrder(url(), rig, maker, 'rest', quote);
+  assert.equal(posted.status, 201, JSON.stringify(posted.body));
+  await cancelOnChain(rig, maker, quote);
+  const find = (body: Record<string, unknown>) =>
+    (body.markets as Array<{ scorer: Address; lineTicks: number; live: { A: { live: number; boundReached: boolean; marked: number } } }>).find(
+      (m) => m.scorer.toLowerCase() === spread.scorer.toLowerCase() && m.lineTicks === spread.lineTicks,
+    );
+  // The list asks the chain nothing: it is the courier's records, which do not yet know of the cancel.
+  const listed = await get(url(), `/v1/book?gameId=${rig.gameId}`);
+  assert.deepEqual(find(listed.body)?.live.A, { live: 1, boundReached: false, marked: 0 }, 'the list counts the quote: the records stand until a request asks the chain');
+  // The market's page asks the chain, shows no quote, and marks it at the block it read.
+  const head = await rig.publicClient.getBlock();
+  const page = await market(url(), spread.scorer, spread.lineTicks, '&side=A');
+  assert.equal(page.block.hash, head.hash);
+  assert.deepEqual(hashesOf(page.sides.A), []);
+  assert.deepEqual({ live: page.sides.A?.live, endedOnChain: page.sides.A?.endedOnChain, markedCancelled: page.sides.A?.markedCancelled }, { live: 1, endedOnChain: 1, markedCancelled: 1 });
+  // The list then counts none: with no live quote on either side the market is not listed.
+  const after = await get(url(), `/v1/book?gameId=${rig.gameId}`);
+  assert.equal(find(after.body), undefined, 'the market holds no quote the records count');
+  const record = await get(url(), `/v1/orders/${posted.body.orderHash}`);
+  assert.equal(record.body.state, 'cancelled');
+  assert.deepEqual(record.body.endedBlock, { number: head.number.toString(), hash: head.hash.toLowerCase() });
 });
 
 /** Plants one quote a record number given, straight into the records: rows whose numbers the test chooses. */

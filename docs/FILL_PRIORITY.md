@@ -17,10 +17,11 @@ behind any quote at the same price that has stood longer.
 The book's reads (`GET /v1/book`) list quotes in this order: `orders_book`, the index on `(market_key, side,
 odds_tick, record_number)` over the quotes the courier has not marked ended, walked from the start or from a page's
 cursor, at most 2,000 rows returned to one request. What is live at the block is passed; what has expired at the
-final block is marked, so the next request does not meet it; what only the chain knows (a cancel, a raised floor,
-a fill by another courier, the relay dropped) is read at the block for the quotes a page lists, and such a quote is
-not listed. The walk for a bet, with its 200 and its 40, is the pre-check build's; it reads the same index in the
-same order.
+final block is marked, so the next request does not meet it; what only the chain knows is read at the block for the
+quotes a page lists: a cancel or a raised floor seen there is marked `cancelled` in the records at that block, so no
+later request meets it either; a fill by another courier or the relay dropped is not marked, and such a quote is not
+listed. The walk for a bet, with its 200 and its 40, is the pre-check build's; it reads the same index in the same
+order.
 
 The three bounds are settings, published on `GET /v1/status` under `bounds` (`scanRows`, `quotesExamined`,
 `quotesListed`). They bound the rows one request is returned, and not the work the database does to return them,

@@ -151,7 +151,11 @@ addresses.
   cancelled or under a floor, with a lot or more left, whose account still has the relay registered. A request that
   is returned an expired quote marks it, where the final block's time plus one has reached its expiry, so the next
   request does not meet it; a backlog the final block has not passed is met again, and the answer names the bound
-  and never an empty book.
+  and never an empty book. A quote the chain shows cancelled or under its account's floor is marked `cancelled` by
+  the page that read it, at the block read (the mark, above), and is returned to no later request; the page's
+  `markedCancelled` counts them. The game's list asks the chain nothing: its counts are the courier's records as
+  they stand, right once any request has asked the chain about the quotes, and the market's page is the one checked
+  against the chain.
 
 One standing condition is raised in this build: `chain-unreachable`, when a read of the chain fails and fails
 again when tried once more; it clears at the next read that succeeds. Each opening and clearing is a numbered line
