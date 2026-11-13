@@ -109,6 +109,14 @@ CREATE INDEX IF NOT EXISTS orders_live_quotes_per_account
   ON orders (account, market_key, side, expiry DESC)
   WHERE role = 'rest' AND ended IS NULL;
 
+-- The markets of a game that hold a quote the courier has not marked ended, for the game's page of the book: the
+-- (market, side) pairs of ONE game, walked one index probe a pair from the page's cursor, at most two a market of
+-- the page plus one. A page's work is the page's, whatever the book holds on other games. Without this index the
+-- walk was along the book's index over every pair the whole book holds, and the game was kept afterwards.
+CREATE INDEX IF NOT EXISTS orders_markets_of_game
+  ON orders (game_id, scorer, line_ticks, side)
+  WHERE role = 'rest' AND ended IS NULL;
+
 -- The door's count of the bets waiting their turn (two an account, 32 in all), and later the pre-check's next bet:
 -- the bets not yet final, in record order. The count is of rows returned along this index, bounded by the counts it
 -- enforces; without it the count would be a scan of every order ever kept, and the plan has a post, a bet and a

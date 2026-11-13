@@ -218,24 +218,55 @@ export interface Orders {
   /** The book's scan with the mark, one statement. */
   scan(on: Writer, args: ScanArgs): Promise<ScanResult>;
   /**
-   * The (market, side) pairs that hold a quote not marked ended, found by
-   * walking the book's index one pair at a time, filtered to one game. The
-   * work is one index probe per pair the whole book holds, live or expired
-   * and unmarked, and does not grow with the orders kept.
+   * The (market, side) pairs of one game that hold a quote not marked ended,
+   * in the order of the market contract's address, the line and the side,
+   * from after the cursor (a market: every pair past both its sides), at most
+   * `bound` of them. One index probe a pair along the game's own index: the
+   * work is the pairs returned plus one, whatever the book holds on other
+   * games.
    */
-  marketsOfGame(on: Writer, gameId: bigint): Promise<Array<{ marketKey: Hex; side: 0 | 1; scorer: Address; lineTicks: number }>>;
+  marketsOfGame(on: Writer, gameId: bigint, after: MarketCursor | null, bound: number): Promise<MarketPair[]>;
 }
 
+/** A market's place in the list of a game's markets: by the market contract's address, then the line. */
+export interface MarketCursor {
+  scorer: Address;
+  lineTicks: number;
+}
+
+export interface MarketPair {
+  marketKey: Hex;
+  side: 0 | 1;
+  /** As the records hold it: lowercase. */
+  scorer: Address;
+  lineTicks: number;
+}
+
+/**
+ * The pairs of one game, walked along `orders_markets_of_game` one probe a
+ * pair: the first pair of the game past the cursor, then each next pair past
+ * the one before, `$4` pairs at most. $1 the game, $2 and $3 the cursor's
+ * scorer and line (both null for the start), $4 the bound of pairs. The order
+ * and the comparisons are on the table's columns, named with the table.
+ */
 export const MARKETS_OF_GAME_SQL = `WITH RECURSIVE pairs AS (
-  (SELECT market_key, side, game_id, scorer, line_ticks FROM orders
-   WHERE role = 'rest' AND ended IS NULL ORDER BY market_key, side LIMIT 1)
+  (SELECT o.scorer, o.line_ticks, o.side, o.market_key, 1 AS n FROM orders o
+   WHERE o.role = 'rest' AND o.ended IS NULL AND o.game_id = $1::numeric
+     AND ($2::text IS NULL OR (o.scorer, o.line_ticks) > ($2::text, $3::integer))
+   ORDER BY o.scorer, o.line_ticks, o.side LIMIT 1)
   UNION ALL
-  SELECT n.market_key, n.side, n.game_id, n.scorer, n.line_ticks FROM pairs p, LATERAL (
-    SELECT market_key, side, game_id, scorer, line_ticks FROM orders
-    WHERE role = 'rest' AND ended IS NULL AND (market_key, side) > (p.market_key, p.side)
-    ORDER BY market_key, side LIMIT 1) n
+  SELECT n.scorer, n.line_ticks, n.side, n.market_key, p.n + 1 FROM pairs p, LATERAL (
+    SELECT o.scorer, o.line_ticks, o.side, o.market_key FROM orders o
+    WHERE o.role = 'rest' AND o.ended IS NULL AND o.game_id = $1::numeric
+      AND (o.scorer, o.line_ticks, o.side) > (p.scorer, p.line_ticks, p.side)
+    ORDER BY o.scorer, o.line_ticks, o.side LIMIT 1) n
+  WHERE p.n < $4::integer
 )
-SELECT market_key, side, scorer, line_ticks FROM pairs WHERE game_id = $1::numeric ORDER BY scorer, line_ticks, side`;
+SELECT scorer, line_ticks, side, market_key FROM pairs ORDER BY scorer, line_ticks, side`;
+
+export function marketsOfGameParams(gameId: bigint, after: MarketCursor | null, bound: number): unknown[] {
+  return [gameId.toString(), after === null ? null : after.scorer.toLowerCase(), after === null ? null : after.lineTicks, bound];
+}
 
 export function createOrders(pool: pg.Pool): Orders {
   return {
@@ -327,8 +358,8 @@ export function createOrders(pool: pg.Pool): Orders {
         })),
       };
     },
-    async marketsOfGame(on, gameId) {
-      const { rows } = await on.query<{ market_key: Hex; side: number; scorer: Address; line_ticks: number }>(MARKETS_OF_GAME_SQL, [gameId.toString()]);
+    async marketsOfGame(on, gameId, after, bound) {
+      const { rows } = await on.query<{ market_key: Hex; side: number; scorer: Address; line_ticks: number }>(MARKETS_OF_GAME_SQL, marketsOfGameParams(gameId, after, bound));
       return rows.map((r) => ({ marketKey: r.market_key, side: Number(r.side) as 0 | 1, scorer: r.scorer, lineTicks: Number(r.line_ticks) }));
     },
   };

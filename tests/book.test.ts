@@ -3,6 +3,7 @@ import { after, before, test } from 'node:test';
 import pg from 'pg';
 import { encodeAbiParameters, getAddress, keccak256, type Abi, type Address, type Hex } from 'viem';
 import type { HDAccount } from 'viem/accounts';
+import { MARKETS_OF_GAME_SQL, marketsOfGameParams } from '../courier/records/orders';
 import { openPool } from '../courier/records/store';
 import { get, startCourier } from './support/courier';
 import { cancelOnChain, crossFromTheTest, hashesOf, liftCap, orderOn, postOrder, raiseFloor, sign, type Order } from './support/orders';
@@ -299,16 +300,53 @@ async function plantNumbered(records: number[], fields: { marketKey: Hex; gameId
 }
 
 /** Plants quotes straight into the records: a backlog the door never saw, as the fixture of the cost contract plants them. */
-async function plant(n: number, fields: { marketKey: Hex; gameId: bigint; scorer: Address; lineTicks: number; oddsTick: number; expiry: bigint; account: Address }): Promise<void> {
+async function plant(n: number, fields: { marketKey: Hex; gameId: bigint; scorer: Address; lineTicks: number; oddsTick: number; expiry: bigint; account: Address; side?: 0 | 1 }): Promise<void> {
   await pool.query(
     `INSERT INTO orders (hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, market_key, side, received_block, received_hash, received_time)
-     SELECT '0x' || lpad(to_hex(i), 64, '0'), 'rest', $1, $2, $3, $4, 0, $5, 1000000, i, $6, 0, '0x' || repeat('ab', 65), $7, 0, 1, '0x' || repeat('cd', 32), 1
+     SELECT '0x' || lpad(to_hex(i), 64, '0'), 'rest', $1, $2, $3, $4, $10, $5, 1000000, i, $6, 0, '0x' || repeat('ab', 65), $7, $10, 1, '0x' || repeat('cd', 32), 1
      FROM generate_series($8::bigint, $9::bigint) AS i`,
-    [fields.account.toLowerCase(), fields.gameId.toString(), fields.scorer.toLowerCase(), fields.lineTicks, fields.oddsTick, fields.expiry.toString(), fields.marketKey.toLowerCase(), planted + 1, planted + n],
+    [fields.account.toLowerCase(), fields.gameId.toString(), fields.scorer.toLowerCase(), fields.lineTicks, fields.oddsTick, fields.expiry.toString(), fields.marketKey.toLowerCase(), planted + 1, planted + n, fields.side ?? 0],
   );
   planted += n;
 }
 let planted = 1_000_000;
+
+/** Plants `pairs` (market, side) pairs on one game, each line two sides, with a key of its own a line: a book of another game. */
+async function plantPairs(pairs: number, gameId: bigint, scorer: Address, expiry: bigint): Promise<void> {
+  await pool.query(
+    `INSERT INTO orders (hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, market_key, side, received_block, received_hash, received_time)
+     SELECT '0x' || lpad(to_hex(i), 64, '0'), 'rest', $1, $2, $3, (i - $5) / 2, (i - $5) % 2, 200, 1000000, i, $4, 0, '0x' || repeat('ab', 65), '0x' || lpad(to_hex(7000000000 + (i - $5) / 2), 64, '0'), (i - $5) % 2, 1, '0x' || repeat('cd', 32), 1
+     FROM generate_series($5::bigint, $6::bigint) AS i`,
+    [rig.accounts.maker.address.toLowerCase(), gameId.toString(), scorer.toLowerCase(), expiry.toString(), planted + 1, planted + pairs],
+  );
+  planted += pairs;
+}
+
+/** The markets query's own plan: every scan of orders, its index, loops and rows, from EXPLAIN (ANALYZE). */
+async function marketsPlan(gameId: bigint, after: { scorer: Address; lineTicks: number } | null, bound: number): Promise<{ indexes: string[]; loops: number; rows: number; buffers: number }> {
+  type Node = Record<string, unknown> & { Plans?: Node[] };
+  const { rows } = await pool.query<{ 'QUERY PLAN': Array<{ Plan: Node }> }>(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${MARKETS_OF_GAME_SQL}`, marketsOfGameParams(gameId, after, bound));
+  const root = rows[0]?.['QUERY PLAN'][0]?.Plan;
+  assert.ok(root);
+  const scans: Node[] = [];
+  let union: Node | undefined;
+  const walk = (n: Node) => {
+    if (n['Relation Name'] === 'orders') scans.push(n);
+    if (n['Node Type'] === 'Recursive Union') union = n;
+    for (const c of n.Plans ?? []) walk(c);
+  };
+  walk(root);
+  assert.ok(scans.length > 0, 'the plan reads orders');
+  assert.ok(union, 'the walk is the recursive union');
+  // Loops are exact per node; a node's "Actual Rows" is its average a loop, so the rows are read where loops is one:
+  // the union, which returns every pair the probes found.
+  return {
+    indexes: [...new Set(scans.map((s) => String(s['Index Name'] ?? s['Node Type'])))],
+    loops: scans.reduce((sum, s) => sum + Number(s['Actual Loops'] ?? 0), 0),
+    rows: Number(union['Actual Rows'] ?? 0),
+    buffers: Number(root['Shared Hit Blocks'] ?? 0) + Number(root['Shared Read Blocks'] ?? 0),
+  };
+}
 
 test('a backlog of 2,500 expired quotes not yet marked, at better prices than one live quote: the first read is returned the bound and marks them, answering with the bound and not an empty book; the second finds the live one. With the final block held behind their expiries nothing is marked and every read is answered with the bound; let past, the marking resumes', async () => {
   const maker = rig.accounts.maker;
@@ -433,4 +471,52 @@ test('the markets of a game are paged, 100 a page in the order of the market con
   for (const bad of ['&limit=0', '&limit=101', '&after=abc', `&after=${spread}`, `&after=${spread}:x`, '&after=1:2']) {
     assert.equal((await get(url(), `/v1/book?gameId=${game}${bad}`)).body.code, 'INVALID_PARAM', bad);
   }
+});
+
+test("a read of a game touches that game's markets only, and a page's work is bounded by its limit, not by the book: 5,000 pairs planted on another game are not visited by this game's page nor by an empty game's, asserted on the query's own rows and loops; the other game's own page is bounded by its limit", async () => {
+  const game = await rig.createGame();
+  const other = 888_888n;
+  const empty = 999_999n;
+  const spread = rig.addresses.spread;
+  const T = await rig.time();
+  const lines = [-150, -100, -50, 0, 50];
+  for (const lineTicks of lines) {
+    const key = keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'address' }, { type: 'int32' }], [game, spread, lineTicks]));
+    await plant(1, { marketKey: key, gameId: game, scorer: spread, lineTicks, oddsTick: 200, expiry: T + 3_600n, account: rig.accounts.maker.address });
+    await plant(1, { marketKey: key, gameId: game, scorer: spread, lineTicks, oddsTick: 210, expiry: T + 3_600n, account: rig.accounts.maker.address, side: 1 });
+  }
+  const strip = (body: Record<string, unknown>) => ({ markets: body.markets, more: body.more, next: body.next, limit: body.limit });
+  const before = await get(url(), `/v1/book?gameId=${game}`);
+  assert.equal(before.status, 200, JSON.stringify(before.body));
+  assert.deepEqual((before.body.markets as Array<{ lineTicks: number; live: { A: { live: number }; B: { live: number } } }>).map((m) => [m.lineTicks, m.live.A.live, m.live.B.live]), lines.map((l) => [l, 1, 1]));
+
+  // The book of another game: 5,000 pairs, 2,500 lines with two sides each.
+  await plantPairs(5_000, other, spread, T + 3_600n);
+  const after_ = await get(url(), `/v1/book?gameId=${game}`);
+  assert.deepEqual(strip(after_.body), strip(before.body), "this game's page is the same page");
+  const none = await get(url(), `/v1/book?gameId=${empty}`);
+  assert.deepEqual(strip(none.body), { markets: [], more: false, next: null, limit: 100 });
+
+  // The query's own plan: the game's index, one probe a pair; the pairs of this game plus the one probe that finds
+  // no more, whatever the other game holds; nothing at all read of the 5,000.
+  const ours = await marketsPlan(game, null, 2 * (100 + 1));
+  assert.deepEqual(ours.indexes, ['orders_markets_of_game']);
+  assert.equal(ours.rows, 10, "the game's ten pairs, and no other row");
+  assert.equal(ours.loops, 11, 'ten probes that found a pair, one that found the end');
+  const nothing = await marketsPlan(empty, null, 2 * (100 + 1));
+  assert.deepEqual(nothing.indexes, ['orders_markets_of_game']);
+  assert.deepEqual({ rows: nothing.rows, loops: nothing.loops }, { rows: 0, loops: 1 }, 'one probe, no row');
+  // The other game's own page of seven: the walk stops at the bound of pairs, not at the book's end.
+  const bound = 2 * (7 + 1);
+  const big = await marketsPlan(other, null, bound);
+  assert.deepEqual(big.indexes, ['orders_markets_of_game']);
+  assert.deepEqual({ rows: big.rows, loops: big.loops }, { rows: bound, loops: bound }, `${bound} pairs, ${bound} probes, of the 5,000`);
+  const page = await get(url(), `/v1/book?gameId=${other}&limit=7`);
+  assert.equal(page.status, 200, JSON.stringify(page.body));
+  assert.deepEqual((page.body.markets as Array<{ lineTicks: number }>).map((m) => m.lineTicks), [0, 1, 2, 3, 4, 5, 6]);
+  assert.equal(page.body.more, true);
+  assert.deepEqual(page.body.next, { scorer: getAddress(spread), lineTicks: 6 });
+  const second = await marketsPlan(other, { scorer: spread, lineTicks: 6 }, bound);
+  assert.deepEqual({ rows: second.rows, loops: second.loops }, { rows: bound, loops: bound }, 'from the cursor, the same work');
+  console.log(`# markets of a game: ${JSON.stringify({ thisGame: ours, emptyGame: nothing, otherGamePageOf7: big, fromCursor: second })}`);
 });

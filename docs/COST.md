@@ -88,13 +88,34 @@ to come round to it, and neither is claimed here. Both are to be read from the l
 (`pg_stat_user_tables`: `n_dead_tup`, `last_autovacuum`) once the courier runs, beside the settings the status
 address serves as the database holds them.
 
+## The markets of a game, measured
+
+`GET /v1/book?gameId=` walks the game's (market, side) pairs along `orders_markets_of_game`, the index on
+`(game_id, scorer, line_ticks, side)` over the quotes not marked ended, from the page's cursor: one index probe a
+pair, each returning the next pair past the one before, at most two a market of the page plus one
+(`MARKETS_OF_GAME_SQL` in `courier/records/orders.ts`); then each market of the page is scanned on its sides, each
+scan at most the bound of rows measured above. The walk, measured by the book test from the statement's own
+`EXPLAIN (ANALYZE, BUFFERS)` with 5,000 pairs standing on another game:
+
+| read | probes (loops of the index scan) | pairs returned | shared buffer accesses |
+| -- | -- | -- | -- |
+| a game of five markets, two sides each | 11 | 10 | 41 |
+| a game with nothing on it | 1 | 0 | 2 |
+| the other game's page of 7 markets, from the start | 16 | 16 | 48 |
+| the same page from its cursor | 16 | 16 | 48 |
+
+The probes are the pairs found plus one, each one descent of the index, three buffer accesses at this size, and
+the 5,000 pairs of the other game enter none of the four. The test asserts the probes and the pairs exactly, and
+the index by name. Before this index the walk was along the book's index over every unmarked pair the whole book
+held, the game kept afterwards: a probe for every pair in the book, whatever game was asked for.
+
 ## The growth
 
-From the same run: an orders row with its indexes is about 927 bytes, an events line about 306, so an admitted
-order, one row and one line, is about 1,233 bytes. At the courier's budget refilling all day (86,400 admitted a
-day) that is about 107 MB a day, 39 GB a year; at one maker's defaults (13 games, 3 markets, 2 sides, re-signed
-every 10 minutes: 11,232 orders a day) about 14 MB a day, 5 GB a year. The status address computes the same from
-the database it has, once a table holds a thousand rows or more.
+From the same run: an orders row with its indexes is about 1,000 bytes (927 before the index on the game's markets
+was added), an events line about 306, so an admitted order, one row and one line, is about 1,306 bytes. At the
+courier's budget refilling all day (86,400 admitted a day) that is about 113 MB a day, 41 GB a year; at one maker's
+defaults (13 games, 3 markets, 2 sides, re-signed every 10 minutes: 11,232 orders a day) about 15 MB a day, 5.4 GB
+a year. The status address computes the same from the database it has, once a table holds a thousand rows or more.
 
 ### The three shapes this build does not yet write
 
@@ -115,6 +136,6 @@ stop of 100 hashes keeps its message a hundred times over, about 100 KB a stop a
 That is the frozen schema measured as it stands. Whether the stop build keeps the message once is that build's
 call; this figure is what it costs not to. At the bounds: an account's 32 stops ahead whose orders have not
 expired are about 1.1 MB; a stop of carried orders is bounded by the orders stopped, one row each, about 1,040
-bytes on top of each stopped order's 1,233; a 40-leg Cross adds about 15 KB to its bet's 1.2 KB, which at the
+bytes on top of each stopped order's 1,306; a 40-leg Cross adds about 15 KB to its bet's 1.3 KB, which at the
 courier's budget refilling all day with every admitted request a 40-leg bet would be about 1.3 GB a day, the
 largest shape at the budget's rate and not a forecast.

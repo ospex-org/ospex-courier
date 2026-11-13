@@ -89,6 +89,9 @@ test('the indexes the plan names are there, with their conditions', async () => 
   const live = def('orders_live_quotes_per_account');
   assert.match(live, /\(account, market_key, side, expiry DESC\)/);
   assert.match(live, /WHERE \(\(role = 'rest'::text\) AND \(ended IS NULL\)\)/);
+  const markets = def('orders_markets_of_game');
+  assert.match(markets, /\(game_id, scorer, line_ticks, side\)/);
+  assert.match(markets, /WHERE \(\(role = 'rest'::text\) AND \(ended IS NULL\)\)/);
   const open = def('crosses_one_open_per_lane');
   assert.match(open, /^CREATE UNIQUE INDEX/);
   assert.match(open, /\(lane\)/);

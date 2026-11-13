@@ -4,7 +4,7 @@ import type { BettingSet } from '../chain/set';
 import type { ChainReader } from '../chain/snapshot';
 import { BOUNDS } from '../http/limits';
 import { marketKey as keyOf, ORDER_RULES } from '../orders/order';
-import type { Cursor, ScannedQuote } from '../records/orders';
+import type { Cursor, MarketCursor, ScannedQuote } from '../records/orders';
 import type { Store } from '../records/store';
 
 // The book, read. Public and bounded: no read is returned more than the bound
@@ -47,18 +47,7 @@ export interface GameBook {
   limit: number;
 }
 
-/** A market's place in the list of a game's markets: by the market contract's address, then the line. */
-export interface MarketCursor {
-  scorer: Address;
-  lineTicks: number;
-}
-
-function compareMarkets(a: MarketCursor, b: MarketCursor): number {
-  const x = a.scorer.toLowerCase();
-  const y = b.scorer.toLowerCase();
-  if (x !== y) return x < y ? -1 : 1;
-  return a.lineTicks - b.lineTicks;
-}
+export type { MarketCursor };
 
 export interface Quote {
   orderHash: Hex;
@@ -124,28 +113,30 @@ async function blocks(deps: BookDeps) {
  * The markets of a game that hold a quote the courier has not marked ended,
  * each side's live count within the bound, a page at a time: the markets in
  * order of the market contract's address and then the line, from after the
- * cursor, at most the page. Only the page's markets are scanned, and a market
- * whose sides hold no live quote and reached no bound is left out of the page.
+ * cursor, at most the page. The game's (market, side) pairs are walked along
+ * the game's own index from the cursor, one probe a pair, at most two a market
+ * of the page plus one, so the page's work is the page's and not the book's;
+ * only the page's markets are scanned, and a market whose sides hold no live
+ * quote and reached no bound is left out of the page.
  */
 export async function readGameBook(deps: BookDeps, gameId: bigint, after: MarketCursor | null = null, limit: number = BOUNDS.page): Promise<GameBook> {
   const { header, final } = await blocks(deps);
   const client = await deps.store.pool.connect();
   try {
     await client.query('BEGIN');
-    const pairs = await deps.store.orders.marketsOfGame(client, gameId);
-    // The markets, in the list's order, from after the cursor.
-    const markets = new Map<string, { scorer: Address; lineTicks: number; marketKey: Hex; sides: Array<0 | 1> }>();
+    // The pairs past the cursor, in the list's order: two a market at most, and one market more than the page, to
+    // know whether markets follow.
+    const pairs = await deps.store.orders.marketsOfGame(client, gameId, after, 2 * (limit + 1));
+    const markets: Array<{ scorer: Address; lineTicks: number; marketKey: Hex; sides: Array<0 | 1> }> = [];
     for (const pair of pairs) {
-      const m = markets.get(pair.marketKey) ?? { scorer: getAddress(pair.scorer), lineTicks: pair.lineTicks, marketKey: pair.marketKey, sides: [] };
-      m.sides.push(pair.side);
-      markets.set(pair.marketKey, m);
+      const last = markets[markets.length - 1];
+      if (last !== undefined && last.scorer.toLowerCase() === pair.scorer.toLowerCase() && last.lineTicks === pair.lineTicks) last.sides.push(pair.side);
+      else markets.push({ scorer: getAddress(pair.scorer), lineTicks: pair.lineTicks, marketKey: pair.marketKey, sides: [pair.side] });
     }
-    const ordered = [...markets.values()].sort(compareMarkets).filter((m) => after === null || compareMarkets(m, after) > 0);
+    const more = markets.length > limit;
+    const taken = markets.slice(0, limit);
     const page: GameBook['markets'] = [];
-    let taken = 0;
-    for (const m of ordered) {
-      if (taken >= limit) break;
-      taken++;
+    for (const m of taken) {
       const entry: GameBook['markets'][number] = { scorer: m.scorer, lineTicks: m.lineTicks, marketKey: m.marketKey, live: { A: { live: 0, boundReached: false, marked: 0 }, B: { live: 0, boundReached: false, marked: 0 } } };
       for (const side of m.sides) {
         const result = await deps.store.orders.scan(client, { marketKey: m.marketKey, side, after: null, blockTime: header.timestamp, finalTime: final.timestamp, page: 0 });
@@ -156,8 +147,7 @@ export async function readGameBook(deps: BookDeps, gameId: bigint, after: Market
       if (entry.live.A.live > 0 || entry.live.B.live > 0 || entry.live.A.boundReached || entry.live.B.boundReached) page.push(entry);
     }
     await client.query('COMMIT');
-    const more = ordered.length > taken;
-    const lastTaken = ordered[taken - 1];
+    const lastTaken = taken[taken.length - 1];
     return {
       gameId: gameId.toString(),
       block: named(header),
