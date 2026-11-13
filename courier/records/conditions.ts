@@ -123,15 +123,16 @@ export function createConditions(pool: pg.Pool): Conditions {
       // Open already: no line, the failure remembered where newest. The row is locked for the statement, so a clearing
       // at the same moment is ordered before or after it, never beside it.
       const open = await onClient(async (client) => {
-        const { rows } = await client.query<{ id: string }>(
-          `WITH open AS (SELECT c.id FROM conditions c WHERE c.key = $1 AND c.cleared_at IS NULL FOR UPDATE),
-                remembered AS (
-                  UPDATE conditions c SET failed_at = ${placed(2)}, failed_facts = $3::jsonb, failed_run = $4
-                  FROM open WHERE c.id = open.id AND ${placed(2)} > coalesce(c.failed_at, c.opened_at)
-                  RETURNING c.id)
-           SELECT open.id FROM open`,
-          [key, waited(at), JSON.stringify(facts), run],
-        );
+        const { rows } = await client.query<{ id: string }>({
+          name: 'condition-failure',
+          text: `WITH open AS (SELECT c.id FROM conditions c WHERE c.key = $1 AND c.cleared_at IS NULL FOR UPDATE),
+                      remembered AS (
+                        UPDATE conditions c SET failed_at = ${placed(2)}, failed_facts = $3::jsonb, failed_run = $4
+                        FROM open WHERE c.id = open.id AND ${placed(2)} > coalesce(c.failed_at, c.opened_at)
+                        RETURNING c.id)
+                 SELECT open.id FROM open`,
+          values: [key, waited(at), JSON.stringify(facts), run],
+        });
         return rows[0] ?? null;
       });
       if (open !== null) return { opened: false };
@@ -159,24 +160,26 @@ export function createConditions(pool: pg.Pool): Conditions {
       // One statement: the condition open from before the success, locked for the statement; its clearing and the
       // line, unless a failure newer than the success is remembered on it. Two processes clearing at once: the second
       // waits on the row and then finds it cleared, so one line is written. Nothing open from before: nothing written.
+      // Named, so each connection plans it once: this is the statement every read that succeeds makes.
       const found = await onClient(async (client) => {
-        const { rows } = await client.query<{ id: string; overtaken: boolean; cleared: boolean }>(
-          `WITH open AS (
-             SELECT c.id, c.failed_at IS NOT NULL AND c.failed_at > ${placed(4)} AS overtaken
-             FROM conditions c
-             WHERE c.key = $1 AND c.cleared_at IS NULL AND c.opened_at < ${placed(4)}
-             FOR UPDATE),
-           line AS (
-             INSERT INTO events (run, kind, reason, facts)
-             SELECT $2, 'condition cleared', $1, $3::jsonb FROM open WHERE NOT open.overtaken
-             RETURNING number),
-           cleared AS (
-             UPDATE conditions c SET cleared_at = ${placed(4)}, cleared_line = line.number
-             FROM open, line WHERE c.id = open.id
-             RETURNING c.id)
-           SELECT open.id, open.overtaken, EXISTS (SELECT 1 FROM cleared) AS cleared FROM open`,
-          [key, run, JSON.stringify(facts), waited(at)],
-        );
+        const { rows } = await client.query<{ id: string; overtaken: boolean; cleared: boolean }>({
+          name: 'condition-success',
+          text: `WITH open AS (
+                   SELECT c.id, c.failed_at IS NOT NULL AND c.failed_at > ${placed(4)} AS overtaken
+                   FROM conditions c
+                   WHERE c.key = $1 AND c.cleared_at IS NULL AND c.opened_at < ${placed(4)}
+                   FOR UPDATE),
+                 line AS (
+                   INSERT INTO events (run, kind, reason, facts)
+                   SELECT $2, 'condition cleared', $1, $3::jsonb FROM open WHERE NOT open.overtaken
+                   RETURNING number),
+                 cleared AS (
+                   UPDATE conditions c SET cleared_at = ${placed(4)}, cleared_line = line.number
+                   FROM open, line WHERE c.id = open.id
+                   RETURNING c.id)
+                 SELECT open.id, open.overtaken, EXISTS (SELECT 1 FROM cleared) AS cleared FROM open`,
+          values: [key, run, JSON.stringify(facts), waited(at)],
+        });
         return rows[0] ?? null;
       });
       if (found === null) return { cleared: false, reopened: null };
