@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { connect } from 'node:net';
 import { after, before, test } from 'node:test';
+import { decodeFunctionData, decodeFunctionResult, encodeFunctionResult, type Hex } from 'viem';
+import { MULTICALL_ABI, MULTICALL_ADDRESS } from '../courier/chain/abi';
 import { openPool } from '../courier/records/store';
 import { get } from './support/courier';
 import { orderOn, postOrder } from './support/orders';
@@ -134,6 +136,59 @@ test("a request whose target does not parse is refused by the courier, and no lo
   assert.deepEqual(leaked, [], 'no log line carries the address or the marker');
   const after_ = ((await get(stack.courier.url, '/v1/status')).body.refusedBeforeAdmission as { byCode: Record<string, number> }).byCode.INVALID_PARAM ?? 0;
   assert.equal(after_, before + 3, 'the two targets and the hash: each counted, none kept');
+});
+
+/**
+ * The node's answer to the quotes' read with its envelope whole and its block probes true, and every return data
+ * after them one byte that decodes as nothing: a read that succeeds, whose decoding then fails inside the route.
+ */
+function withReturnDataGarbled(params: unknown[], result: unknown): unknown {
+  const call = params[0] as { to?: string; data?: Hex } | undefined;
+  if (typeof result !== 'string' || call?.to?.toLowerCase() !== MULTICALL_ADDRESS.toLowerCase() || call.data === undefined) return result;
+  if (decodeFunctionData({ abi: MULTICALL_ABI, data: call.data }).functionName !== 'aggregate3') return result;
+  const answers = [...(decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', data: result as Hex }) as ReadonlyArray<{ success: boolean; returnData: Hex }>)];
+  return encodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', result: answers.map((a, i) => (i < 3 ? a : { success: true, returnData: '0x01' as Hex })) });
+}
+
+test("a request that enters the catch-all is logged under the route it matched and nothing else: its target's text, in the path and in the query, is in no line of the courier's", async () => {
+  const url = stack.courier.url;
+  const rig = stack.rig;
+  const marker = 'PRIVATE_SENTINEL_c4e1';
+  // No request from outside enters the catch-all on its own at this head: every refusal and every failure the routes
+  // classify is answered before it. One does with the node's help: a market page whose quotes' state the node answers
+  // with bytes that do not decode. So a quote stands on the market, and the node is made to answer that way.
+  const T = await rig.time();
+  const posted = await postOrder(url, rig, rig.accounts.maker, 'rest', orderOn(rig, rig.accounts.maker, { expiry: T + 600n }));
+  assert.equal(posted.status, 201, JSON.stringify(posted.body));
+  // The target carries the marker twice: in a path segment the URL's own rules remove (`/v1/<marker>/../book` is
+  // `/v1/book`), so the route is matched, and in the query. The raw socket sends it as written; a client library would
+  // tidy the path first.
+  const market = `gameId=${rig.gameId}&scorer=${rig.addresses.moneyline}&lineTicks=0&side=A`;
+  const target = `/v1/${marker}/../book?${market}&${marker}=1`;
+  const failedBefore = stack.courier.lines.filter((l) => l.startsWith('request GET /v1/book failed')).length;
+  stack.proxy.rule('eth_call', { kind: 'rewriteResult', result: withReturnDataGarbled });
+  let answer: string;
+  try {
+    answer = await raw(stack.courier.port, `GET ${target} HTTP/1.1\r\nHost: courier\r\nConnection: close\r\n\r\n`);
+  } finally {
+    stack.proxy.rule('eth_call', null);
+  }
+  assert.match(answer, /^HTTP\/1\.1 500 /, `the catch-all's own answer: ${JSON.stringify(answer.slice(0, 160))}`);
+  assert.match(answer, /"code":"INTERNAL_ERROR"/);
+  assert.ok(!answer.includes(marker), 'the answer carries nothing of the target either');
+  for (let i = 0; i < 50 && stack.courier.lines.filter((l) => l.startsWith('request GET /v1/book failed')).length === failedBefore; i++) await new Promise((r) => setTimeout(r, 20));
+  const logged = stack.courier.lines.filter((l) => l.startsWith('request GET /v1/book failed'));
+  assert.equal(logged.length, failedBefore + 1, `the failure was logged once, under the route matched: ${JSON.stringify(stack.courier.lines.slice(-5))}`);
+  assert.match(logged[logged.length - 1] as string, /^request GET \/v1\/book failed: [A-Za-z]+$/, 'the line: the route, the failure\'s class, and nothing of the request');
+  assert.deepEqual(stack.courier.lines.filter((l) => l.includes(marker) || l.includes('/..')), [], 'no log line carries the marker, or any of the target');
+  // The same request with the node answering honestly is the page, with the quote on it: the failure was the node's
+  // answer and nothing of the request's.
+  const honest = await raw(stack.courier.port, `GET ${target} HTTP/1.1\r\nHost: courier\r\nConnection: close\r\n\r\n`);
+  assert.match(honest, /^HTTP\/1\.1 200 /, JSON.stringify(honest.slice(0, 160)));
+  assert.ok(honest.includes(`"orderHash":"${String(posted.body.orderHash)}"`), 'the quote is listed');
+  assert.equal(stack.courier.lines.filter((l) => l.startsWith('request GET /v1/book failed')).length, failedBefore + 1, 'the honest answer logged no failure');
+  const status = await get(url, '/v1/status');
+  assert.deepEqual(status.body.conditions, [], 'a read that succeeded and did not decode is the courier\'s failure, not the chain unreachable');
 });
 
 test('one network address has 600 requests a minute; the 601st is refused with a retry-after, counted, and another address is not touched', async () => {
