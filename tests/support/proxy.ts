@@ -33,6 +33,8 @@ interface JsonRpcRequest {
 
 export type Rule =
   | { kind: 'refuse'; code: number; message: string }
+  /** Refuse the nth request of the method to arrive since the rule was set (1 the first), where `refuse(nth)` says so; pass the others on. */
+  | { kind: 'refuseWhen'; refuse: (nth: number) => boolean; code: number; message: string }
   | { kind: 'answer'; result: (params: unknown[]) => unknown }
   | { kind: 'rewrite'; params: (params: unknown[]) => unknown[] }
   /** Pass the request on, and answer with the node's result changed: the chain made to say something else. */
@@ -79,11 +81,20 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
     });
   }
 
+  /** How many requests of each method had arrived when its current rule was set: the nth under the rule counts from there. */
+  const arrivedAtRule = new Map<string, number>();
+
   async function answerOne(req: JsonRpcRequest, raw: string): Promise<{ text: string; how: Counted['how'] }> {
     const params = req.params ?? [];
     const rule = rules.get(req.method);
     if (rule?.kind === 'refuse') {
       return { text: JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: rule.code, message: rule.message } }), how: 'refused' };
+    }
+    if (rule?.kind === 'refuseWhen') {
+      // This request is already counted as arrived, so the nth is the count since the rule less the ones before it.
+      const nth = counted.filter((c) => c.method === req.method).length - (arrivedAtRule.get(req.method) ?? 0);
+      if (rule.refuse(nth)) return { text: JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: rule.code, message: rule.message } }), how: 'refused' };
+      return { text: await upstream(raw), how: 'passed' };
     }
     if (rule?.kind === 'answer') {
       return { text: JSON.stringify({ jsonrpc: '2.0', id: req.id, result: rule.result(params) }), how: 'answered' };
@@ -160,7 +171,10 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
     },
     rule(method, rule) {
       if (rule === null) rules.delete(method);
-      else rules.set(method, rule);
+      else {
+        rules.set(method, rule);
+        arrivedAtRule.set(method, count(method));
+      }
     },
     clear() {
       rules.clear();

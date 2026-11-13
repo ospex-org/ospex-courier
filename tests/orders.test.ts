@@ -695,6 +695,43 @@ test('one post is one page and at most one read of the chain for the quotes, wha
   }
 });
 
+test("each read of the chain is tried once more, so a post at the cap makes at most six requests to the node: with every read failing once at the proxy the post is answered as it would be without the failures, in six requests and with no condition opened; without the failures, in three", async () => {
+  const who = rig.account(17);
+  await rig.fund(who);
+  const T = await rig.time();
+  const market = { scorer: rig.addresses.spread, lineTicks: -1_405 };
+  for (let i = 0; i < 16; i++) {
+    const answer = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...market }));
+    assert.equal(answer.status, 201, `${i}: ${JSON.stringify(answer.body)}`);
+  }
+  // Every read fails once: of each method, the first request since the rule was set is refused, the second passes,
+  // the third refused, the fourth passes. A post at the cap reads the header, its own state and the sixteen's.
+  const odd = (nth: number) => nth % 2 === 1;
+  stack.proxy.rule('eth_getBlockByNumber', { kind: 'refuseWhen', refuse: odd, code: -32000, message: 'held for the test' });
+  stack.proxy.rule('eth_call', { kind: 'refuseWhen', refuse: odd, code: -32000, message: 'held for the test' });
+  const before = { headers: stack.proxy.count('eth_getBlockByNumber'), calls: stack.proxy.count('eth_call'), all: stack.proxy.count() };
+  let withFailures;
+  try {
+    withFailures = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...market }));
+  } finally {
+    stack.proxy.rule('eth_getBlockByNumber', null);
+    stack.proxy.rule('eth_call', null);
+  }
+  assert.equal(withFailures.status, 422, JSON.stringify(withFailures.body));
+  assert.equal(withFailures.body.code, 'TOO_MANY_QUOTES', 'answered as it would be without the failures');
+  assert.deepEqual(
+    { headers: stack.proxy.count('eth_getBlockByNumber') - before.headers, calls: stack.proxy.count('eth_call') - before.calls, all: stack.proxy.count() - before.all },
+    { headers: 2, calls: 4, all: 6 },
+    'the header twice, the door\'s read twice, the sixteen\'s read twice: six',
+  );
+  assert.deepEqual((await get(url(), '/v1/status')).body.conditions, [], 'a read that fails once and succeeds once more opens no condition');
+  // Without the failures: three.
+  const again = { all: stack.proxy.count() };
+  const plain = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...market }));
+  assert.equal(plain.body.code, 'TOO_MANY_QUOTES');
+  assert.equal(stack.proxy.count() - again.all, 3);
+});
+
 test('a stop on record for the hash is honoured at the door: STOPPED, as a line (the stop build writes the record; the door reads it)', async () => {
   const maker = rig.accounts.maker;
   const T = await rig.time();

@@ -91,7 +91,9 @@ account on that side of that market (`TOO_MANY_QUOTES`): one page of the account
 not marked ended, at most seventeen rows; sixteen or more standing, the chain is asked once about sixteen of them,
 the ones it shows cancelled or under the account's floor are marked `cancelled` in the records at the block read,
 and the count is read once more, so one post is one page and at most one read of the chain for the quotes whatever
-the account has posted before; for a bet, the signed stake not above the cap until the lift, both read from the matching contract at the
+the account has posted before (each read of the chain is tried once more when it fails, so a post makes at most six
+requests to the node: the header, its own read and the quotes' read, twice each; a game's page at most four, its two
+headers; a market's page at most six, its two headers and the quotes' read); for a bet, the signed stake not above the cap until the lift, both read from the matching contract at the
 block (`ABOVE_CAP`), the expiry at most 30 seconds past the chain's time (`EXPIRY_TOO_FAR`), and fewer than two of
 the account's bets, and 32 in all, waiting their turn (`QUEUE_FULL`). Checks 5 and 8 to 16 run in one database
 transaction under the order's hash lock. A quote accepted is `201 resting`; a bet accepted is `202 queued`, recorded
