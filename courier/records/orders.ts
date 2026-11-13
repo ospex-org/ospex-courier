@@ -23,10 +23,10 @@ export interface OrderRow {
   receivedHash: Hex;
   /** The receipt block's time: the chain's time the order was taken at, which a repeat is answered from. */
   receivedTime: bigint;
-  /** How the order ended here, if it has: `cancelled` is a quote a read of the chain showed cancelled or under its account's floor, marked at the block read. */
+  /** How the order ended here, if it has: `cancelled` and `filled` are what a read of the chain showed (cancelled or under its account's floor; less than a lot of its stake left), marked at the block read. */
   ended: 'stopped' | 'expired' | 'filled' | 'cancelled' | null;
   endedAt: Date | null;
-  /** The block the chain read that marked a quote cancelled was made at; null for the other marks. */
+  /** The block the chain read that marked a quote cancelled or filled was made at; null for the other marks. */
   endedBlock: bigint | null;
   endedBlockHash: Hex | null;
   betState: 'waiting' | 'held' | 'sent' | 'refused' | 'lapsed' | null;
@@ -73,6 +73,14 @@ export interface AccountQuote {
 export interface BlockRead {
   number: bigint;
   hash: Hex;
+}
+
+/** An end a read of the chain can show a stored quote: its cancel or its nonce under the floor, or less than a lot of its stake left. */
+export type EndSeen = 'cancelled' | 'filled';
+
+export interface MarkEnded {
+  hash: Hex;
+  how: EndSeen;
 }
 
 export interface ScanResult {
@@ -210,11 +218,12 @@ export interface Orders {
    */
   quotesOfAccount(on: Writer, account: Address, marketKey: Hex, side: 0 | 1, blockTime: bigint): Promise<AccountQuote[]>;
   /**
-   * Marks quotes cancelled, at the block the chain read that showed them so was
-   * made at: the ones among `hashes` not already marked. Returns the hashes it
-   * marked.
+   * Marks quotes a read of the chain showed ended, at the block the read was
+   * made at: `cancelled` (its cancel, or its nonce under its account's floor
+   * for the market) or `filled` (less than a lot of its stake left); the ones
+   * among `marks` not already marked. Returns what it marked.
    */
-  markCancelled(on: Writer, hashes: Hex[], block: BlockRead): Promise<Hex[]>;
+  markEnded(on: Writer, marks: ReadonlyArray<MarkEnded>, block: BlockRead): Promise<MarkEnded[]>;
   /** The book's scan with the mark, one statement. */
   scan(on: Writer, args: ScanArgs): Promise<ScanResult>;
   /**
@@ -324,14 +333,15 @@ export function createOrders(pool: pg.Pool): Orders {
       );
       return rows.map((r) => ({ hash: r.hash, expiry: BigInt(r.expiry), riskAmount: BigInt(r.risk_amount), nonce: BigInt(r.nonce), recordNumber: Number(r.record_number) }));
     },
-    async markCancelled(on, hashes, block) {
-      if (hashes.length === 0) return [];
-      const { rows } = await on.query<{ hash: Hex }>(
-        `UPDATE orders SET ended = 'cancelled', ended_at = now(), ended_block = $2::numeric, ended_block_hash = $3
-         WHERE hash = ANY($1::text[]) AND ended IS NULL RETURNING hash`,
-        [hashes.map((h) => h.toLowerCase()), block.number.toString(), block.hash.toLowerCase()],
+    async markEnded(on, marks, block) {
+      if (marks.length === 0) return [];
+      const { rows } = await on.query<{ hash: Hex; ended: EndSeen }>(
+        `UPDATE orders AS o SET ended = m.how, ended_at = now(), ended_block = $3::numeric, ended_block_hash = $4
+         FROM unnest($1::text[], $2::text[]) AS m(hash, how)
+         WHERE o.hash = m.hash AND o.ended IS NULL RETURNING o.hash, o.ended`,
+        [marks.map((m) => m.hash.toLowerCase()), marks.map((m) => m.how), block.number.toString(), block.hash.toLowerCase()],
       );
-      return rows.map((r) => r.hash);
+      return rows.map((r) => ({ hash: r.hash, how: r.ended }));
     },
     async scan(on, args) {
       const { rows } = await on.query<{ scanned: number; marked: number; live: number; last_tick: number | null; last_record: string | null; rows: Array<Record<string, unknown>> }>(

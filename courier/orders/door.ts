@@ -5,7 +5,7 @@ import type { BettingSet } from '../chain/set';
 import { ChainUnreachable, type ChainReader } from '../chain/snapshot';
 import { BOUNDS, type Counters } from '../http/limits';
 import type { HttpAnswer } from '../http/routes';
-import type { OrderRow } from '../records/orders';
+import type { MarkEnded, OrderRow } from '../records/orders';
 import type { Run } from '../records/runs';
 import type { Store } from '../records/store';
 import { budgetRefusal, takeBudgets } from './budgets';
@@ -189,12 +189,12 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
       // 13. Fewer than 16 live quotes on this side of this market: the account's quotes on the side the courier has
       // not marked ended and the block's time has not expired, one page of at most seventeen. Fewer than sixteen
       // standing, the chain is asked nothing. Sixteen or more, the chain is asked once about sixteen of them, and
-      // the ones it shows cancelled or under the account's floor (the maker's own acts) are marked cancelled here,
-      // at the block read, so no later request asks about them again; the count is then read once more from the
-      // records. A quote the chain shows filled by another courier is not marked (nothing fills through this
-      // courier yet, and that mark is the pre-check build's) and stands in the count until its expiry. So one post
-      // is one page, at most one read of the chain for the quotes, and one more page: a number, whatever the
-      // account has posted before.
+      // the ones it shows ended are marked here, at the block read, so no later request asks about them again:
+      // cancelled, or under the account's floor (the maker's own acts), as `cancelled`; with less than a lot of the
+      // stake left (a fill through another courier; this courier's own fills are the sender build's), as `filled`.
+      // The count is then read once more from the records. A quote partly filled with a lot or more left stands
+      // and is counted. So one post is one page, at most one read of the chain for the quotes, and one more page: a
+      // number, whatever the account has posted before.
       const bound = BOUNDS.liveQuotesPerAccountSideMarket;
       const page = await deps.store.orders.quotesOfAccount(client, order.account, key, order.positionType, T);
       let standing = page.length;
@@ -208,11 +208,14 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
           throw err;
         }
         const floor = state.accounts.get(order.account.toLowerCase())?.floor ?? 0n;
-        const ended = asked.filter((q) => {
+        const ended = asked.flatMap((q): MarkEnded[] => {
           const s = state.quotes.get(q.hash.toLowerCase());
-          return s !== undefined && (s.cancelled || q.nonce < floor);
+          if (s === undefined) return [];
+          if (s.cancelled || q.nonce < floor) return [{ hash: q.hash, how: 'cancelled' }];
+          if (q.riskAmount - s.filled < ORDER_RULES.lot) return [{ hash: q.hash, how: 'filled' }];
+          return [];
         });
-        await deps.store.orders.markCancelled(client, ended.map((q) => q.hash), read.header);
+        await deps.store.orders.markEnded(client, ended, read.header);
         standing = (await deps.store.orders.quotesOfAccount(client, order.account, key, order.positionType, T)).length;
       }
       if (standing >= bound) {

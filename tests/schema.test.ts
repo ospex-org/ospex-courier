@@ -137,8 +137,10 @@ test('a mark is whole: cancelled carries the block the chain was read at, number
   await refused(insertOrder(HASH('e4'), 'rest', { ended: 'expired', ended_at: at, ended_block_hash: HASH('b') }), '23514', 'a hash with no number');
   await refused(insertOrder(HASH('e5'), 'rest', { ended: 'gone', ended_at: at }), '23514', 'an end the schema does not list');
   await refused(insertOrder(HASH('e6'), 'rest', { ended: 'cancelled' }), '23514', 'a mark with no time');
-  // The controls: a cancelled mark with its block; an expiry mark with none.
+  await refused(insertOrder(HASH('e9'), 'rest', { ended: 'filled', ended_at: at }), '23514', 'filled with no block');
+  // The controls: a cancelled mark and a filled mark with their block; an expiry mark with none.
   await insertOrder(HASH('e7'), 'rest', { ended: 'cancelled', ended_at: at, ended_block: '5', ended_block_hash: HASH('b') });
+  await insertOrder(HASH('ea'), 'rest', { ended: 'filled', ended_at: at, ended_block: '6', ended_block_hash: HASH('b') });
   await insertOrder(HASH('e8'), 'rest', { ended: 'expired', ended_at: at });
 });
 

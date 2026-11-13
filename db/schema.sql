@@ -65,15 +65,17 @@ CREATE TABLE IF NOT EXISTS orders (
   -- The receipt block's time: the chain's time the order was taken at, which the first answer carries and a repeat
   -- post is answered from, with no chain read.
   received_time   numeric(78, 0) NOT NULL,
-  -- Empty while the order is live as far as the courier itself knows; else how it ended here: a stop on record,
-  -- expired at the final block, filled by this courier's own Cross, or cancelled: a read of the chain showed the
-  -- quote cancelled or under its account's floor for the market, both the maker's own act, and the request that
-  -- read it marked it, at the block it read (ended_block). A fill by another courier and the relay dropped are read
-  -- at a block and not stored: neither is the maker's act on the quote, and a fill at the head can still be undone.
+  -- Empty while the order is live as far as the courier itself knows; else how it ended here: a stop on record;
+  -- expired at the final block; or what a read of the chain showed, marked by the request that read it at the block
+  -- it read (ended_block): cancelled, the quote cancelled or under its account's floor for the market (the maker's
+  -- own act), or filled, less than a lot of its stake left (a fill through another courier; this courier's own
+  -- fills are the sender build's, which marks filled too). The relay dropped is read at a block and not stored: not
+  -- an end of the quote, and undone by the account itself.
   ended           text CHECK (ended IN ('stopped', 'expired', 'filled', 'cancelled')),
   ended_at        timestamptz,
-  -- The block the chain read that marked the quote cancelled was made at: number and hash. Empty for the other
-  -- marks: a stop has its message, and the expiry mark is against the final block's time.
+  -- The block the chain read that marked the quote cancelled or filled was made at: number and hash, so a later
+  -- build can tell a mark whose block is no longer on the chain. Empty for the other marks: a stop has its message,
+  -- and the expiry mark is against the final block's time.
   ended_block     numeric(78, 0),
   ended_block_hash text CHECK (ended_block_hash ~ '^0x[0-9a-f]{64}$'),
   -- For a bet, where it stands. A quote has none.
@@ -83,7 +85,7 @@ CREATE TABLE IF NOT EXISTS orders (
   CONSTRAINT orders_ended_block_whole CHECK (
     (ended_block IS NULL) = (ended_block_hash IS NULL)
     AND (ended_block IS NULL OR ended IS NOT NULL)
-    AND (ended IS DISTINCT FROM 'cancelled' OR ended_block IS NOT NULL)),
+    AND (ended IS NULL OR ended NOT IN ('cancelled', 'filled') OR ended_block IS NOT NULL)),
   CONSTRAINT orders_bet_state_for_bets CHECK ((role = 'take') = (bet_state IS NOT NULL))
 );
 

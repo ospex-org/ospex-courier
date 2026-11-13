@@ -4,7 +4,7 @@ import type { BettingSet } from '../chain/set';
 import type { ChainReader } from '../chain/snapshot';
 import { BOUNDS } from '../http/limits';
 import { marketKey as keyOf, ORDER_RULES } from '../orders/order';
-import type { Cursor, MarketCursor, ScannedQuote } from '../records/orders';
+import type { Cursor, EndSeen, MarketCursor, ScannedQuote } from '../records/orders';
 import type { Store } from '../records/store';
 
 // The book, read. Public and bounded: no read is returned more than the bound
@@ -81,6 +81,8 @@ export interface SidePage {
   endedOnChain: number;
   /** Of those, the quotes the chain showed cancelled or under their account's floor, which this request marked cancelled in the records at the block: they are asked about no more. */
   markedCancelled: number;
+  /** Of those, the quotes the chain showed with less than a lot of their stake left, which this request marked filled in the records at the block. */
+  markedFilled: number;
   /** What ended the page: the book (no more rows), the bound (the scan returned its bound), or nothing yet (more live rows than the page). */
   endedBy: 'book' | 'bound' | null;
   /** Where the next page starts: the last row this scan returned. Null where the book ended. */
@@ -200,18 +202,26 @@ export async function readMarketBook(deps: BookDeps, q: MarketQuery): Promise<Ma
     client.release();
   }
 
-  // What only the chain knows about the page's quotes, in one call at the block. A quote it shows cancelled, or
-  // under its account's floor for the market, is marked cancelled in the records here, at this block, in this same
-  // request: the maker's own act, seen, so the courier carries the quote no further and no request asks about it
-  // again. A quote shown filled by another courier, or whose account dropped the relay, is not listed and not marked.
+  // What only the chain knows about the page's quotes, in one call at the block. A quote it shows ended is marked in
+  // the records here, at this block, in this same request, so the courier carries it no further and no request asks
+  // about it again: cancelled, or under its account's floor for the market (the maker's own act), as `cancelled`;
+  // with less than a lot of its stake left (a fill through another courier), as `filled`. A quote whose account
+  // dropped the relay is not listed and not marked: not an end of the quote, and undone by the account itself.
   const examined: ScannedQuote[] = sides.flatMap((s) => scans[s]?.rows ?? []);
   const state = await readQuotes(deps.chain, deps.set, header, key, examined.map((e) => ({ hash: e.hash, account: e.account })));
-  const cancelledOnChain = (row: ScannedQuote): boolean => {
+  const endOf = (row: ScannedQuote): EndSeen | null => {
     const s = state.quotes.get(row.hash.toLowerCase());
     const a = state.accounts.get(row.account.toLowerCase());
-    return s !== undefined && a !== undefined && (s.cancelled || row.nonce < a.floor);
+    if (s === undefined || a === undefined) return null;
+    if (s.cancelled || row.nonce < a.floor) return 'cancelled';
+    if (row.riskAmount - s.filled < ORDER_RULES.lot) return 'filled';
+    return null;
   };
-  const marked = new Set<string>((await deps.store.orders.markCancelled(deps.store.pool, examined.filter(cancelledOnChain).map((e) => e.hash), header)).map((h) => h.toLowerCase()));
+  const marks = examined.flatMap((e) => {
+    const how = endOf(e);
+    return how === null ? [] : [{ hash: e.hash, how }];
+  });
+  const marked = new Map<string, EndSeen>((await deps.store.orders.markEnded(deps.store.pool, marks, header)).map((m) => [m.hash.toLowerCase(), m.how]));
 
   const out: MarketBook = {
     gameId: q.gameId.toString(),
@@ -230,12 +240,15 @@ export async function readMarketBook(deps: BookDeps, q: MarketQuery): Promise<Ma
     const quotes: Quote[] = [];
     let endedOnChain = 0;
     let markedCancelled = 0;
+    let markedFilled = 0;
     for (const row of scan.rows) {
       const s = state.quotes.get(row.hash.toLowerCase());
       const a = state.accounts.get(row.account.toLowerCase());
       if (s === undefined || a === undefined) continue;
       const remaining = row.riskAmount - s.filled;
-      if (marked.has(row.hash.toLowerCase())) markedCancelled++;
+      const mark = marked.get(row.hash.toLowerCase());
+      if (mark === 'cancelled') markedCancelled++;
+      else if (mark === 'filled') markedFilled++;
       if (s.cancelled || row.nonce < a.floor || remaining < ORDER_RULES.lot || !a.registered) {
         endedOnChain++;
         continue;
@@ -265,6 +278,7 @@ export async function readMarketBook(deps: BookDeps, q: MarketQuery): Promise<Ma
       live: scan.live,
       endedOnChain,
       markedCancelled,
+      markedFilled,
       endedBy: pageFull ? null : boundEnded ? 'bound' : 'book',
       next: pageFull ? (scan.rows[scan.rows.length - 1] ? { oddsTick: (scan.rows[scan.rows.length - 1] as ScannedQuote).oddsTick, recordNumber: (scan.rows[scan.rows.length - 1] as ScannedQuote).recordNumber } : scan.last) : boundEnded ? scan.last : null,
       limit: q.limit,

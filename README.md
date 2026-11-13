@@ -110,16 +110,19 @@ not marked ended, `queued` for a bet waiting its turn, else how the order ended 
 `filled`, or `cancelled`, with `endedAt` and, for `cancelled`, `endedBlock`, the block the chain was read at.
 
 **The mark of a quote the chain shows ended.** Every request that asks the chain about a quote the courier holds (the
-door's count above; the market's page, below) and is shown it cancelled, or under its account's floor for the market,
-marks it `cancelled` in the records in that same request, at the block it read; a marked quote is asked about no
-more. Both are the maker's own acts, so the mark is at the block read and not at finality: if a reorganization undoes
-the cancel, the quote stays marked here, this courier carries it no further, and a maker who wants it carried signs a
-new one. Two things a read can show are not marked: a quote filled by another courier (nothing fills through this
-courier yet; who marks a filled quote, and how the count takes one whose fill is not final, is the pre-check build's),
-which stands in the door's count until its expiry and is not listed; and an account that has dropped the relay,
-which is not an end of the quote and is undone by the account itself, so its quotes are not listed while it stands
-unregistered and are listed again after. The expiry mark is unchanged: against the final block's time, in the
-book's reads.
+door's count above; the market's page, below) and is shown it ended marks it in the records in that same request,
+at the block it read, and a marked quote is asked about no more: `cancelled` where the chain shows it cancelled or
+under its account's floor for the market, the maker's own acts; `filled` where it shows less than a lot of its stake
+left, a fill through another courier the account registered (this courier's own fills are the sender build's, marked
+`filled` too, at their final block). A quote partly filled with a lot or more left stands, counted and listed with
+what remains. The mark is at the block read and not at finality: if a reorganization undoes the cancel or the fill,
+the quote stays marked here, this courier carries it no further, and a maker who wants it carried signs a new one;
+the block's number and hash on the mark let a later build tell a mark whose block is no longer on the chain. One thing
+a read can show is not marked: an account that has dropped the relay, which is not an end of the quote and is undone
+by the account itself, so its quotes are not listed while it stands unregistered and are listed again after. The
+expiry mark is unchanged: against the final block's time, in the book's reads. The plan's fill marks were this
+courier's own final Crosses; the fill seen through another courier, marked at the block read, is an amendment to it,
+said as one.
 
 ## What is served
 
@@ -160,9 +163,9 @@ courier waits on; Node's own default is five minutes.
   cancelled or under a floor, with a lot or more left, whose account still has the relay registered. A request that
   is returned an expired quote marks it, where the final block's time plus one has reached its expiry, so the next
   request does not meet it; a backlog the final block has not passed is met again, and the answer names the bound
-  and never an empty book. A quote the chain shows cancelled or under its account's floor is marked `cancelled` by
-  the page that read it, at the block read (the mark, above), and is returned to no later request; the page's
-  `markedCancelled` counts them. The game's list asks the chain nothing: its counts are the courier's records as
+  and never an empty book. A quote the chain shows ended is marked by the page that read it, at the block read (the
+  mark, above), and is returned to no later request: `cancelled` or `filled`, counted on the page as
+  `markedCancelled` and `markedFilled`. The game's list asks the chain nothing: its counts are the courier's records as
   they stand, right once any request has asked the chain about the quotes, and the market's page is the one checked
   against the chain.
 

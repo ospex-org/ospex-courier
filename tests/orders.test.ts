@@ -779,6 +779,69 @@ test("the door's page is the sixteen with the newest expiry, by the numbers: a p
   assert.equal(await unendedRows(who), 11, 'the ten and the one admitted');
 });
 
+test("a quote the chain shows filled, with less than a lot of its stake left, is marked filled at the block read, by the door and by the market's page alike: sixteen quotes of one account, three filled on chain by the rig; the next post is 201 and the three are marked with their block; the page lists them no more; a quote partly filled with a lot or more left is still listed and still counted", async () => {
+  const who = rig.account(19);
+  await rig.fund(who);
+  const taker = rig.accounts.taker;
+  const T = await rig.time();
+  const market = { scorer: rig.addresses.spread, lineTicks: 345 };
+  const quotes: Order[] = [];
+  const hashes: string[] = [];
+  for (let i = 0; i < 16; i++) {
+    const q = orderOn(rig, who, { expiry: T + 3_600n, oddsTick: 200, riskAmount: 10_000n, ...market });
+    const answer = await postOrder(url(), rig, who, 'rest', q);
+    assert.equal(answer.status, 201, `${i}: ${JSON.stringify(answer.body)}`);
+    quotes.push(q);
+    hashes.push(answer.body.orderHash as string);
+  }
+  // The rig fills three whole and a fourth in part (4,000 of 10,000: sixty lots left), each one Cross sent through
+  // the relay from its sender. The courier is not involved: nothing in it signs or sends.
+  const fill = async (q: Order, riskAmount: bigint) => {
+    const bet: Order = { ...orderOn(rig, taker, { expiry: (await rig.time()) + 20n, oddsTick: 200, riskAmount, ...market }), positionType: 1 };
+    const sent = await crossFromTheTest(rig, { order: bet, signature: await sign(taker, bet, 31337, rig.addresses.matching) }, [{ order: q, signature: await sign(who, q, 31337, rig.addresses.matching) }]);
+    assert.equal(sent.filled, true, JSON.stringify(sent));
+  };
+  for (const q of quotes.slice(0, 3)) await fill(q, 10_000n);
+  await fill(quotes[3] as Order, 4_000n);
+  assert.equal(await unendedRows(who), 16, 'filled on chain, the four stand in the records until a request asks the chain about them');
+
+  // The next post finds sixteen standing, asks the chain once, marks the three filled at the block it read, and is taken.
+  const head = await rig.publicClient.getBlock();
+  const callsBefore = stack.proxy.count('eth_call');
+  const taken = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, oddsTick: 200, riskAmount: 10_000n, ...market }));
+  assert.equal(taken.status, 201, JSON.stringify(taken.body));
+  assert.equal(stack.proxy.count('eth_call') - callsBefore, 2, "the door's own read and one read of the sixteen");
+  for (const m of await marks(hashes.slice(0, 3))) assert.deepEqual(m, { ended: 'filled', block: head.number.toString(), hash: head.hash.toLowerCase() }, 'marked filled at the block the chain was read at');
+  assert.deepEqual((await marks([hashes[3] as string]))[0], { ended: null, block: null, hash: null }, 'partly filled with sixty lots left: not an end');
+  assert.equal(await unendedRows(who), 14, 'thirteen standing and the one admitted');
+  const served = await get(url(), `/v1/orders/${hashes[0]}`);
+  assert.equal(served.body.state, 'filled');
+  assert.deepEqual(served.body.endedBlock, { number: head.number.toString(), hash: head.hash.toLowerCase() });
+
+  // The market's page: the three are listed no more; the partly filled one is listed with what remains; the new one is listed.
+  type Side = { quotes: Array<{ orderHash: string; remaining: string }>; markedFilled: number; markedCancelled: number; endedOnChain: number };
+  const pageOf = async (): Promise<Side> => ((await get(url(), `/v1/book?gameId=${rig.gameId}&scorer=${market.scorer}&lineTicks=${market.lineTicks}&side=A`)).body.sides as { A: Side }).A;
+  const page1 = await pageOf();
+  assert.equal(page1.quotes.length, 14);
+  assert.ok(!page1.quotes.some((q) => hashes.slice(0, 3).includes(q.orderHash)), 'the three filled are not listed');
+  assert.equal(page1.quotes.find((q) => q.orderHash === hashes[3])?.remaining, '6000', 'the partly filled one is listed with what remains');
+  assert.deepEqual({ filled: page1.markedFilled, cancelled: page1.markedCancelled, ended: page1.endedOnChain }, { filled: 0, cancelled: 0, ended: 0 }, 'the door marked the three; the page is returned them no more');
+
+  // The page marks too: a fifth filled whole after the post is listed no more and marked at the block the page read.
+  await fill(quotes[4] as Order, 10_000n);
+  const head2 = await rig.publicClient.getBlock();
+  const page2 = await pageOf();
+  assert.deepEqual({ listed: page2.quotes.length, filled: page2.markedFilled, ended: page2.endedOnChain }, { listed: 13, filled: 1, ended: 1 });
+  assert.deepEqual((await marks([hashes[4] as string]))[0], { ended: 'filled', block: head2.number.toString(), hash: head2.hash.toLowerCase() });
+
+  // Still counted: the partly filled quote is one of the sixteen. Three more posts fill the count; the next is refused.
+  for (let i = 0; i < 3; i++) assert.equal((await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, oddsTick: 200, riskAmount: 10_000n, ...market }))).status, 201, `more ${i}`);
+  assert.equal(await unendedRows(who), 16);
+  const seventeenth = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, oddsTick: 200, riskAmount: 10_000n, ...market }));
+  assert.equal(seventeenth.body.code, 'TOO_MANY_QUOTES', JSON.stringify(seventeenth.body));
+  assert.equal(await unendedRows(who), 16, 'the partly filled quote counts: sixty lots can still fill');
+});
+
 test('a stop on record for the hash is honoured at the door: STOPPED, as a line (the stop build writes the record; the door reads it)', async () => {
   const maker = rig.accounts.maker;
   const T = await rig.time();
