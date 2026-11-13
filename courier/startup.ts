@@ -4,7 +4,7 @@ import { chainId, createJsonRpc, describeNodeFailure, type JsonRpc } from './cha
 import { readSet, SetRefused, type BettingSet } from './chain/set';
 import { createChainReader, type ChainReader } from './chain/snapshot';
 import { readCourierConfig, type CourierConfig } from './config';
-import { createCounters } from './http/limits';
+import { BOUNDS, createAddressLimiter, createCounters } from './http/limits';
 import { createRequestHandler } from './http/service';
 import { PublishedListRefused, readPublishedReporters } from './orders/published';
 import { applySchema, createStore, databaseRefusal, missingSchema, openPool, pinnedAuthority, StoreRefused, type Store } from './records/store';
@@ -112,8 +112,9 @@ export async function startService(env: Record<string, string | undefined>, opti
   await store.events.write({ run: run.id, kind: 'run started', facts: { chainId: set.chainId.toString(), entry: set.entryId.toString(), nodeUsable: node.usable } });
 
   const counters = createCounters(now);
+  const limiter = createAddressLimiter(BOUNDS.requestsPerAddressPerMinute);
   const chain = createChainReader({ rpc, conditions: store.conditions, run: run.id, now, log });
-  const handler = createRequestHandler({ store, chain, set, node, run, counters, settings: { lowPol: config.lowPol }, published, notYetBuilt: NOT_YET_BUILT, log });
+  const handler = createRequestHandler({ store, chain, set, node, run, counters, limiter, settings: { lowPol: config.lowPol }, published, notYetBuilt: NOT_YET_BUILT, log });
   const server: Server = createServer(handler);
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -139,6 +140,7 @@ export async function startService(env: Record<string, string | undefined>, opti
       closing ??= (async () => {
         await new Promise<void>((resolve) => server.close(() => resolve()));
         server.closeAllConnections();
+        limiter.close();
         try {
           await store.events.write({ run: run.id, kind: 'run stopped', reason });
           await store.runs.stop(run.id, reason);

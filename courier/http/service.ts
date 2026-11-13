@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { describeNodeFailure } from '../chain/rpc';
 import { failureCode } from '../records/store';
-import { BOUNDS, createAddressLimiter, type AddressLimiter, type Counters } from './limits';
+import { BOUNDS, type Counters } from './limits';
 import { getBook, getOrder, getReady, getRuns, getStatus, postOrders, type HttpAnswer, type RouteDeps } from './routes';
 
 // The courier's HTTP service: node:http and routes by hand. JSON under /v1;
@@ -20,7 +20,6 @@ import { getBook, getOrder, getReady, getRuns, getStatus, postOrders, type HttpA
 
 export interface ServiceDeps extends RouteDeps {
   counters: Counters;
-  limiter?: AddressLimiter;
 }
 
 const THIS_MACHINE = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
@@ -38,7 +37,13 @@ function transport(req: IncomingMessage): 'https' | 'this-machine' | 'not-https'
   return THIS_MACHINE.has(req.socket.remoteAddress ?? '') ? 'this-machine' : 'no-header-from-elsewhere';
 }
 
-/** The caller's network address, as the router reports it or as the socket has it. Used for the limit and never kept. */
+/**
+ * The caller's network address, as the router reports it or as the socket has
+ * it: the last value of X-Forwarded-For, which is the one the router appended.
+ * Used for the limit and kept no longer than its minute. The courier therefore
+ * runs behind one router that appends the caller's address and is reachable no
+ * other way: anywhere else the last forwarded value is the caller's own choice.
+ */
 function callerAddress(req: IncomingMessage): string {
   const forwarded = req.headers['x-forwarded-for'];
   if (typeof forwarded === 'string' && forwarded.trim() !== '') return forwarded.split(',').pop()?.trim() ?? '';
@@ -92,7 +97,7 @@ function readBody(req: IncomingMessage, bound: number): Promise<{ ok: true; text
 }
 
 export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, res: ServerResponse) => void {
-  const limiter = deps.limiter ?? createAddressLimiter(BOUNDS.requestsPerAddressPerMinute);
+  const limiter = deps.limiter;
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', 'http://courier');

@@ -46,6 +46,49 @@ test('an address has its minute: the limit allowed, the next refused, and the mi
   assert.deepEqual(limiter.take('10.0.0.1'), { allowed: true });
 });
 
+test("an address whose minute has passed leaves the map whether or not it is seen again: 2,000 addresses, one request each; within the minute every one is kept; the minute passes, and the clock removes them with no request made; without a clock, any other address's request does", async () => {
+  let t = 2_000_000;
+  const address = (i: number) => `10.1.${Math.floor(i / 256)}.${i % 256}`;
+  // The clock every 20 ms of real time, reading the test's own time.
+  const limiter = createAddressLimiter(600, () => t, 20);
+  try {
+    for (let i = 0; i < 2_000; i++) assert.deepEqual(limiter.take(address(i)), { allowed: true });
+    assert.equal(limiter.addresses(), 2_000);
+    t += 30_000;
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(limiter.addresses(), 2_000, 'within the minute every address is kept');
+    assert.deepEqual(limiter.take('10.2.0.1'), { allowed: true });
+    assert.equal(limiter.addresses(), 2_001);
+    t += 30_001;
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(limiter.addresses(), 1, 'the 2,000 whose minute has passed are gone on the clock; the one whose minute still holds a request stands');
+  } finally {
+    limiter.close();
+  }
+  const noClock = createAddressLimiter(600, () => t, 0);
+  for (let i = 0; i < 2_000; i++) noClock.take(address(i));
+  t += 60_001;
+  assert.equal(noClock.addresses(), 2_000, 'no clock and no request yet: nothing has looked');
+  assert.deepEqual(noClock.take('10.4.0.1'), { allowed: true });
+  assert.equal(noClock.addresses(), 1, "another address's request removed the 2,000");
+  // A refused request adds nothing and moves nothing: the address leaves when its last taken request is a minute old.
+  const strict = createAddressLimiter(2, () => t, 0);
+  strict.take('a');
+  t += 1_000;
+  strict.take('b');
+  strict.take('b');
+  assert.ok(!strict.take('b').allowed);
+  t += 59_001;
+  assert.equal(strict.addresses(), 2);
+  strict.sweep();
+  assert.equal(strict.addresses(), 1, "a's minute passed; b's last taken request is 59 seconds old");
+  t += 1_000;
+  strict.sweep();
+  assert.equal(strict.addresses(), 0);
+  noClock.close();
+  strict.close();
+});
+
 test('the counters count by code and report in order', () => {
   const counters = createCounters(() => new Date('2026-11-11T00:00:00Z'));
   counters.count('NOT_FOUND');

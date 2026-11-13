@@ -117,4 +117,10 @@ test('one network address has 600 requests a minute; the 601st is refused with a
   const byCode = (other.body.refusedBeforeAdmission as { byCode: Record<string, number> }).byCode;
   assert.equal(byCode.NOT_FOUND, 600);
   assert.equal(byCode.RATE_LIMIT_EXCEEDED, 1);
+  // What is kept of addresses is a count on the status address, never an address: the two forwarded here and the
+  // test's own socket, each one entry however many requests it made.
+  const minute = other.body.addressMinute as { addresses: number; perMinute: number };
+  assert.equal(minute.perMinute, 600);
+  assert.ok(minute.addresses >= 2 && minute.addresses <= 3, `addresses in the last minute: ${minute.addresses}`);
+  assert.ok(!JSON.stringify(other.body).includes('203.0.113.9'), 'no address is served');
 });

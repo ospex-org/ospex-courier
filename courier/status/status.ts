@@ -2,7 +2,7 @@ import type { Address } from 'viem';
 import type { NodeCheck } from '../chain/node';
 import type { BettingSet } from '../chain/set';
 import type { ChainReader } from '../chain/snapshot';
-import { BOUNDS, type Counters } from '../http/limits';
+import { BOUNDS, type AddressLimiter, type Counters } from '../http/limits';
 import type { Store } from '../records/store';
 import type { Run } from '../records/runs';
 
@@ -25,6 +25,8 @@ export interface StatusDeps {
   node: NodeCheck;
   run: Run;
   counters: Counters;
+  /** The one limit kept in memory: each address's minute. */
+  limiter: AddressLimiter;
   settings: { lowPol: number };
   /** The published list of reporters, read at start. */
   published: readonly Address[];
@@ -98,6 +100,8 @@ export async function status(deps: StatusDeps): Promise<Record<string, unknown>>
     published: { reporters: deps.published },
     settings: { lowPol: deps.settings.lowPol },
     refusedBeforeAdmission: { since: deps.counters.since.toISOString(), byCode: deps.counters.snapshot() },
+    /** The addresses holding a request in the last minute, this process: a count, never an address. */
+    addressMinute: { addresses: deps.limiter.addresses(), perMinute: BOUNDS.requestsPerAddressPerMinute },
     database: {
       sizeBytes: databaseSize,
       /** The orders table's maintenance settings, as the database holds them. */

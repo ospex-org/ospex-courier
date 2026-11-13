@@ -124,7 +124,11 @@ book's reads.
 JSON, under `/v1`, over https only (behind Heroku's router; plain http is served only from this machine). No sign-in
 and no secret: the book is public. Every refusal is `{error, code}`, a plain sentence and an UPPER_SNAKE code.
 Reads from one network address are limited to 600 a minute, counted in memory; the courier keeps no log of
-addresses.
+addresses, and an address whose minute has passed leaves the count on a clock, whether or not it is seen again, so
+what is held is a minute's addresses and no more; the status address says how many stand (`addressMinute`), never
+which. The address is the last value of `X-Forwarded-For`, the one the router appended, so the courier runs behind
+one router that appends the caller's address, Heroku's, and is reachable no other way: anywhere else the last
+forwarded value is the caller's own choice, and with it the count.
 
 - `GET /healthz`: the process answers, and no more. `GET /readyz`: the database answers.
 - `GET /v1/status`: what stands now. This run; the open conditions; the number of the newest report line; the last
