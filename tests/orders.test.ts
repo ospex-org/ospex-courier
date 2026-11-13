@@ -730,6 +730,25 @@ test("each read of the chain is tried once more, so a post at the cap makes at m
   const plain = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...market }));
   assert.equal(plain.body.code, 'TOO_MANY_QUOTES');
   assert.equal(stack.proxy.count() - again.all, 3);
+
+  // The retry's limit: the sixteen's read failing both its tries is CHAIN_UNREACHABLE, exactly two requests of it and no
+  // third, and the condition opens; the next read that succeeds clears it. (The door's own read, the first eth_call
+  // since the rule was set, passes.)
+  stack.proxy.rule('eth_call', { kind: 'refuseWhen', refuse: (nth) => nth >= 2, code: -32000, message: 'held for the test' });
+  const limit = { calls: stack.proxy.count('eth_call') };
+  let unreachable;
+  try {
+    unreachable = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...market }));
+  } finally {
+    stack.proxy.rule('eth_call', null);
+  }
+  assert.equal(unreachable.status, 503, JSON.stringify(unreachable.body));
+  assert.equal(unreachable.body.code, 'CHAIN_UNREACHABLE');
+  assert.equal(stack.proxy.count('eth_call') - limit.calls, 3, "the door's read once, the sixteen's read twice, and no third try");
+  assert.deepEqual(((await get(url(), '/v1/status')).body.conditions as Array<{ key: string }>).map((c) => c.key), ['chain-unreachable'], 'two failures open the condition');
+  const recovered = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...market }));
+  assert.equal(recovered.body.code, 'TOO_MANY_QUOTES');
+  assert.deepEqual((await get(url(), '/v1/status')).body.conditions, [], 'the next read that succeeds clears it');
 });
 
 test("the door's page is the sixteen with the newest expiry, by the numbers: a planted set where the page's order decides the answer, record numbers 9,990 to 10,015 at one expiry, the upper sixteen under the floor and the lower ten live; the post marks the sixteen and is admitted", async () => {
