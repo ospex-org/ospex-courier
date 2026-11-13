@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { connect } from 'node:net';
 import { after, before, test } from 'node:test';
 import pg from 'pg';
 import { decodeFunctionData, decodeFunctionResult, encodeAbiParameters, encodeFunctionData, encodeFunctionResult, keccak256, toBytes, type Abi, type Address, type Hex } from 'viem';
@@ -293,6 +294,37 @@ test('the body: over 8 KB is refused 413 before it is read whole; not JSON, the 
   assert.equal(counts.BODY_TOO_LARGE, 1);
   assert.ok((counts.INVALID_PARAM ?? 0) >= 8);
   assert.equal(await orderRow(orderHash(order, 31337n, rig.addresses.matching)), null);
+});
+
+test("a request that never arrives whole is closed by the courier at its own ten seconds, answered 408, and counted as no refusal; the same bytes sent whole are answered at once", async () => {
+  const countsBefore = await refusedBeforeAdmission();
+  const started = Date.now();
+  // Headers whole, a body announced at 4,000 bytes and sent to its fifteenth: then nothing, for as long as the courier
+  // allows. Node's own default would hold this for five minutes; the test gives up at 25 seconds.
+  const outcome = await new Promise<{ closed: boolean; answer: string; elapsedMs: number }>((resolve) => {
+    const socket = connect({ host: '127.0.0.1', port: stack.courier.port });
+    let answer = '';
+    socket.on('data', (c: Buffer) => {
+      answer += c.toString('utf8');
+    });
+    socket.on('connect', () => socket.write('POST /v1/orders HTTP/1.1\r\nHost: courier\r\nContent-Type: application/json\r\nContent-Length: 4000\r\n\r\n{"role":"rest",'));
+    socket.on('close', () => resolve({ closed: true, answer, elapsedMs: Date.now() - started }));
+    socket.on('error', () => undefined);
+    setTimeout(() => {
+      socket.destroy();
+      resolve({ closed: false, answer, elapsedMs: Date.now() - started });
+    }, 25_000).unref();
+  });
+  assert.ok(outcome.closed, `the courier closed the connection; what it answered: ${JSON.stringify(outcome.answer)}`);
+  assert.ok(outcome.elapsedMs >= 9_000 && outcome.elapsedMs < 20_000, `closed at the courier's own ten seconds, not at another's number: ${outcome.elapsedMs} ms`);
+  assert.match(outcome.answer, /^HTTP\/1\.1 408/, 'answered 408');
+  const countsAfter = await refusedBeforeAdmission();
+  assert.equal(countsAfter.BODY_TOO_LARGE ?? 0, countsBefore.BODY_TOO_LARGE ?? 0, 'a request cut short is not a body too large');
+  assert.equal(countsAfter.INVALID_PARAM ?? 0, countsBefore.INVALID_PARAM ?? 0, 'nor a bad body');
+  // The control: the same bytes, sent whole, are read and answered at once (not JSON).
+  const whole = await post(url(), '/v1/orders', '{"role":"rest",');
+  assert.equal(whole.status, 400);
+  assert.equal(whole.body.code, 'INVALID_PARAM');
 });
 
 test('before admission nothing is kept: a key that has not registered the relay is refused NOT_REGISTERED, with no row, no line and no budget row; counted', async () => {

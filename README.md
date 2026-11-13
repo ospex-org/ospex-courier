@@ -128,7 +128,10 @@ addresses, and an address whose minute has passed leaves the count on a clock, w
 what is held is a minute's addresses and no more; the status address says how many stand (`addressMinute`), never
 which. The address is the last value of `X-Forwarded-For`, the one the router appended, so the courier runs behind
 one router that appends the caller's address, Heroku's, and is reachable no other way: anywhere else the last
-forwarded value is the caller's own choice, and with it the count.
+forwarded value is the caller's own choice, and with it the count. The server waits ten seconds for a request to
+arrive whole, headers and body (`timeouts` on the status address), then answers 408 and closes the connection: an
+order's body is at most 8 KB and a read has none, so a request still arriving after ten seconds is not one the
+courier waits on; Node's own default is five minutes.
 
 - `GET /healthz`: the process answers, and no more. `GET /readyz`: the database answers.
 - `GET /v1/status`: what stands now. This run; the open conditions; the number of the newest report line; the last

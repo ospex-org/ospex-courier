@@ -68,16 +68,20 @@ function send(res: ServerResponse, answer: HttpAnswer, extra: Record<string, str
 
 const refusal = (status: number, code: string, error: string): HttpAnswer => ({ status, body: { error, code } });
 
+type Body = { ok: true; text: string } | { ok: false; why: 'too large' | 'cut' };
+
 /**
  * The body of a POST, read up to its bound and no further: a body over the
- * bound is refused before it is read whole, and before anything is parsed.
+ * bound is refused before it is read whole, and before anything is parsed. A
+ * body that never arrives whole (the connection cut, or closed by the server's
+ * own timeout) is `cut`: there is nothing to answer and nothing was refused.
  */
-function readBody(req: IncomingMessage, bound: number): Promise<{ ok: true; text: string } | { ok: false }> {
+function readBody(req: IncomingMessage, bound: number): Promise<Body> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let size = 0;
     let done = false;
-    const finish = (value: { ok: true; text: string } | { ok: false }) => {
+    const finish = (value: Body) => {
       if (done) return;
       done = true;
       resolve(value);
@@ -87,12 +91,15 @@ function readBody(req: IncomingMessage, bound: number): Promise<{ ok: true; text
       if (size > bound) {
         req.removeAllListeners('data');
         req.resume();
-        return finish({ ok: false });
+        return finish({ ok: false, why: 'too large' });
       }
       chunks.push(chunk);
     });
     req.on('end', () => finish({ ok: true, text: Buffer.concat(chunks).toString('utf8') }));
-    req.on('error', () => finish({ ok: false }));
+    req.on('error', () => finish({ ok: false, why: 'cut' }));
+    req.on('close', () => {
+      if (!req.complete) finish({ ok: false, why: 'cut' });
+    });
   });
 }
 
@@ -129,6 +136,8 @@ export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, 
     if (req.method === 'POST' && path === '/v1/orders') {
       const body = await readBody(req, BOUNDS.orderBodyBytes);
       if (!body.ok) {
+        // A request that did not arrive whole: the connection is gone or going, nothing is answered and nothing counted.
+        if (body.why === 'cut') return;
         deps.counters.count('BODY_TOO_LARGE');
         return send(res, refusal(413, 'BODY_TOO_LARGE', `An order's body is at most ${BOUNDS.orderBodyBytes} bytes.`), { connection: 'close' });
       }

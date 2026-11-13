@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { BOUNDS, createAddressLimiter, createCounters } from '../courier/http/limits';
+import { BOUNDS, createAddressLimiter, createCounters, TIMEOUTS } from '../courier/http/limits';
 
 // The published bounds, pinned to the plan's numbers; and the one limit kept
 // in memory, the requests from one network address.
@@ -23,6 +23,7 @@ test('the bounds are the plan\'s numbers', () => {
     pageQuotesPerSide: 50,
     page: 100,
   });
+  assert.deepEqual(TIMEOUTS, { requestMs: 10_000, headersMs: 10_000, checkEveryMs: 1_000 }, 'the server waits ten seconds for a request to arrive whole, and looks every second');
 });
 
 test('an address has its minute: the limit allowed, the next refused, and the minute slides', () => {

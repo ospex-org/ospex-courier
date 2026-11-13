@@ -4,7 +4,7 @@ import { chainId, createJsonRpc, describeNodeFailure, type JsonRpc } from './cha
 import { readSet, SetRefused, type BettingSet } from './chain/set';
 import { createChainReader, type ChainReader } from './chain/snapshot';
 import { readCourierConfig, type CourierConfig } from './config';
-import { BOUNDS, createAddressLimiter, createCounters } from './http/limits';
+import { BOUNDS, createAddressLimiter, createCounters, TIMEOUTS } from './http/limits';
 import { createRequestHandler } from './http/service';
 import { PublishedListRefused, readPublishedReporters } from './orders/published';
 import { applySchema, createStore, databaseRefusal, missingSchema, openPool, pinnedAuthority, StoreRefused, type Store } from './records/store';
@@ -115,7 +115,10 @@ export async function startService(env: Record<string, string | undefined>, opti
   const limiter = createAddressLimiter(BOUNDS.requestsPerAddressPerMinute);
   const chain = createChainReader({ rpc, conditions: store.conditions, run: run.id, now, log });
   const handler = createRequestHandler({ store, chain, set, node, run, counters, limiter, settings: { lowPol: config.lowPol }, published, notYetBuilt: NOT_YET_BUILT, log });
-  const server: Server = createServer(handler);
+  // The server's own timeout on a request arriving: a stated number (http/limits.ts), not Node's five minutes; and
+  // how often it looks, so the close comes within a second of the number and not within Node's thirty.
+  const server: Server = createServer({ requestTimeout: TIMEOUTS.requestMs, connectionsCheckingInterval: TIMEOUTS.checkEveryMs }, handler);
+  server.headersTimeout = TIMEOUTS.headersMs;
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(config.port, () => {

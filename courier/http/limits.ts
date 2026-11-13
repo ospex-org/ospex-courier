@@ -30,6 +30,22 @@ export const BOUNDS = {
   page: 100,
 } as const;
 
+/**
+ * How long the server waits for a request to arrive whole, headers and body,
+ * in milliseconds: ten seconds. An order's body is at most 8,192 bytes and a
+ * read has none, so a request still arriving after ten seconds is not one the
+ * courier waits on; the connection is answered 408 and closed. Node's own
+ * default is five minutes, which a client that never finishes its body would
+ * hold a connection for. Published on the status address.
+ */
+export const TIMEOUTS = {
+  requestMs: 10_000,
+  /** The headers alone, within the same ten seconds (Node requires it at or under the request's). */
+  headersMs: 10_000,
+  /** How often the server looks for a request past its time: the close comes within this much of the ten seconds. Node's own default is thirty seconds. */
+  checkEveryMs: 1_000,
+} as const;
+
 export interface AddressLimiter {
   /** Takes one request from the address's minute. Refused when the address has made its limit in the last minute. */
   take(address: string): { allowed: true } | { allowed: false; retryAfterSeconds: number };
