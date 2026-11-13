@@ -734,9 +734,13 @@ test('a live quote after kickoff on a game with a written start is taken; a scor
 
   // The rig's first game, still verified: at the start plus the window, bets are closed; one second before, not.
   const firstStart = await rig.read<bigint>(rig.addresses.games, rig.abis.OspexGames as Abi, 'getGameStart', [rig.gameId]);
+  // The block before the close is named by its time, not reached by adding to the clock: a block mined after an
+  // addition carries the wall clock's seconds since the last read as well, and can land on the close itself.
   const closesAt = firstStart + window;
   T = await rig.time();
-  if (T < closesAt - 1n) await rig.increaseTime(closesAt - 1n - T);
+  assert.ok(T < closesAt - 1n, 'the close is still ahead');
+  await rig.setNextBlockTime(closesAt - 1n);
+  await rig.mine(1);
   T = await rig.time();
   assert.equal(T, closesAt - 1n);
   const open = await postOrder(url(), rig, maker, 'rest', orderOn(rig, maker, { expiry: T + 600n, oddsTick: 444 }));
