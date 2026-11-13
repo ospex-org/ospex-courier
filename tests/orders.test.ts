@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import pg from 'pg';
 import { decodeFunctionData, decodeFunctionResult, encodeAbiParameters, encodeFunctionData, encodeFunctionResult, keccak256, toBytes, type Abi, type Address, type Hex } from 'viem';
+import type { HDAccount } from 'viem/accounts';
 import { MULTICALL_ABI, MULTICALL_ADDRESS } from '../courier/chain/abi';
 import { orderHash, orderSigner } from '../courier/orders/order';
 import { openPool } from '../courier/records/store';
@@ -511,36 +512,155 @@ test('an account holds at most 16 live quotes on one side of one market; an expi
   assert.equal(otherSide.status, 201);
 });
 
-test('the count of live quotes looks past the ended ones standing in front: sixteen quotes cancelled on chain, with later expiries than their replacements, hide no live quote behind them; sixteen replacements are taken and the seventeenth is refused', async () => {
+/** The account's unended quote rows on a market and side, by hash, with how each ended and at which block. */
+async function unendedRows(who: HDAccount, side: 0 | 1 = 0): Promise<number> {
+  const { rows } = await pool.query<{ n: number }>(`SELECT count(*)::int AS n FROM orders WHERE account = $1 AND role = 'rest' AND side = $2 AND ended IS NULL`, [who.address.toLowerCase(), side]);
+  return rows[0]?.n ?? -1;
+}
+
+async function marks(hashes: string[]): Promise<Array<{ ended: string | null; block: string | null; hash: string | null }>> {
+  const { rows } = await pool.query<{ ended: string | null; block: string | null; hash: string | null }>(
+    `SELECT ended, ended_block::text AS block, ended_block_hash AS hash FROM orders WHERE hash = ANY($1::text[]) ORDER BY record_number`,
+    [hashes.map((h) => h.toLowerCase())],
+  );
+  return rows;
+}
+
+test('the count of standing quotes is one page and at most one read of the chain: sixteen quotes cancelled on chain are marked cancelled, at the block read, by the first post that finds sixteen standing, and hide no live quote; sixteen replacements are taken, the seventeenth is refused; one live replacement cancelled makes room for one, a quote already marked and cancelled again makes none', async () => {
   const who = rig.account(10);
   await rig.fund(who);
   const T = await rig.time();
   const market = { scorer: rig.addresses.total, lineTicks: 2_305 };
   const first: Order[] = [];
+  const firstHashes: string[] = [];
   for (let i = 0; i < 16; i++) {
     const q = orderOn(rig, who, { expiry: T + 3_600n, ...market });
     const answer = await postOrder(url(), rig, who, 'rest', q);
     assert.equal(answer.status, 201, `${i}: ${JSON.stringify(answer.body)}`);
     first.push(q);
+    firstHashes.push(answer.body.orderHash as string);
   }
   for (const q of first) await cancelOnChain(rig, who, q);
-  // The replacements expire an hour earlier than the cancelled sixteen, so in the index, newest expiry first, every
-  // one of them stands behind all sixteen. Each is taken: the cancelled ones are read at the block and not counted.
-  for (let i = 0; i < 16; i++) {
-    const answer = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 1_800n, ...market }));
+  assert.equal(await unendedRows(who), 16, 'cancelled on chain, the sixteen stand in the records until a request asks the chain about them');
+
+  // The first replacement finds sixteen standing, asks the chain once about them, marks the sixteen it shows cancelled
+  // at the block it read, and is taken. The replacements expire an hour before the cancelled sixteen, so every one of
+  // them would stand behind the sixteen in the index: the mark is what makes room, not the order.
+  const head = await rig.publicClient.getBlock();
+  const callsBefore = stack.proxy.count('eth_call');
+  const taken = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 1_800n, ...market }));
+  assert.equal(taken.status, 201, JSON.stringify(taken.body));
+  assert.equal(stack.proxy.count('eth_call') - callsBefore, 2, "the door's own read and one read of the sixteen");
+  const marked = await marks(firstHashes);
+  assert.equal(marked.length, 16);
+  for (const m of marked) assert.deepEqual(m, { ended: 'cancelled', block: head.number.toString(), hash: head.hash.toLowerCase() }, 'marked cancelled at the block the chain was read at');
+  assert.equal(await unendedRows(who), 1);
+
+  // Fifteen more replacements, each with fewer than sixteen standing: the chain is asked nothing about the quotes.
+  const replacements: Order[] = [];
+  for (let i = 1; i < 16; i++) {
+    const before = stack.proxy.count('eth_call');
+    const q = orderOn(rig, who, { expiry: T + 1_800n, ...market });
+    const answer = await postOrder(url(), rig, who, 'rest', q);
     assert.equal(answer.status, 201, `replacement ${i + 1}: ${JSON.stringify(answer.body)}`);
+    assert.equal(stack.proxy.count('eth_call') - before, 1, `replacement ${i + 1}: the door's own read and no other`);
+    replacements.push(q);
   }
   const seventeenth = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 1_800n, ...market }));
   assert.equal(seventeenth.status, 422, JSON.stringify(seventeenth.body));
   assert.equal(seventeenth.body.code, 'TOO_MANY_QUOTES');
   assert.equal(seventeenth.body.error, 'This account holds 16 live quotes on this side of this market; the bound is 16.');
-  const unended = await pool.query<{ n: number }>(`SELECT count(*)::int AS n FROM orders WHERE account = $1 AND role = 'rest' AND ended IS NULL`, [who.address.toLowerCase()]);
-  assert.equal(unended.rows[0]?.n, 32, 'the cancelled sixteen stand unmarked in the records: what the chain knows is read at the block, never stored');
-  // One replacement cancelled makes room for one, found behind the cancelled sixteen as well.
-  const replacement = orderOn(rig, who, { expiry: T + 1_800n, ...market });
-  assert.equal((await postOrder(url(), rig, who, 'rest', replacement)).body.code, 'TOO_MANY_QUOTES');
+  assert.equal(await unendedRows(who), 16, 'the sixteen replacements stand; the cancelled sixteen are marked');
+
+  // One live replacement cancelled on chain makes room for one: found by the next post's one read, marked, and the post taken.
+  await cancelOnChain(rig, who, replacements[0] as Order);
+  const roomBefore = stack.proxy.count('eth_call');
+  const room = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 1_800n, ...market }));
+  assert.equal(room.status, 201, JSON.stringify(room.body));
+  assert.equal(stack.proxy.count('eth_call') - roomBefore, 2);
+  assert.equal((await marks([await contractHash(rig, replacements[0] as Order)]))[0]?.ended, 'cancelled');
+  // A quote already marked, cancelled on chain again, makes none: it is not asked about again.
   await cancelOnChain(rig, who, first[0] as Order);
-  assert.equal((await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 1_800n, ...market }))).body.code, 'TOO_MANY_QUOTES', 'a cancelled quote that was not counted makes no room');
+  const none = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 1_800n, ...market }));
+  assert.equal(none.body.code, 'TOO_MANY_QUOTES', 'a quote already marked makes no room');
+  assert.equal(await unendedRows(who), 16);
+
+  // The record of a marked quote says how and at which block.
+  const served = await get(url(), `/v1/orders/${firstHashes[0]}`);
+  assert.equal(served.status, 200);
+  assert.equal(served.body.state, 'cancelled');
+  assert.equal(served.body.ended, 'cancelled');
+  assert.equal(typeof served.body.endedAt, 'string');
+  assert.deepEqual(served.body.endedBlock, { number: head.number.toString(), hash: head.hash.toLowerCase() });
+  // A live quote's record carries no such block.
+  assert.equal((await get(url(), `/v1/orders/${taken.body.orderHash}`)).body.endedBlock, null);
+});
+
+test('one post is one page and at most one read of the chain for the quotes, whatever the account has posted: 256 quotes ended by floor raises, the 257th post included; then 256 rows planted under the floor, a state the door cannot make, each post one read, marking sixteen, refused until the side is clear', async () => {
+  const who = rig.account(13);
+  await rig.fund(who);
+  const market = { scorer: rig.addresses.spread, lineTicks: -1_235 };
+  let T = await rig.time();
+  const requests: number[] = [];
+  const quoteReads: number[] = [];
+  const postOne = async (positionType: 0 | 1) => {
+    const before = { all: stack.proxy.count(), calls: stack.proxy.count('eth_call') };
+    const q = orderOn(rig, who, { expiry: T + 3_600n, ...market, positionType });
+    const answer = await postOrder(url(), rig, who, 'rest', q);
+    requests.push(stack.proxy.count() - before.all);
+    // The door's own read is one eth_call; a read of the quotes is one more.
+    quoteReads.push(stack.proxy.count('eth_call') - before.calls - 1);
+    return { ...answer, order: q };
+  };
+
+  // Sixteen batches of sixteen quotes, each batch ended by one raise of the account's floor above its nonces. The
+  // account's budget is 240 at once and 12 a minute of the chain's time, so the chain's clock is moved for the rest.
+  for (let batch = 0; batch < 16; batch++) {
+    if (batch === 15) {
+      await rig.increaseTime(90n);
+      T = await rig.time();
+    }
+    let top = 0n;
+    let one: Order | null = null;
+    for (let i = 0; i < 16; i++) {
+      const answer = await postOne(0);
+      assert.equal(answer.status, 201, `batch ${batch}, post ${i}: ${JSON.stringify(answer.body)}`);
+      if (answer.order.nonce > top) top = answer.order.nonce;
+      one = answer.order;
+    }
+    await raiseFloor(rig, who, one as Order, top + 1n);
+  }
+  // The 257th finds the last batch's sixteen standing, asks once, marks them, and is taken.
+  const last = await postOne(0);
+  assert.equal(last.status, 201, JSON.stringify(last.body));
+  assert.equal(requests.length, 257);
+  assert.ok(requests.every((n) => n <= 3), `at most three requests to the chain a post (one header, the door's read, one read of the quotes): ${JSON.stringify(requests)}`);
+  assert.ok(quoteReads.every((n) => n <= 1), `at most one read of the quotes a post: ${JSON.stringify(quoteReads)}`);
+  assert.equal(quoteReads.filter((n) => n === 1).length, 16, 'the chain was asked about the quotes once per sixteen posted: at each post that found sixteen standing');
+  assert.equal(Number((await pool.query<{ n: number }>(`SELECT count(*)::int AS n FROM orders WHERE account = $1 AND ended = 'cancelled'`, [who.address.toLowerCase()])).rows[0]?.n), 256, 'the 256 ended by the floor are marked');
+  assert.equal(await unendedRows(who, 0), 1);
+
+  // A state the door cannot make: 256 unended rows planted on the other side, every nonce under the floor. Each post
+  // is one page and one read, marks sixteen, and is refused until the side is clear; the sixteenth clears it.
+  const key = keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'address' }, { type: 'int32' }], [rig.gameId, market.scorer, market.lineTicks]));
+  await pool.query(
+    `INSERT INTO orders (hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, market_key, side, received_block, received_hash, received_time)
+     SELECT '0x' || lpad(to_hex(900000000 + i), 64, '0'), 'rest', $1, $2, $3, $4, 1, 200, 1000000, i, $5, 0, '0x' || repeat('ab', 65), $6, 1, 1, '0x' || repeat('cd', 32), 1
+     FROM generate_series(1, 256) AS i`,
+    [who.address.toLowerCase(), rig.gameId.toString(), market.scorer.toLowerCase(), market.lineTicks, (T + 3_600n).toString(), key.toLowerCase()],
+  );
+  assert.equal(await unendedRows(who, 1), 256);
+  await rig.increaseTime(90n);
+  T = await rig.time();
+  for (let i = 0; i < 16; i++) {
+    const answer = await postOne(1);
+    const left = 256 - 16 * (i + 1);
+    assert.equal(answer.status, i < 15 ? 422 : 201, `planted post ${i + 1}: ${JSON.stringify(answer.body)}`);
+    if (i < 15) assert.equal(answer.body.error, `This account holds 16${left > 16 ? ' or more' : ''} live quotes on this side of this market; the bound is 16.`, `planted post ${i + 1}: the count read again after the mark`);
+    assert.equal(quoteReads[quoteReads.length - 1], 1, `planted post ${i + 1}: one read of the quotes`);
+    assert.equal(requests[requests.length - 1], 3);
+    assert.equal(await unendedRows(who, 1), left + (i < 15 ? 0 : 1), `planted post ${i + 1}: sixteen marked`);
+  }
 });
 
 test('a stop on record for the hash is honoured at the door: STOPPED, as a line (the stop build writes the record; the door reads it)', async () => {

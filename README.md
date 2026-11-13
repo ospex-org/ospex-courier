@@ -87,9 +87,11 @@ courier's own fault); a stop on record (`STOPPED`); the game, whose start must b
 be exactly the published list, which must not have ended and whose close must not have passed (`UNKNOWN_GAME`,
 `NO_WRITTEN_START`, `REPORTERS_NOT_THE_PUBLISHED_LIST`, `GAME_ENDED`, `BETS_CLOSED`); the order's standing on chain
 (`CANCELLED`, `EXPIRED`, `FILLED`), the expiry exact with no margin; for a quote, fewer than 16 live quotes of the
-account on that side of that market (`TOO_MANY_QUOTES`), the unexpired ones gathered sixteen at a time and the
-chain asked which of them it shows ended, so that cancelled or filled quotes standing in front hide none behind
-them; for a bet, the signed stake not above the cap until the lift, both read from the matching contract at the
+account on that side of that market (`TOO_MANY_QUOTES`): one page of the account's unexpired quotes the courier has
+not marked ended, at most seventeen rows; sixteen or more standing, the chain is asked once about sixteen of them,
+the ones it shows cancelled or under the account's floor are marked `cancelled` in the records at the block read,
+and the count is read once more, so one post is one page and at most one read of the chain for the quotes whatever
+the account has posted before; for a bet, the signed stake not above the cap until the lift, both read from the matching contract at the
 block (`ABOVE_CAP`), the expiry at most 30 seconds past the chain's time (`EXPIRY_TOO_FAR`), and fewer than two of
 the account's bets, and 32 in all, waiting their turn (`QUEUE_FULL`). Checks 5 and 8 to 16 run in one database
 transaction under the order's hash lock. A quote accepted is `201 resting`; a bet accepted is `202 queued`, recorded
@@ -101,7 +103,21 @@ admitted requests at once and 12 a minute after; the courier's 2,400 at once and
 accounts together. Their clock is the chain's time, read at the block the door named. A request over a budget is
 not admitted, and the row counts how many and when last.
 
-`GET /v1/orders/{hash}` is the courier's record of one order.
+`GET /v1/orders/{hash}` is the courier's record of one order. Its `state` is `resting` for a quote the courier has
+not marked ended, `queued` for a bet waiting its turn, else how the order ended here: `stopped`, `expired`,
+`filled`, or `cancelled`, with `endedAt` and, for `cancelled`, `endedBlock`, the block the chain was read at.
+
+**The mark of a quote the chain shows ended.** Every request that asks the chain about a quote the courier holds (the
+door's count above; the market's page, below) and is shown it cancelled, or under its account's floor for the market,
+marks it `cancelled` in the records in that same request, at the block it read; a marked quote is asked about no
+more. Both are the maker's own acts, so the mark is at the block read and not at finality: if a reorganization undoes
+the cancel, the quote stays marked here, this courier carries it no further, and a maker who wants it carried signs a
+new one. Two things a read can show are not marked: a quote filled by another courier (nothing fills through this
+courier yet; who marks a filled quote, and how the count takes one whose fill is not final, is the pre-check build's),
+which stands in the door's count until its expiry and is not listed; and an account that has dropped the relay,
+which is not an end of the quote and is undone by the account itself, so its quotes are not listed while it stands
+unregistered and are listed again after. The expiry mark is unchanged: against the final block's time, in the
+book's reads.
 
 ## What is served
 

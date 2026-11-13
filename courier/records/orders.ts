@@ -23,8 +23,12 @@ export interface OrderRow {
   receivedHash: Hex;
   /** The receipt block's time: the chain's time the order was taken at, which a repeat is answered from. */
   receivedTime: bigint;
-  ended: 'stopped' | 'expired' | 'filled' | null;
+  /** How the order ended here, if it has: `cancelled` is a quote a read of the chain showed cancelled or under its account's floor, marked at the block read. */
+  ended: 'stopped' | 'expired' | 'filled' | 'cancelled' | null;
   endedAt: Date | null;
+  /** The block the chain read that marked a quote cancelled was made at; null for the other marks. */
+  endedBlock: bigint | null;
+  endedBlockHash: Hex | null;
   betState: 'waiting' | 'held' | 'sent' | 'refused' | 'lapsed' | null;
 }
 
@@ -65,10 +69,10 @@ export interface AccountQuote {
   recordNumber: number;
 }
 
-/** Where the next page of an account's quotes starts: the last row's expiry and record number. */
-export interface AccountQuoteCursor {
-  expiry: bigint;
-  recordNumber: number;
+/** A block a chain read was made at, as a mark records it. */
+export interface BlockRead {
+  number: bigint;
+  hash: Hex;
 }
 
 export interface ScanResult {
@@ -86,7 +90,8 @@ export interface ScanResult {
 
 const ORDER_COLUMNS = `hash, role, account, game_id::text AS game_id, scorer, line_ticks, position_type, odds_tick, risk_amount::text AS risk_amount,
   nonce::text AS nonce, expiry::text AS expiry, min_fill::text AS min_fill, signature, market_key, side, record_number::text AS record_number,
-  received_at, received_block::text AS received_block, received_hash, received_time::text AS received_time, ended, ended_at, bet_state`;
+  received_at, received_block::text AS received_block, received_hash, received_time::text AS received_time, ended, ended_at,
+  ended_block::text AS ended_block, ended_block_hash, bet_state`;
 
 function toRow(r: Record<string, unknown>): OrderRow {
   return {
@@ -114,6 +119,8 @@ function toRow(r: Record<string, unknown>): OrderRow {
     receivedTime: BigInt(r.received_time as string),
     ended: (r.ended as OrderRow['ended']) ?? null,
     endedAt: (r.ended_at as Date | null) ?? null,
+    endedBlock: r.ended_block === null || r.ended_block === undefined ? null : BigInt(r.ended_block as string),
+    endedBlockHash: (r.ended_block_hash as Hex | null) ?? null,
     betState: (r.bet_state as OrderRow['betState']) ?? null,
   };
 }
@@ -193,12 +200,19 @@ export interface Orders {
   waiting(on: Writer, account: Address): Promise<{ account: number; all: number }>;
   /**
    * One page of an account's quotes on one side of one market the courier has
-   * not marked ended, newest expiry first, at most the bound plus one rows,
-   * from after the cursor: the live ones come first, so a walk along it ends
-   * at the first expired row. The door walks it page by page, since quotes the
-   * chain shows ended can stand in front with later expiries.
+   * not marked ended and the block's time has not expired (expiry above T + 1),
+   * newest expiry first, at most the bound plus one rows. One page is the whole
+   * count: the records hold at most sixteen such quotes of an account on a side
+   * that the chain has not been asked about, since the door marks the ones a
+   * read shows ended.
    */
-  quotesOfAccount(on: Writer, account: Address, marketKey: Hex, side: 0 | 1, after: AccountQuoteCursor | null): Promise<AccountQuote[]>;
+  quotesOfAccount(on: Writer, account: Address, marketKey: Hex, side: 0 | 1, blockTime: bigint): Promise<AccountQuote[]>;
+  /**
+   * Marks quotes cancelled, at the block the chain read that showed them so was
+   * made at: the ones among `hashes` not already marked. Returns the hashes it
+   * marked.
+   */
+  markCancelled(on: Writer, hashes: Hex[], block: BlockRead): Promise<Hex[]>;
   /** The book's scan with the mark, one statement. */
   scan(on: Writer, args: ScanArgs): Promise<ScanResult>;
   /**
@@ -265,15 +279,23 @@ export function createOrders(pool: pg.Pool): Orders {
       );
       return { account: Number(rows[0]?.mine ?? 0), all: Number(rows[0]?.all ?? 0) };
     },
-    async quotesOfAccount(on, account, marketKey, side, after) {
+    async quotesOfAccount(on, account, marketKey, side, blockTime) {
       const { rows } = await on.query<{ hash: Hex; expiry: string; risk_amount: string; nonce: string; record_number: string }>(
         `SELECT hash, expiry::text AS expiry, risk_amount::text AS risk_amount, nonce::text AS nonce, record_number::text AS record_number FROM orders
-         WHERE role = 'rest' AND ended IS NULL AND account = $1 AND market_key = $2 AND side = $3
-           AND ($5::numeric IS NULL OR (expiry, record_number) < ($5::numeric, $6::bigint))
+         WHERE role = 'rest' AND ended IS NULL AND account = $1 AND market_key = $2 AND side = $3 AND expiry > $5::numeric
          ORDER BY expiry DESC, record_number DESC LIMIT $4`,
-        [account.toLowerCase(), marketKey.toLowerCase(), side, BOUNDS.liveQuotesPerAccountSideMarket + 1, after === null ? null : after.expiry.toString(), after === null ? null : after.recordNumber],
+        [account.toLowerCase(), marketKey.toLowerCase(), side, BOUNDS.liveQuotesPerAccountSideMarket + 1, (blockTime + 1n).toString()],
       );
       return rows.map((r) => ({ hash: r.hash, expiry: BigInt(r.expiry), riskAmount: BigInt(r.risk_amount), nonce: BigInt(r.nonce), recordNumber: Number(r.record_number) }));
+    },
+    async markCancelled(on, hashes, block) {
+      if (hashes.length === 0) return [];
+      const { rows } = await on.query<{ hash: Hex }>(
+        `UPDATE orders SET ended = 'cancelled', ended_at = now(), ended_block = $2::numeric, ended_block_hash = $3
+         WHERE hash = ANY($1::text[]) AND ended IS NULL RETURNING hash`,
+        [hashes.map((h) => h.toLowerCase()), block.number.toString(), block.hash.toLowerCase()],
+      );
+      return rows.map((r) => r.hash);
     },
     async scan(on, args) {
       const { rows } = await on.query<{ scanned: number; marked: number; live: number; last_tick: number | null; last_record: string | null; rows: Array<Record<string, unknown>> }>(

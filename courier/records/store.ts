@@ -201,6 +201,8 @@ export const COLUMNS_USED: ReadonlyArray<readonly [table: string, column: string
   ['orders', 'received_time'],
   ['orders', 'ended'],
   ['orders', 'ended_at'],
+  ['orders', 'ended_block'],
+  ['orders', 'ended_block_hash'],
   ['orders', 'bet_state'],
   ['stops', 'hash'],
   ['accounts', 'account'],

@@ -126,6 +126,19 @@ test('an order keeps the contract\'s own rules: the price range, whole lots, the
   await insertOrder(HASH('f0'), 'take', { bet_state: 'waiting' });
 });
 
+test('a mark is whole: cancelled carries the block the chain was read at, number and hash together; a block without a mark, or an end the schema does not list, is refused', async () => {
+  const at = new Date();
+  await refused(insertOrder(HASH('e1'), 'rest', { ended: 'cancelled', ended_at: at }), '23514', 'cancelled with no block');
+  await refused(insertOrder(HASH('e2'), 'rest', { ended: 'cancelled', ended_at: at, ended_block: '5' }), '23514', 'cancelled with a block number and no hash');
+  await refused(insertOrder(HASH('e3'), 'rest', { ended_block: '5', ended_block_hash: HASH('b') }), '23514', 'a block with no mark');
+  await refused(insertOrder(HASH('e4'), 'rest', { ended: 'expired', ended_at: at, ended_block_hash: HASH('b') }), '23514', 'a hash with no number');
+  await refused(insertOrder(HASH('e5'), 'rest', { ended: 'gone', ended_at: at }), '23514', 'an end the schema does not list');
+  await refused(insertOrder(HASH('e6'), 'rest', { ended: 'cancelled' }), '23514', 'a mark with no time');
+  // The controls: a cancelled mark with its block; an expiry mark with none.
+  await insertOrder(HASH('e7'), 'rest', { ended: 'cancelled', ended_at: at, ended_block: '5', ended_block_hash: HASH('b') });
+  await insertOrder(HASH('e8'), 'rest', { ended: 'expired', ended_at: at });
+});
+
 test('one bet, one Cross; one transaction hash; one open Cross a lane', async () => {
   const { rows } = await pool.query<{ id: string }>('INSERT INTO runs DEFAULT VALUES RETURNING id');
   const run = Number(rows[0]?.id);

@@ -65,14 +65,25 @@ CREATE TABLE IF NOT EXISTS orders (
   -- The receipt block's time: the chain's time the order was taken at, which the first answer carries and a repeat
   -- post is answered from, with no chain read.
   received_time   numeric(78, 0) NOT NULL,
-  -- Empty while the order is live as far as the courier itself knows; else how it ended here. What only the
-  -- chain knows (a cancel, a floor, a fill sent by another courier) is read at a block, never stored.
-  ended           text CHECK (ended IN ('stopped', 'expired', 'filled')),
+  -- Empty while the order is live as far as the courier itself knows; else how it ended here: a stop on record,
+  -- expired at the final block, filled by this courier's own Cross, or cancelled: a read of the chain showed the
+  -- quote cancelled or under its account's floor for the market, both the maker's own act, and the request that
+  -- read it marked it, at the block it read (ended_block). A fill by another courier and the relay dropped are read
+  -- at a block and not stored: neither is the maker's act on the quote, and a fill at the head can still be undone.
+  ended           text CHECK (ended IN ('stopped', 'expired', 'filled', 'cancelled')),
   ended_at        timestamptz,
+  -- The block the chain read that marked the quote cancelled was made at: number and hash. Empty for the other
+  -- marks: a stop has its message, and the expiry mark is against the final block's time.
+  ended_block     numeric(78, 0),
+  ended_block_hash text CHECK (ended_block_hash ~ '^0x[0-9a-f]{64}$'),
   -- For a bet, where it stands. A quote has none.
   bet_state       text CHECK (bet_state IN ('waiting', 'held', 'sent', 'refused', 'lapsed')),
   CONSTRAINT orders_side_is_position_type CHECK (side = position_type),
   CONSTRAINT orders_ended_whole CHECK ((ended IS NULL) = (ended_at IS NULL)),
+  CONSTRAINT orders_ended_block_whole CHECK (
+    (ended_block IS NULL) = (ended_block_hash IS NULL)
+    AND (ended_block IS NULL OR ended IS NOT NULL)
+    AND (ended IS DISTINCT FROM 'cancelled' OR ended_block IS NOT NULL)),
   CONSTRAINT orders_bet_state_for_bets CHECK ((role = 'take') = (bet_state IS NOT NULL))
 );
 
@@ -88,11 +99,12 @@ CREATE INDEX IF NOT EXISTS orders_book
   ON orders (market_key, side, odds_tick, record_number)
   WHERE role = 'rest' AND ended IS NULL;
 
--- The door's count of an account's live quotes on one side of one market: the live ones first, so the walk
--- ends at the first expired row, a page of at most 17 rows at a time whatever the account has posted. The door
--- walks it page by page, since quotes the chain shows ended (cancelled, under the account's floor, filled) stand
--- in it with their expiries and are told apart only at the block. Again a count of rows returned; what the
--- database passes over to return them is the paragraph above.
+-- The door's count of an account's quotes on one side of one market the courier has not marked ended: one page
+-- of the unexpired ones, at most 17 rows, whatever the account has posted. Sixteen or more standing, the chain is
+-- asked once about sixteen and the ones it shows cancelled or under the floor are marked here, so the records
+-- never hold more than sixteen unended quotes of an account on a side except where the chain has not yet been
+-- asked about them. Again a count of rows returned; what the database passes over to return them is the
+-- paragraph above.
 CREATE INDEX IF NOT EXISTS orders_live_quotes_per_account
   ON orders (account, market_key, side, expiry DESC)
   WHERE role = 'rest' AND ended IS NULL;
