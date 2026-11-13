@@ -2,16 +2,26 @@ import { createServer, request as httpRequest, type Server } from 'node:http';
 import { once } from 'node:events';
 
 // A small proxy between the courier and the chain, which the tests control.
-// It counts requests and their bytes, by method; it can refuse one, answer
-// one itself, hold one, or pass it on. It answers the `finalized` tag itself,
-// so the test decides which block is final.
+// It counts requests and their bytes, by method, as they ARRIVE, so a request
+// the node rejects or one still being answered is in the count; it can refuse
+// one, answer one itself, hold one, or pass it on. It answers the `finalized`
+// tag itself, so the test decides which block is final. Everything the courier
+// asks of the chain goes through it, and nothing else does: the tests speak to
+// the chain on the rig's own address.
 
 export interface Counted {
   method: string;
   requestBytes: number;
+  /** The answer's bytes once answered; 0 while the request is still being answered. */
   answerBytes: number;
-  /** How the proxy dealt with it. */
-  how: 'passed' | 'refused' | 'answered' | 'held';
+  /** How the proxy dealt with it: `arrived` until it has been answered. */
+  how: 'arrived' | 'passed' | 'refused' | 'answered' | 'held';
+}
+
+/** The courier's sends, which this build must never make: counted at the proxy as they arrive. */
+export interface Sends {
+  eth_sendRawTransaction: number;
+  eth_sendTransaction: number;
 }
 
 interface JsonRpcRequest {
@@ -32,7 +42,10 @@ export type Rule =
 export interface ChainProxy {
   url: string;
   counted: Counted[];
+  /** Requests of the method that have arrived (every method when none is named), answered or not. */
   count(method?: string): number;
+  /** The two sends, as they have arrived. */
+  sends(): Sends;
   /** Apply a rule to every request of the method until the rule is lifted. */
   rule(method: string, rule: Rule | null): void;
   /** Lift every rule. */
@@ -111,10 +124,16 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
         return res.end();
       }
       const list = Array.isArray(parsed) ? parsed : [parsed];
+      // Counted now, as they arrive: what the courier asked is on record before the node has said anything.
+      const arrived: Counted[] = list.map((r) => ({ method: r.method, requestBytes: Buffer.byteLength(raw), answerBytes: 0, how: 'arrived' as const }));
+      counted.push(...arrived);
       Promise.all(list.map((r) => answerOne(r, JSON.stringify(r)))).then(
         (answers) => {
           const text = Array.isArray(parsed) ? `[${answers.map((a) => a.text).join(',')}]` : (answers[0]?.text ?? '');
-          list.forEach((r, i) => counted.push({ method: r.method, requestBytes: Buffer.byteLength(raw), answerBytes: Buffer.byteLength(text), how: answers[i]?.how ?? 'passed' }));
+          arrived.forEach((entry, i) => {
+            entry.answerBytes = Buffer.byteLength(text);
+            entry.how = answers[i]?.how ?? 'passed';
+          });
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(text);
         },
@@ -130,11 +149,14 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
   const address = server.address();
   const port = typeof address === 'object' && address !== null ? address.port : 0;
 
+  const count = (method?: string) => (method === undefined ? counted.length : counted.filter((c) => c.method === method).length);
+
   return {
     url: `http://127.0.0.1:${port}`,
     counted,
-    count(method) {
-      return method === undefined ? counted.length : counted.filter((c) => c.method === method).length;
+    count,
+    sends() {
+      return { eth_sendRawTransaction: count('eth_sendRawTransaction'), eth_sendTransaction: count('eth_sendTransaction') };
     },
     rule(method, rule) {
       if (rule === null) rules.delete(method);

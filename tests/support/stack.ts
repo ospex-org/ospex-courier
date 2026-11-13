@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,7 +11,10 @@ import { startTcpRelay, type TcpRelay } from './tcp';
 
 // The whole rig for a test file: the chain, the proxy in front of it, a
 // database with the schema applied, a relay in front of the database, and the
-// courier as its own process against the two.
+// courier as its own process against the two. At its close every stack prints
+// what the courier sent through the proxy, counted as the requests arrived,
+// and asserts it sent nothing: this build holds no key and sends no
+// transaction, and the suite shows it rather than the source alone.
 
 export interface Stack {
   rig: Rig;
@@ -78,10 +82,14 @@ export async function startStack(prefix: string): Promise<Stack> {
     publishedListFile,
     async close() {
       await courier.stop();
+      // Counted once the courier has stopped, so a send in flight at the close is in the count too.
+      const sends = proxy.sends();
+      console.log(`# the courier's sends through the proxy (${prefix}): eth_sendRawTransaction ${sends.eth_sendRawTransaction}, eth_sendTransaction ${sends.eth_sendTransaction}`);
       await dbRelay.close();
       await proxy.close();
       await rig.close();
       await db.end();
+      assert.deepEqual(sends, { eth_sendRawTransaction: 0, eth_sendTransaction: 0 }, 'the courier sent a transaction, or tried to: this build signs and sends nothing');
     },
   };
 }
