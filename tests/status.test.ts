@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { connect } from 'node:net';
 import { after, before, test } from 'node:test';
 import { openPool } from '../courier/records/store';
 import { get } from './support/courier';
@@ -99,6 +100,40 @@ test('with the database stopped, the status answers 503 and claims nothing; /rea
   }
   assert.equal(recovered.status, 200, JSON.stringify(recovered.body));
   assert.ok(typeof (recovered.body.run as { id: number }).id === 'number');
+});
+
+/** One request over a raw socket, as the bytes given; the whole answer, once the courier closes the connection. */
+function raw(port: number, request: string): Promise<string> {
+  return new Promise((resolve) => {
+    const socket = connect({ host: '127.0.0.1', port });
+    let answer = '';
+    socket.on('data', (c: Buffer) => {
+      answer += c.toString('utf8');
+    });
+    socket.on('connect', () => socket.write(request));
+    socket.on('close', () => resolve(answer));
+    socket.on('error', () => resolve(answer));
+    setTimeout(() => socket.destroy(), 5_000).unref();
+  });
+}
+
+test("a request whose target does not parse is refused by the courier, and no log line carries the target: a failure is logged under the route matched, or one fixed word, never the caller's text", async () => {
+  const address = '203.0.113.77';
+  const marker = 'PRIVATE_SENTINEL_f3a9';
+  const before = ((await get(stack.courier.url, '/v1/status')).body.refusedBeforeAdmission as { byCode: Record<string, number> }).byCode.INVALID_PARAM ?? 0;
+  for (const target of [`http://[${address}/${marker}`, `//[${address}/${marker}`]) {
+    const answer = await raw(stack.courier.port, `GET ${target} HTTP/1.1\r\nHost: courier\r\nConnection: close\r\n\r\n`);
+    assert.match(answer, /^HTTP\/1\.1 400 /, `the courier's own answer to ${target}: ${JSON.stringify(answer.slice(0, 120))}`);
+    assert.match(answer, /"code":"INVALID_PARAM"/);
+  }
+  // A refusal the courier does log, sent after the two: once its line is captured, every line of theirs has been too.
+  assert.equal((await get(stack.courier.url, '/v1/orders/abc')).body.code, 'INVALID_PARAM');
+  for (let i = 0; i < 50 && !stack.courier.lines.some((l) => l.includes('GET /v1/orders/{hash} INVALID_PARAM')); i++) await new Promise((r) => setTimeout(r, 20));
+  assert.ok(stack.courier.lines.some((l) => l.includes('GET /v1/orders/{hash} INVALID_PARAM')), 'the later refusal was logged');
+  const leaked = stack.courier.lines.filter((l) => l.includes(address) || l.includes(marker));
+  assert.deepEqual(leaked, [], 'no log line carries the address or the marker');
+  const after_ = ((await get(stack.courier.url, '/v1/status')).body.refusedBeforeAdmission as { byCode: Record<string, number> }).byCode.INVALID_PARAM ?? 0;
+  assert.equal(after_, before + 3, 'the two targets and the hash: each counted, none kept');
 });
 
 test('one network address has 600 requests a minute; the 601st is refused with a retry-after, counted, and another address is not touched', async () => {

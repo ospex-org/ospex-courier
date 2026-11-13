@@ -106,15 +106,31 @@ function readBody(req: IncomingMessage, bound: number): Promise<Body> {
 export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, res: ServerResponse) => void {
   const limiter = deps.limiter;
 
-  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? '/', 'http://courier');
+  /**
+   * One request. `matched` is the route the courier matched, or one fixed word
+   * when it matched none: what a failure is logged under, never the request's
+   * own target, which is the caller's text.
+   */
+  async function handle(req: IncomingMessage, res: ServerResponse, matched: { route: string }): Promise<void> {
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://courier');
+    } catch {
+      // A target that does not parse as a URL: refused before anything else, and nothing of it is kept or logged.
+      deps.counters.count('INVALID_PARAM');
+      return send(res, refusal(400, 'INVALID_PARAM', "The request's target could not be read as a URL."));
+    }
     const path = url.pathname;
     if (req.method === 'OPTIONS') {
+      matched.route = 'OPTIONS';
       res.writeHead(204, CORS);
       res.end();
       return;
     }
-    if (req.method === 'GET' && path === '/healthz') return send(res, { status: 200, body: { ok: true } });
+    if (req.method === 'GET' && path === '/healthz') {
+      matched.route = 'GET /healthz';
+      return send(res, { status: 200, body: { ok: true } });
+    }
 
     // The door's first two checks for every other route: https, then the caller's minute. A request that fails
     // either is answered at once, counted, and nothing else happens: no database and no chain.
@@ -129,11 +145,24 @@ export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, 
       return send(res, refusal(429, 'RATE_LIMIT_EXCEEDED', 'Too many requests from this address in the last minute.'), { 'retry-after': String(minute.retryAfterSeconds) });
     }
 
-    if (req.method === 'GET' && path === '/readyz') return send(res, await getReady(deps));
-    if (req.method === 'GET' && path === '/v1/status') return send(res, await getStatus(deps));
-    if (req.method === 'GET' && path === '/v1/runs') return send(res, await getRuns(deps, url.searchParams));
-    if (req.method === 'GET' && path === '/v1/book') return send(res, await getBook(deps, url.searchParams));
+    if (req.method === 'GET' && path === '/readyz') {
+      matched.route = 'GET /readyz';
+      return send(res, await getReady(deps));
+    }
+    if (req.method === 'GET' && path === '/v1/status') {
+      matched.route = 'GET /v1/status';
+      return send(res, await getStatus(deps));
+    }
+    if (req.method === 'GET' && path === '/v1/runs') {
+      matched.route = 'GET /v1/runs';
+      return send(res, await getRuns(deps, url.searchParams));
+    }
+    if (req.method === 'GET' && path === '/v1/book') {
+      matched.route = 'GET /v1/book';
+      return send(res, await getBook(deps, url.searchParams));
+    }
     if (req.method === 'POST' && path === '/v1/orders') {
+      matched.route = 'POST /v1/orders';
       const body = await readBody(req, BOUNDS.orderBodyBytes);
       if (!body.ok) {
         // A request that did not arrive whole: the connection is gone or going, nothing is answered and nothing counted.
@@ -153,18 +182,23 @@ export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, 
       return send(res, answer, typeof retry === 'number' ? { 'retry-after': String(retry) } : {});
     }
     const order = /^\/v1\/orders\/([^/]+)$/.exec(path);
-    if (req.method === 'GET' && order !== null) return send(res, await getOrder(deps, order[1] ?? ''));
+    if (req.method === 'GET' && order !== null) {
+      matched.route = 'GET /v1/orders/{hash}';
+      return send(res, await getOrder(deps, order[1] ?? ''));
+    }
     deps.counters.count('NOT_FOUND');
     return send(res, refusal(404, 'NOT_FOUND', 'Not found.'));
   }
 
   return (req, res) => {
-    handle(req, res).catch((err: unknown) => {
+    const matched = { route: 'unmatched' };
+    handle(req, res, matched).catch((err: unknown) => {
       const node = describeNodeFailure(err);
       const code = failureCode(err);
-      // Logged by class and code; nothing is recorded, and the answer does not say otherwise. The one failure the
-      // courier records as its own fault is the door's hash mismatch, which the door writes itself.
-      deps.log(`request ${req.method ?? ''} ${(req.url ?? '').split('?')[0] ?? ''} failed: ${node.kind}${code === undefined ? '' : ` (${code})`}`);
+      // Logged by the route matched and the failure's class and code, never by the request's target; nothing is
+      // recorded, and the answer does not say otherwise. The one failure the courier records as its own fault is
+      // the door's hash mismatch, which the door writes itself.
+      deps.log(`request ${matched.route} failed: ${node.kind}${code === undefined ? '' : ` (${code})`}`);
       if (!res.headersSent) send(res, refusal(500, 'INTERNAL_ERROR', 'The courier failed on this request.'));
       else res.destroy();
     });
