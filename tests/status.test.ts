@@ -4,14 +4,14 @@ import { after, before, test } from 'node:test';
 import { decodeFunctionData, decodeFunctionResult, encodeFunctionResult, type Hex } from 'viem';
 import { MULTICALL_ABI, MULTICALL_ADDRESS } from '../courier/chain/abi';
 import { openPool } from '../courier/records/store';
-import { get } from './support/courier';
+import { get, startCourier } from './support/courier';
 import { orderOn, postOrder } from './support/orders';
 import { startStack, type Stack } from './support/stack';
 
 // The status address and the conditions it can see in this build: the chain
 // unreachable, opened after a read fails twice and cleared by the next that
-// succeeds, each a numbered line; the database stopped, answered 503 and
-// nothing claimed; and the one caller's minute.
+// succeeds, whichever process makes it, each a numbered line; the database
+// stopped, answered 503 and nothing claimed; and the one caller's minute.
 
 let stack: Stack;
 
@@ -67,6 +67,120 @@ test('a chain read that fails twice opens chain-unreachable, with a line; the ne
     assert.ok(!text.includes(stack.proxy.url), 'no line carries the node\'s address');
   } finally {
     await pool.end();
+  }
+});
+
+// ──────────────── the condition across processes: the next read that succeeds clears it, whichever process makes it ────────────────
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const conditionsOf = async (url: string) => (await get(url, '/v1/status')).body.conditions as Array<{ key: string; openedLine: number }>;
+const runOf = async (url: string) => ((await get(url, '/v1/status')).body.run as { id: number }).id;
+const bookRead = (url: string) => get(url, `/v1/book?gameId=${stack.rig.gameId}`);
+
+/** The lines of the condition's openings and clearings as the records hold them, in order, each with the run that wrote it. */
+async function conditionLines(): Promise<Array<{ kind: string; run: number }>> {
+  const pool = openPool(stack.databaseUrl, null);
+  try {
+    const { rows } = await pool.query<{ kind: string; run: string }>("SELECT kind, run::text AS run FROM events WHERE kind IN ('condition opened', 'condition cleared') AND reason = 'chain-unreachable' ORDER BY number");
+    return rows.map((r) => ({ kind: r.kind, run: Number(r.run) }));
+  } finally {
+    await pool.end();
+  }
+}
+
+/** Opens the condition on one process: the node refuses its headers, one read of the book on that process fails twice, the node answers again. */
+async function openOn(url: string): Promise<void> {
+  stack.proxy.rule('eth_getBlockByNumber', { kind: 'refuse', code: -32000, message: 'held for the test' });
+  try {
+    const refused = await bookRead(url);
+    assert.equal(refused.status, 503, JSON.stringify(refused.body));
+    assert.equal(refused.body.code, 'CHAIN_UNREACHABLE');
+  } finally {
+    stack.proxy.rule('eth_getBlockByNumber', null);
+  }
+}
+
+test('two processes: a condition one of them opens is cleared by the next read that succeeds, on the other; both then list no condition, and the opener\'s own next read writes nothing more', async () => {
+  const a = stack.courier.url;
+  const second = await startCourier(stack.env);
+  try {
+    const b = second.url;
+    assert.deepEqual(await conditionsOf(b), [], 'the second process starts with no condition open');
+    const before = await conditionLines();
+    await openOn(a);
+    const openedOnA = await conditionsOf(a);
+    assert.equal(openedOnA.length, 1, JSON.stringify(openedOnA));
+    assert.equal(openedOnA[0]?.key, 'chain-unreachable');
+    assert.deepEqual(await conditionsOf(b), openedOnA, 'both processes list the one condition: the records are one');
+
+    // The other process's next read that succeeds clears it.
+    const served = await bookRead(b);
+    assert.equal(served.status, 200, JSON.stringify(served.body));
+    assert.deepEqual(await conditionsOf(a), [], 'the process that opened it lists it no more');
+    assert.deepEqual(await conditionsOf(b), [], 'the process that cleared it lists it no more');
+    const lines = await conditionLines();
+    assert.deepEqual(lines.slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared'], 'one opening, one clearing');
+    assert.equal(lines[lines.length - 2]?.run, await runOf(a), 'the opening is the run of the process whose read failed');
+    assert.equal(lines[lines.length - 1]?.run, await runOf(b), 'the clearing is the run of the process whose read succeeded, not the one that opened it');
+
+    // The opener's own next read that succeeds finds it cleared: no second clearing line.
+    assert.equal((await bookRead(a)).status, 200);
+    assert.deepEqual(await conditionsOf(a), []);
+    assert.equal((await conditionLines()).length, lines.length, 'nothing more was written');
+  } finally {
+    await second.stop();
+  }
+});
+
+test('two processes read successfully at once while the condition stands open: one clearing line, not two, in each of five rounds', async () => {
+  const a = stack.courier.url;
+  const second = await startCourier(stack.env);
+  try {
+    const b = second.url;
+    for (let round = 1; round <= 5; round++) {
+      const before = await conditionLines();
+      await openOn(round % 2 === 1 ? a : b);
+      // Both reads held at their first request of the chain until both have arrived there, then released together,
+      // so the two settle as near to at once as the test can make them.
+      const held = stack.proxy.hold('eth_getBlockByNumber');
+      const arrived = stack.proxy.count('eth_getBlockByNumber');
+      const reads = Promise.all([bookRead(a), bookRead(b)]);
+      for (let i = 0; i < 300 && stack.proxy.count('eth_getBlockByNumber') < arrived + 2; i++) await sleep(10);
+      assert.equal(stack.proxy.count('eth_getBlockByNumber'), arrived + 2, `round ${round}: both processes are at the chain`);
+      held.release();
+      const [onA, onB] = await reads;
+      assert.equal(onA.status, 200, JSON.stringify(onA.body));
+      assert.equal(onB.status, 200, JSON.stringify(onB.body));
+      assert.deepEqual(await conditionsOf(a), [], `round ${round}`);
+      assert.deepEqual(await conditionsOf(b), [], `round ${round}`);
+      const after = await conditionLines();
+      assert.deepEqual(after.slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared'], `round ${round}: one opening, one clearing, whichever process wrote it`);
+    }
+  } finally {
+    await second.stop();
+  }
+});
+
+test("a deploy's overlap: a process that started while the condition was closed clears the one an older process opened and then stopped on", async () => {
+  const older = await startCourier(stack.env);
+  const newer = await startCourier(stack.env);
+  try {
+    assert.deepEqual(await conditionsOf(newer.url), [], 'the newer process starts while the condition is closed');
+    const before = await conditionLines();
+    await openOn(older.url);
+    assert.equal((await conditionsOf(newer.url)).length, 1, 'the newer process lists what the older opened');
+    await older.stop();
+    // The newer process's next read that succeeds clears it: no restart, and no process that knew it open is left.
+    const served = await bookRead(newer.url);
+    assert.equal(served.status, 200, JSON.stringify(served.body));
+    assert.deepEqual(await conditionsOf(newer.url), []);
+    assert.deepEqual(await conditionsOf(stack.courier.url), [], 'a third process, which read nothing meanwhile, lists none either');
+    const after = await conditionLines();
+    assert.deepEqual(after.slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared']);
+    assert.equal(after[after.length - 1]?.run, await runOf(newer.url), 'the clearing is the newer process\'s');
+  } finally {
+    await newer.stop();
+    await older.stop();
   }
 });
 

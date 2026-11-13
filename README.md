@@ -170,11 +170,15 @@ courier waits on; Node's own default is five minutes.
   against the chain.
 
 One standing condition is raised in this build: `chain-unreachable`, when a read of the chain fails and fails
-again when tried once more; it clears at the next read that succeeds. Each opening and clearing is a numbered line
-in the records. The bookkeeping is written by the request once it holds no connection of the pool, so a request
-never asks the pool for a second connection while it holds one; and the process remembers whether it opened the
-condition (or found it open when it started), so where nothing changed no statement is made. A process that neither
-opened it nor found it open at its start does not write its clearing: the courier runs as one web process.
+again when tried once more; it clears at the next read that succeeds, whichever process makes it. Each opening and
+clearing is a numbered line in the records, written in one transaction with the condition's row. The bookkeeping is
+done by the request once it holds no connection of the pool, so a request never asks the pool for a second
+connection while it holds one. A request that read no chain makes no statement for it. One whose read succeeded asks
+the records with one statement, a probe of the open conditions' index with no transaction and no lock, whether the
+condition stands open, unless the process already knows it does (it opened it, or found it open when it started);
+where it stands open, the clear runs under the condition's lock, so two processes that read successfully at once
+write one clearing line, and a process that started while the condition was closed clears one that another process
+opened after. One whose read failed twice opens the condition, unless the process knows it is open already.
 
 ## The database
 

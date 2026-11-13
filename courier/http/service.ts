@@ -110,13 +110,15 @@ export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, 
 
   /**
    * Sends an answer. First, what the chain reads learned of the
-   * chain-unreachable condition is written (the request holds no connection
+   * chain-unreachable condition is settled (the request holds no connection
    * of the pool by now, so the bookkeeping never waits on a connection the
-   * request holds, and where nothing changed it is no statement); then the
-   * answer, with its retry time where it names one.
+   * request holds; a request that read no chain makes no statement, and one
+   * whose read succeeded asks with one statement whether the condition stands
+   * open, in whichever process it was opened, and clears it where it does);
+   * then the answer, with its retry time where it names one.
    */
   async function send(res: ServerResponse, answer: HttpAnswer, extra: Record<string, string> = {}): Promise<void> {
-    await deps.chain.settle().catch((err: unknown) => deps.log(`condition: the chain-unreachable bookkeeping could not be written${failureCode(err) === undefined ? '' : ` (${failureCode(err)})`}`));
+    await deps.chain.settle().catch((err: unknown) => deps.log(`condition: the chain-unreachable bookkeeping could not be read or written${failureCode(err) === undefined ? '' : ` (${failureCode(err)})`}`));
     write(res, answer, extra);
   }
 

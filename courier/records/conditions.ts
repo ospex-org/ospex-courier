@@ -26,6 +26,8 @@ export interface Conditions {
   open(key: ConditionKey, facts: Record<string, unknown>, run: number): Promise<boolean>;
   /** Clears the open condition of the key, if any; returns whether this call cleared one. */
   clear(key: ConditionKey, facts: Record<string, unknown>, run: number): Promise<boolean>;
+  /** Whether a condition of the key stands open in the records: one statement, a probe of the open conditions' index, no transaction and no lock. */
+  standsOpen(key: ConditionKey): Promise<boolean>;
   /** The conditions open now, oldest first. */
   open_(): Promise<Condition[]>;
 }
@@ -83,6 +85,10 @@ export function createConditions(pool: pg.Pool): Conditions {
         await client.query('UPDATE conditions SET cleared_at = now(), cleared_line = $2 WHERE id = $1', [rows[0]?.id, line]);
         return true;
       });
+    },
+    async standsOpen(key) {
+      const { rowCount } = await pool.query('SELECT 1 FROM conditions WHERE key = $1 AND cleared_at IS NULL', [key]);
+      return (rowCount ?? 0) > 0;
     },
     async open_() {
       const { rows } = await pool.query(`SELECT ${COLUMNS} FROM conditions WHERE cleared_at IS NULL ORDER BY opened_at, id`);

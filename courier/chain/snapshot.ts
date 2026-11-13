@@ -9,12 +9,17 @@ import { describeNodeFailure, headerByTag, multicallAt, type Header, type JsonRp
 // code as its fact, and the next read that succeeds clears it.
 //
 // The condition's bookkeeping is kept apart from the reads. A read notes what
-// it learned (the chain unreachable, or reachable again while the condition
-// stood open) in memory; the request writes it afterwards, with `settle`,
+// it learned (the chain unreachable after two failures, or a read that
+// succeeded) in memory; the request acts on it afterwards, with `settle`,
 // once it holds no connection of the pool. So a request never asks the pool
-// for a second connection while it holds one, and where the condition does
-// not change no statement is made at all: this process knows whether it
-// opened the condition, or found it open when it started.
+// for a second connection while it holds one. The clearing is the next read
+// that succeeds, whichever process makes it: another process may have opened
+// the condition while this one ran, and nothing this process remembers can
+// say so. So a read that succeeds asks the records, with one statement and
+// no transaction, whether the condition stands open, unless this process
+// already knows it does (it opened it, or found it open when it started);
+// where it stands open, the clear runs under the condition's lock, so two
+// processes that read successfully at once write one clearing line.
 
 export class ChainUnreachable extends Error {
   constructor(readonly failure: { kind: string; code: number | string | null; method: string | null }) {
@@ -44,11 +49,15 @@ export interface ChainReader {
   /** The last latest-block header read, and when. Null before the first read. */
   last(): LastRead | null;
   /**
-   * Writes what the reads learned about the chain-unreachable condition since
+   * Acts on what the reads learned about the chain-unreachable condition since
    * the last settle, if anything: its opening after a read failed twice, its
-   * clearing after a read succeeded while it stood open. A request calls it
-   * once it holds no connection of the pool. At most one statement, and none
-   * while nothing changed. A write that fails is kept for the next settle.
+   * clearing after a read succeeded while it stood open, in whichever process.
+   * A request calls it once it holds no connection of the pool. Nothing where
+   * no chain was read; after a read that succeeded, one statement asking
+   * whether the condition stands open (none where this process knows it does),
+   * then the clearing's transaction only where it does; after a read that
+   * failed twice, the opening's transaction, unless this process knows it is
+   * open already. A statement that fails is kept for the next settle.
    */
   settle(): Promise<void>;
 }
@@ -67,12 +76,15 @@ export function createChainReader(deps: ChainReaderDeps): ChainReader {
   const now = deps.now ?? (() => new Date());
   const log = deps.log ?? (() => undefined);
   let last: LastRead | null = null;
-  /** Whether this process believes the condition stands open: it opened it, or found it open at its start. */
+  /**
+   * Whether this process knows the condition stands open: it opened it, or found it open at its start. True is
+   * knowledge, and the clear needs no lookup first; false is not, since another process may have opened it.
+   */
   let open = deps.openAtStart;
-  /** The newest observation not yet written: the chain unreachable, or reachable again while the condition stood open. */
+  /** The newest observation not yet settled: the chain unreachable, or a read that succeeded. */
   let observed: { unreachable: boolean; facts: Record<string, unknown> } | null = null;
 
-  /** Once, and once more; a second failure is noted as the condition's opening. A success while it stands open is noted as its clearing. */
+  /** Once, and once more; a second failure is noted as the condition's opening. A success is noted, and settles as its clearing where it stands open. */
   async function attempt<T>(once: () => Promise<T>, fact: (value: T) => Record<string, unknown>): Promise<T> {
     let value: T;
     try {
@@ -86,7 +98,7 @@ export function createChainReader(deps: ChainReaderDeps): ChainReader {
         throw new ChainUnreachable(failure);
       }
     }
-    if (open || observed?.unreachable === true) observed = { unreachable: false, facts: fact(value) };
+    observed = { unreachable: false, facts: fact(value) };
     return value;
   }
 
@@ -112,17 +124,22 @@ export function createChainReader(deps: ChainReaderDeps): ChainReader {
       if (o === null) return;
       observed = null;
       try {
-        if (o.unreachable && !open) {
-          const opened = await deps.conditions.open('chain-unreachable', o.facts, deps.run);
-          open = true;
-          if (opened) log(`condition opened: chain-unreachable (${String(o.facts.kind)}${o.facts.code === null || o.facts.code === undefined ? '' : ` ${String(o.facts.code)}`})`);
-        } else if (!o.unreachable && open) {
+        if (o.unreachable) {
+          if (!open) {
+            const opened = await deps.conditions.open('chain-unreachable', o.facts, deps.run);
+            open = true;
+            if (opened) log(`condition opened: chain-unreachable (${String(o.facts.kind)}${o.facts.code === null || o.facts.code === undefined ? '' : ` ${String(o.facts.code)}`})`);
+          }
+        } else if (open || (await deps.conditions.standsOpen('chain-unreachable'))) {
+          // A read succeeded while the condition stands open, opened by this process or by another: the next read
+          // that succeeds clears it, whichever process makes it. The clear is under the condition's lock, so of two
+          // processes clearing at once one writes the line and the other finds it cleared.
           const cleared = await deps.conditions.clear('chain-unreachable', o.facts, deps.run);
           open = false;
           if (cleared) log('condition cleared: chain-unreachable');
         }
       } catch (err) {
-        // The records could not be written now: the observation is kept for the next settle.
+        // The records could not be read or written now: the observation is kept for the next settle.
         if (observed === null) observed = o;
         throw err;
       }

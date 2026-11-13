@@ -114,8 +114,9 @@ export async function startService(env: Record<string, string | undefined>, opti
 
   const counters = createCounters(now);
   const limiter = createAddressLimiter(BOUNDS.requestsPerAddressPerMinute);
-  // Whether the chain-unreachable condition stands open from before this start: read once, so the first read that
-  // succeeds clears it and no later read asks the records whether it changed.
+  // Whether the chain-unreachable condition stands open from before this start, read once: this process then clears
+  // it at its first read that succeeds without asking the records first. Every later read that succeeds asks them,
+  // with one statement, since another process may open the condition while this one runs.
   const openAtStart = (await store.conditions.open_()).some((c) => c.key === 'chain-unreachable');
   const chain = createChainReader({ rpc, conditions: store.conditions, run: run.id, openAtStart, now, log });
   const handler = createRequestHandler({ store, chain, set, node, run, counters, limiter, settings: { lowPol: config.lowPol }, published, notYetBuilt: NOT_YET_BUILT, log });
