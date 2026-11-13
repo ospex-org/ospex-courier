@@ -109,18 +109,13 @@ export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, 
   const limiter = deps.limiter;
 
   /**
-   * Sends an answer. First, what the chain reads learned of the
-   * chain-unreachable condition is settled (the request holds no connection
-   * of the pool by now, so the bookkeeping never waits on a connection the
-   * request holds; a request that read no chain makes no statement, and one
-   * whose read succeeded asks with one statement whether the condition stands
-   * open, in whichever process it was opened, and clears it where it does);
-   * then the answer, with its retry time where it names one.
+   * Sends an answer, with its retry time where it names one. Nothing of the
+   * chain-unreachable condition is settled here or anywhere in the service:
+   * each read of the chain applies its own outcome to the records before it
+   * returns (chain/snapshot.ts), so a request leaves nothing behind on any
+   * path out, the catch-all included.
    */
-  async function send(res: ServerResponse, answer: HttpAnswer, extra: Record<string, string> = {}): Promise<void> {
-    await deps.chain.settle().catch((err: unknown) => deps.log(`condition: the chain-unreachable bookkeeping could not be read or written${failureCode(err) === undefined ? '' : ` (${failureCode(err)})`}`));
-    write(res, answer, extra);
-  }
+  const send = write;
 
   /**
    * One request. `matched` is the route the courier matched, or one fixed word

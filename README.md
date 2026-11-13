@@ -171,14 +171,21 @@ courier waits on; Node's own default is five minutes.
 
 One standing condition is raised in this build: `chain-unreachable`, when a read of the chain fails and fails
 again when tried once more; it clears at the next read that succeeds, whichever process makes it. Each opening and
-clearing is a numbered line in the records, written in one transaction with the condition's row. The bookkeeping is
-done by the request once it holds no connection of the pool, so a request never asks the pool for a second
-connection while it holds one. A request that read no chain makes no statement for it. One whose read succeeded asks
-the records with one statement, a probe of the open conditions' index with no transaction and no lock, whether the
-condition stands open, unless the process already knows it does (it opened it, or found it open when it started);
-where it stands open, the clear runs under the condition's lock, so two processes that read successfully at once
-write one clearing line, and a process that started while the condition was closed clears one that another process
-opened after. One whose read failed twice opens the condition, unless the process knows it is open already.
+clearing is a numbered line in the records, written in one transaction with the condition's row. The records decide
+every opening and clearing, and nothing a process remembers does: each read of the chain applies its outcome by the
+statement that follows the node's answer, before the request goes on, so no outcome is left for a later request and
+no path out of a request, the catch-all included, has anything to settle. A read that succeeded makes one statement,
+which clears the condition where one stands open from before that read and writes nothing where none does; a read
+that failed twice makes one statement where the condition is open (no line, the failure remembered on the row where
+newest) and a transaction under the condition's lock where none is (the opening, unless a clearing newer than the
+failure is on record). "Before" and "after" are decided on the database's one clock: an outcome is placed at the
+database's now() less the time it waited on its process for its statement, and the rows' instants are placed the
+same way, so two processes' clocks are never compared, and a success older than an opening clears nothing of it,
+however long its statement waited. Two processes that read successfully at once write one clearing line (the row
+is locked for the statement); a process that started while the condition was closed clears one that another process
+opened after; a success that a newer failure overtook before its statement ran is recorded as the recovery and the
+outage that went on, a clearing and a new opening, in one transaction. The request holds no connection of the
+reads' pool at any of its reads, so the statement never waits on a connection the request holds.
 
 ## The database
 
