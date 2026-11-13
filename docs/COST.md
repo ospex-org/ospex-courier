@@ -74,11 +74,13 @@ at 50 dead versions plus a fifth of its rows: at 500,000 rows that is 100,000 de
 is about 2,500 buffer accesses ahead of a scan that costs 166 clean, fifteen times over, and the number grows with
 the table. A scale factor of 0 removes the growth. The threshold of 2,000 is a chosen batch: the bound of rows one
 request is returned, and so the most one request marks, so that the table is due after one request's worth of
-marking whatever its size; the dead ahead of a scan are then a few thousand between vacuums, about 190 accesses
-over the clean 166, as the third book's before-vacuum row shows. It is not a measured optimum (no other threshold
-was measured against it) and it is not a ceiling on the dead versions: the threshold is when the table becomes
-due, autovacuum's workers can be busy elsewhere, and a version an older transaction can still see is not removed
-until it cannot.
+marking whatever its size. What was measured of that state is the third book's before-vacuum row: 2,000 dead
+versions, planted by one request's marking, standing ahead of the next scan, which then costs 353 accesses against
+166 clean, about 190 more. How many dead versions gather between production's vacuums was not measured here; it is
+read from the live table (`n_dead_tup`, below) once the courier runs. The threshold is not a measured optimum (no
+other threshold was measured against it) and it is not a ceiling on the dead versions: the threshold is when the
+table becomes due, autovacuum's workers can be busy elsewhere, and a version an older transaction can still see is
+not removed until it cannot.
 
 `vacuum_index_cleanup = on` makes each vacuum of this table remove the index entries. A vacuum left to itself may
 skip the indexes when the pages holding dead items are under two per cent of the table's pages. The run above
@@ -132,10 +134,11 @@ orders table's.
 | a 40-leg Cross | one `crosses` row, confirmed, with its transaction, receipt and final block; 40 `legs` rows with the stakes expected and recorded; three lines (sent, pending, confirmed). The bet's own row and line are the order's figures above | about 970 for the Cross, 13,200 for the legs (330 a leg), 1,050 for the lines: about 15,200 |
 
 What the first row says about the schema's shape: a stop's message is kept once for every hash it stops, so a
-stop of 100 hashes keeps its message a hundred times over, about 100 KB a stop against about 1.2 KB an order.
-That is the frozen schema measured as it stands. Whether the stop build keeps the message once is that build's
-call; this figure is what it costs not to. At the bounds: an account's 32 stops ahead whose orders have not
-expired are about 1.1 MB; a stop of carried orders is bounded by the orders stopped, one row each, about 1,040
+stop of 100 hashes keeps its message a hundred times over, about 100 KB a stop against about 1.3 KB an order.
+That is the frozen schema measured as it stands, and these notes stop there. At the bounds: an account's 32 stops
+ahead whose orders have not expired are 32 rows (the bound is on stopped hashes, one row each, not on groups of
+sixteen), about 68 KB at this fixture's 2,140 bytes a row, before their lines; a stop of carried orders is bounded
+by the orders stopped, one row each, about 1,040
 bytes on top of each stopped order's 1,306; a 40-leg Cross adds about 15 KB to its bet's 1.3 KB, which at the
 courier's budget refilling all day with every admitted request a 40-leg bet would be about 1.3 GB a day, the
 largest shape at the budget's rate and not a forecast.
