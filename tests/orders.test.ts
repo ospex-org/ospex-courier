@@ -732,6 +732,34 @@ test("each read of the chain is tried once more, so a post at the cap makes at m
   assert.equal(stack.proxy.count() - again.all, 3);
 });
 
+test("the door's page is the sixteen with the newest expiry, by the numbers: a planted set where the page's order decides the answer, record numbers 9,990 to 10,015 at one expiry, the upper sixteen under the floor and the lower ten live; the post marks the sixteen and is admitted", async () => {
+  const who = rig.account(18);
+  await rig.fund(who);
+  const T = await rig.time();
+  const market = { scorer: rig.addresses.total, lineTicks: 2_605 };
+  // The account's floor on this market at 500: a planted nonce under it is ended on chain, one above it is live.
+  await raiseFloor(rig, who, orderOn(rig, who, { expiry: T + 3_600n, ...market }), 500n);
+  const key = keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'address' }, { type: 'int32' }], [rig.gameId, market.scorer, market.lineTicks]));
+  await pool.query(
+    `INSERT INTO orders (hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, market_key, side, received_block, received_hash, received_time, record_number)
+     SELECT '0x' || lpad(to_hex(800000000 + i), 64, '0'), 'rest', $1, $2, $3, $4, 0, 200, 1000000, CASE WHEN i >= 10000 THEN i - 9999 ELSE 600 + i - 9990 END, $5, 0, '0x' || repeat('ab', 65), $6, 0, 1, '0x' || repeat('cd', 32), 1, i
+     FROM generate_series(9990, 10015) AS i`,
+    [who.address.toLowerCase(), rig.gameId.toString(), market.scorer.toLowerCase(), market.lineTicks, (T + 3_600n).toString(), key.toLowerCase()],
+  );
+  // As text, "9999" sorts above "10015": a page ordered by the text holds the ten live and six of the sixteen, marks
+  // six, recounts twenty, and refuses. By the numbers it holds the sixteen under the floor, marks them all, recounts
+  // ten, and admits.
+  const posted = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...market }));
+  assert.equal(posted.status, 201, JSON.stringify(posted.body));
+  const { rows } = await pool.query<{ record_number: string; ended: string | null }>(
+    `SELECT record_number::text AS record_number, ended FROM orders WHERE account = $1 AND record_number BETWEEN 9990 AND 10015 ORDER BY record_number`,
+    [who.address.toLowerCase()],
+  );
+  assert.deepEqual(rows.filter((r) => r.ended === 'cancelled').map((r) => Number(r.record_number)), Array.from({ length: 16 }, (_, i) => 10_000 + i), 'the sixteen under the floor are marked');
+  assert.deepEqual(rows.filter((r) => r.ended === null).map((r) => Number(r.record_number)), Array.from({ length: 10 }, (_, i) => 9_990 + i), 'the ten live stand');
+  assert.equal(await unendedRows(who), 11, 'the ten and the one admitted');
+});
+
 test('a stop on record for the hash is honoured at the door: STOPPED, as a line (the stop build writes the record; the door reads it)', async () => {
   const maker = rig.accounts.maker;
   const T = await rig.time();

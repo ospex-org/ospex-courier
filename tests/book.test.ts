@@ -470,6 +470,27 @@ test("a page's cursor compares the numbers, not their text: quotes at one tick w
   assert.deepEqual(seen, expected, 'every quote once, in the order of the numbers');
 });
 
+test("the scan at its bound serves the smallest record number: 2,002 quotes at one tick, record numbers 99,999 and 100,000 to 102,000, read in pages of 50, are each served once in the numbers' order, 99,999 first", async () => {
+  const total = { scorer: rig.addresses.total, lineTicks: 2_705 };
+  const T = await rig.time();
+  const key = keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'address' }, { type: 'int32' }], [rig.gameId, total.scorer, total.lineTicks]));
+  const records = [99_999, ...Array.from({ length: 2_001 }, (_, i) => 100_000 + i)];
+  await plantNumbered(records, { marketKey: key, gameId: rig.gameId, oddsTick: 300, expiry: T + 3_600n, account: rig.accounts.maker.address, ...total });
+  // As text, "100000" sorts before "99999": a window of 2,000 ordered by the text is 100,000 to 101,999, and 99,999
+  // is in no window, since a later page starts after the cursor. By the numbers the window is 99,999 to 101,998.
+  const seen: number[] = [];
+  let after = '';
+  for (let pages = 0; ; pages++) {
+    assert.ok(pages < 60, 'the walk ends');
+    const page = (await market(url(), total.scorer, total.lineTicks, `&side=A&limit=50${after}`)).sides.A as Page;
+    seen.push(...page.quotes.map((q) => q.recordNumber));
+    if (page.next === null) break;
+    after = `&after=${page.next.oddsTick}:${page.next.recordNumber}`;
+  }
+  assert.equal(seen[0], 99_999, 'the smallest number is served first');
+  assert.deepEqual(seen, records, "every quote once, in the numbers' order");
+});
+
 test('the markets of a game are paged, 100 a page in the order of the market contract and the line, and the cursor reaches the rest: 101 markets with a live quote each, lines from −2,500 across zero to 2,500, are listed once each, over two pages and over pages of seven', async () => {
   const game = await rig.createGame();
   const spread = rig.addresses.spread;
