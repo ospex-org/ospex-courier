@@ -288,6 +288,16 @@ test('remaining is the stake less what the chain shows filled; payable is what t
   assert.equal(page.quotes.length, 2, 'registered again, the dropped account\'s quote is listed again');
 });
 
+/** Plants one quote a record number given, straight into the records: rows whose numbers the test chooses. */
+async function plantNumbered(records: number[], fields: { marketKey: Hex; gameId: bigint; scorer: Address; lineTicks: number; oddsTick: number; expiry: bigint; account: Address }): Promise<void> {
+  await pool.query(
+    `INSERT INTO orders (hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, market_key, side, received_block, received_hash, received_time, record_number)
+     SELECT '0x' || lpad(to_hex(i), 64, '0'), 'rest', $1, $2, $3, $4, 0, $5, 1000000, i, $6, 0, '0x' || repeat('ab', 65), $7, 0, 1, '0x' || repeat('cd', 32), 1, i
+     FROM unnest($8::bigint[]) AS i`,
+    [fields.account.toLowerCase(), fields.gameId.toString(), fields.scorer.toLowerCase(), fields.lineTicks, fields.oddsTick, fields.expiry.toString(), fields.marketKey.toLowerCase(), records],
+  );
+}
+
 /** Plants quotes straight into the records: a backlog the door never saw, as the fixture of the cost contract plants them. */
 async function plant(n: number, fields: { marketKey: Hex; gameId: bigint; scorer: Address; lineTicks: number; oddsTick: number; expiry: bigint; account: Address }): Promise<void> {
   await pool.query(
@@ -350,10 +360,38 @@ test('a backlog of 2,500 expired quotes not yet marked, at better prices than on
   assert.deepEqual(m?.live.A, { live: 0, boundReached: true, marked: 2_000 });
 });
 
-test('the markets of a game are paged, 100 a page in the order of the market contract and the line, and the cursor reaches the rest: 101 markets with a live quote each are listed once each, over two pages and over pages of seven', async () => {
+test("a page's cursor compares the numbers, not their text: quotes at one tick whose record numbers cross from seven digits to eight, and ticks that cross from three digits to four, are each served once, in the numbers' order, over pages of three", async () => {
+  const total = { scorer: rig.addresses.total, lineTicks: 2_405 };
+  const T = await rig.time();
+  const key = keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'address' }, { type: 'int32' }], [rig.gameId, total.scorer, total.lineTicks]));
+  // Four quotes at tick 999 with record numbers 9,999,998 to 10,000,001, four at tick 1,000 with 10,000,002 to
+  // 10,000,005: as text, "10000000" sorts before "9999998" and "1000" before "999"; as numbers, neither does.
+  const at999 = [9_999_998, 9_999_999, 10_000_000, 10_000_001];
+  const at1000 = [10_000_002, 10_000_003, 10_000_004, 10_000_005];
+  await plantNumbered(at999, { marketKey: key, gameId: rig.gameId, oddsTick: 999, expiry: T + 3_600n, account: rig.accounts.maker.address, ...total });
+  await plantNumbered(at1000, { marketKey: key, gameId: rig.gameId, oddsTick: 1_000, expiry: T + 3_600n, account: rig.accounts.maker.address, ...total });
+  const expected = [...at999, ...at1000];
+  const seen: number[] = [];
+  let after = '';
+  for (let pages = 0; ; pages++) {
+    assert.ok(pages < 10, 'the walk ends');
+    const page = (await market(url(), total.scorer, total.lineTicks, `&side=A&limit=3${after}`)).sides.A as Page;
+    assert.ok(page.quotes.length <= 3);
+    seen.push(...page.quotes.map((q) => q.recordNumber));
+    if (page.next === null) {
+      assert.equal(page.endedBy, 'book');
+      break;
+    }
+    after = `&after=${page.next.oddsTick}:${page.next.recordNumber}`;
+  }
+  assert.deepEqual(seen, expected, 'every quote once, in the order of the numbers');
+});
+
+test('the markets of a game are paged, 100 a page in the order of the market contract and the line, and the cursor reaches the rest: 101 markets with a live quote each, lines from −2,500 across zero to 2,500, are listed once each, over two pages and over pages of seven', async () => {
   const game = await rig.createGame();
   const spread = rig.addresses.spread;
-  const lines = Array.from({ length: 101 }, (_, i) => -5_000 + i * 50);
+  // Lines across a change of sign and of width: as text "-50" sorts before "-500" and "100" before "50".
+  const lines = Array.from({ length: 101 }, (_, i) => -2_500 + i * 50);
   const T = await rig.time();
   for (const lineTicks of lines) {
     const key = keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'address' }, { type: 'int32' }], [game, spread, lineTicks]));

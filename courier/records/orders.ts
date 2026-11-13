@@ -134,7 +134,9 @@ function toRow(r: Record<string, unknown>): OrderRow {
  * the final block's time plus one (it can fill in no block after F), and
  * passes to the caller those whose expiry is above the block's time plus one.
  * $1 market key, $2 side, $3 $4 the cursor, $5 the bound, $6 F + 1, $7 T + 1,
- * $8 the page.
+ * $8 the page. The order and the cursor are both on the table's columns as
+ * numbers (`odds_tick`, `record_number`); the text casts are inside the JSON
+ * built last, where no ORDER BY can take them for the columns.
  */
 export const SCAN_SQL = `WITH scanned AS (
   SELECT hash, account, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, record_number
@@ -281,9 +283,12 @@ export function createOrders(pool: pg.Pool): Orders {
     },
     async quotesOfAccount(on, account, marketKey, side, blockTime) {
       const { rows } = await on.query<{ hash: Hex; expiry: string; risk_amount: string; nonce: string; record_number: string }>(
-        `SELECT hash, expiry::text AS expiry, risk_amount::text AS risk_amount, nonce::text AS nonce, record_number::text AS record_number FROM orders
-         WHERE role = 'rest' AND ended IS NULL AND account = $1 AND market_key = $2 AND side = $3 AND expiry > $5::numeric
-         ORDER BY expiry DESC, record_number DESC LIMIT $4`,
+        // Ordered by the table's own columns, named with the table: a bare name in ORDER BY that an output column
+        // shares is the output column, and here the outputs are the numbers cast to text, whose order is not the
+        // numbers' once they differ in digits.
+        `SELECT o.hash, o.expiry::text AS expiry, o.risk_amount::text AS risk_amount, o.nonce::text AS nonce, o.record_number::text AS record_number FROM orders o
+         WHERE o.role = 'rest' AND o.ended IS NULL AND o.account = $1 AND o.market_key = $2 AND o.side = $3 AND o.expiry > $5::numeric
+         ORDER BY o.expiry DESC, o.record_number DESC LIMIT $4`,
         [account.toLowerCase(), marketKey.toLowerCase(), side, BOUNDS.liveQuotesPerAccountSideMarket + 1, (blockTime + 1n).toString()],
       );
       return rows.map((r) => ({ hash: r.hash, expiry: BigInt(r.expiry), riskAmount: BigInt(r.risk_amount), nonce: BigInt(r.nonce), recordNumber: Number(r.record_number) }));
