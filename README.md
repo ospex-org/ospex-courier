@@ -166,12 +166,20 @@ courier waits on; Node's own default is five minutes.
 
 One standing condition is raised in this build: `chain-unreachable`, when a read of the chain fails and fails
 again when tried once more; it clears at the next read that succeeds. Each opening and clearing is a numbered line
-in the records.
+in the records. The bookkeeping is written by the request once it holds no connection of the pool, so a request
+never asks the pool for a second connection while it holds one; and the process remembers whether it opened the
+condition (or found it open when it started), so where nothing changed no statement is made. A process that neither
+opened it nor found it open at its start does not write its clearing: the courier runs as one web process.
 
 ## The database
 
 The courier's own Postgres, `db/schema.sql`: ten tables (orders, stops, lanes, crosses, legs, events, conditions,
-accounts, runs, games) and the indexes the book and the door read along. The schema's comments say what each bound
+accounts, runs, games) and the indexes the book and the door read along. The process holds two pools on it: four
+connections for the reads and the records, and one for the door, on which a post's admission transaction (the
+budgets' rows locked, through the record's commit, a read of the chain inside it) runs one post at a time in the
+process; the posts waiting hold nothing, so a reader and another account are answered while a burst of posts runs,
+and the courier's row serializes the posts across processes anyway. A request that waits ten seconds for a
+connection of either pool and gets none is answered `503 DATABASE_UNREADABLE` with a retry time of one second. The schema's comments say what each bound
 counts: a scan along the book's index is bounded by the rows it is returned, which is what `LIMIT` counts, and not
 by the index entries it visits, the rows it fetches or the pages it reads to return them. That work is measured
 (`docs/COST.md`, `tests/cost.test.ts`), and the orders table's maintenance is chosen with the measurement in view:

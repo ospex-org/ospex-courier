@@ -2,7 +2,7 @@ import { getAddress, isAddress, type Address, type Hex } from 'viem';
 import { readGameBook, readMarketBook } from '../book/read';
 import { ChainUnreachable } from '../chain/snapshot';
 import { orderRecord, postOrder } from '../orders/door';
-import { failureCode } from '../records/store';
+import { failureCode, POOL_WAIT_EXHAUSTED, POOL_WAIT_MS } from '../records/store';
 import { DatabaseUnreadable, status, type StatusDeps } from '../status/status';
 import { BOUNDS } from './limits';
 
@@ -37,14 +37,33 @@ const DATABASE_UNREADABLE = refusal(503, 'DATABASE_UNREADABLE', 'The database co
 /**
  * The driver's connection failures that carry no code: a socket closed under
  * it ("Connection terminated unexpectedly"), its connection time-out, a client
- * no longer queryable. On one platform the same cut gives ECONNRESET with a
- * code, on another this sentence with none; both are the database's failure.
+ * no longer queryable, the pool's wait for a connection run out. On one
+ * platform the same cut gives ECONNRESET with a code, on another this sentence
+ * with none; both are the database's failure.
  */
-const CODELESS_DATABASE_FAILURES = /connection terminated|connection timeout|timeout expired|not queryable|connection ended|terminating connection|connection refused/i;
+const CODELESS_DATABASE_FAILURES = /connection terminated|connection timeout|timeout expired|timeout exceeded when trying to connect|not queryable|connection ended|terminating connection|connection refused/i;
 
 /** Whether a failure is the database's (a driver or server code, or the driver's codeless connection message), and not a fault of the courier's own. */
 const isDatabaseFailure = (err: unknown) =>
   !(err instanceof ChainUnreachable) && (failureCode(err) !== undefined || (err instanceof Error && CODELESS_DATABASE_FAILURES.test(err.message)));
+
+/** Whether the failure is the pool's wait for a connection run out: every connection held by other requests for the whole wait. */
+const isPoolWaitExhausted = (err: unknown) => err instanceof Error && POOL_WAIT_EXHAUSTED.test(err.message);
+
+/**
+ * The answer for a database that could not be read on a route, logged by the
+ * route and the failure's code, never with a value. A pool wait run out is
+ * said as that, with a retry time: the connections were all held for the
+ * whole wait, and one frees as soon as a request ends.
+ */
+function databaseUnreadable(deps: RouteDeps, route: string, err: unknown, sentence: string): HttpAnswer {
+  if (isPoolWaitExhausted(err)) {
+    deps.log(`database: no connection free within its wait of ${POOL_WAIT_MS / 1000} s (${route})`);
+    return { status: 503, body: { error: `${sentence} The courier waited ${POOL_WAIT_MS / 1000} seconds for a connection to it and none came free; try again shortly.`, code: 'DATABASE_UNREADABLE', retryAfterSeconds: 1 } };
+  }
+  deps.log(`database: could not be read (${route})${failureCode(err) === undefined ? '' : ` (${failureCode(err)})`}`);
+  return refusal(503, 'DATABASE_UNREADABLE', sentence);
+}
 
 /** A whole number from a query string, or null where it is not one. */
 function wholeNumber(text: string | null, max = 18): bigint | null {
@@ -87,8 +106,8 @@ export async function getRuns(deps: RouteDeps, query: URLSearchParams): Promise<
         limit: Number(limit),
       },
     };
-  } catch {
-    return refusal(503, 'DATABASE_UNREADABLE', 'The database could not be read.');
+  } catch (err) {
+    return databaseUnreadable(deps, 'GET /v1/runs', err, 'The database could not be read.');
   }
 }
 
@@ -120,7 +139,7 @@ export async function getBook(deps: RouteDeps, query: URLSearchParams): Promise<
       return { status: 200, body: { ...(await readGameBook(deps, gameId, after, Number(limit))) } };
     } catch (err) {
       if (err instanceof ChainUnreachable) return CHAIN_UNREACHABLE;
-      if (isDatabaseFailure(err)) return DATABASE_UNREADABLE;
+      if (isDatabaseFailure(err)) return databaseUnreadable(deps, route, err, DATABASE_UNREADABLE.body.error as string);
       throw err;
     }
   }
@@ -141,7 +160,7 @@ export async function getBook(deps: RouteDeps, query: URLSearchParams): Promise<
     return { status: 200, body: { ...(await readMarketBook(deps, { gameId, scorer: getAddress(scorer), lineTicks: Number(lineText), side: sideText, after, limit: Number(limit) })) } };
   } catch (err) {
     if (err instanceof ChainUnreachable) return CHAIN_UNREACHABLE;
-    if (isDatabaseFailure(err)) return DATABASE_UNREADABLE;
+    if (isDatabaseFailure(err)) return databaseUnreadable(deps, route, err, DATABASE_UNREADABLE.body.error as string);
     throw err;
   }
 }
@@ -151,7 +170,7 @@ export async function postOrders(deps: RouteDeps, body: unknown): Promise<HttpAn
   try {
     return await postOrder({ store: deps.store, chain: deps.chain, set: deps.set, run: deps.run, counters: deps.counters, published: deps.published, coinDecimals: deps.set.coinDecimals, log: deps.log }, body);
   } catch (err) {
-    if (isDatabaseFailure(err)) return refusal(503, 'DATABASE_UNREADABLE', 'The database could not be read; nothing was recorded for this order.');
+    if (isDatabaseFailure(err)) return databaseUnreadable(deps, 'POST /v1/orders', err, 'The database could not be read; nothing was recorded for this order.');
     throw err;
   }
 }
@@ -163,7 +182,7 @@ export async function getOrder(deps: RouteDeps, hash: string): Promise<HttpAnswe
     const row = await deps.store.orders.get(hash.toLowerCase() as Hex);
     if (row === null) return refusal(404, 'UNKNOWN_ORDER', 'The courier holds no order of this hash.');
     return { status: 200, body: orderRecord(row) };
-  } catch {
-    return refusal(503, 'DATABASE_UNREADABLE', 'The database could not be read.');
+  } catch (err) {
+    return databaseUnreadable(deps, 'GET /v1/orders/{hash}', err, 'The database could not be read.');
   }
 }

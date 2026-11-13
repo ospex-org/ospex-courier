@@ -55,7 +55,7 @@ export function pinnedAuthority(file?: string): string | null {
  * and how the app reaches its add-on. With no authority, a database on this
  * machine is reached plain, and one anywhere else is refused.
  */
-export function connectionSettings(databaseUrl: string, authority: string | null): pg.PoolConfig {
+export function connectionSettings(databaseUrl: string, authority: string | null, max = 4): pg.PoolConfig {
   let url: URL;
   try {
     url = new URL(databaseUrl);
@@ -75,18 +75,25 @@ export function connectionSettings(databaseUrl: string, authority: string | null
     password: decodeURIComponent(url.password),
     ...(database === '' ? {} : { database }),
     ssl: authority === null ? false : { ca: authority, rejectUnauthorized: true },
-    max: 4,
-    connectionTimeoutMillis: 10_000,
+    max,
+    connectionTimeoutMillis: POOL_WAIT_MS,
   };
 }
+
+/** How long a request waits for a connection of a pool before it is answered as the database being unavailable. */
+export const POOL_WAIT_MS = 10_000;
+
+/** The message pg gives when that wait runs out; it carries no code. */
+export const POOL_WAIT_EXHAUSTED = /timeout exceeded when trying to connect/i;
 
 /**
  * A pool on DATABASE_URL. The one function the release step and the web
  * process make their connection through. The authority is the pinned bundle
- * unless a caller (a test) passes its own.
+ * unless a caller (a test) passes its own. `max` is the pool's connections:
+ * four for the reads and the records, one for the door (below).
  */
-export function openPool(databaseUrl: string, authority: string | null = pinnedAuthority()): pg.Pool {
-  return new pg.Pool(connectionSettings(databaseUrl, authority));
+export function openPool(databaseUrl: string, authority: string | null = pinnedAuthority(), max = 4): pg.Pool {
+  return new pg.Pool(connectionSettings(databaseUrl, authority, max));
 }
 
 const SCHEMA = new URL('../../db/schema.sql', import.meta.url);
@@ -243,7 +250,18 @@ export interface TableFigures {
 }
 
 export interface Store {
+  /** The pool every read and record goes through: four connections. */
   pool: pg.Pool;
+  /**
+   * The door's own pool, one connection: the admission transaction of a post
+   * (the budgets' rows, locked, through the record's commit, a read of the chain
+   * inside it) runs on it, one post at a time in this process. Posts wait for
+   * it holding nothing, so they never hold the other pool's connections idle
+   * on the courier's row, and every other route is answered meanwhile; the
+   * courier's row serializes the posts across processes anyway. A post that
+   * waits the pool's time out is answered as the database being unavailable.
+   */
+  door: pg.Pool;
   runs: Runs;
   events: Events;
   conditions: Conditions;
@@ -262,12 +280,14 @@ export interface Store {
 
 const REPORT_KINDS = ['condition opened', 'condition cleared', 'incident'];
 
-export function createStore(pool: pg.Pool, log: (line: string) => void = () => undefined): Store {
+export function createStore(pool: pg.Pool, door: pg.Pool, log: (line: string) => void = () => undefined): Store {
   // An idle connection the database drops raises an error on the pool itself, which with no listener would end the
   // process. It is logged by its code and the pool makes a new connection at the next query.
   pool.on('error', (err) => log(`database: an idle connection failed${errorCode(err)}`));
+  door.on('error', (err) => log(`database: the door's idle connection failed${errorCode(err)}`));
   return {
     pool,
+    door,
     runs: createRuns(pool),
     events: createEvents(pool),
     conditions: createConditions(pool),
@@ -283,7 +303,10 @@ export function createStore(pool: pg.Pool, log: (line: string) => void = () => u
       return n === null || n === undefined ? null : Number(n);
     },
     async maintenance() {
-      const { rows } = await pool.query<{ reloptions: string[] | null }>(`SELECT reloptions FROM pg_class WHERE relname = 'orders' AND relkind = 'r'`);
+      // The orders table of this schema, named with its schema: another schema's table of the same name is not it.
+      const { rows } = await pool.query<{ reloptions: string[] | null }>(
+        `SELECT c.reloptions FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relname = 'orders' AND c.relkind = 'r'`,
+      );
       const out: Record<string, string> = {};
       for (const option of rows[0]?.reloptions ?? []) {
         const i = option.indexOf('=');
@@ -305,7 +328,7 @@ export function createStore(pool: pg.Pool, log: (line: string) => void = () => u
       });
     },
     async close() {
-      await pool.end();
+      await Promise.all([pool.end(), door.end()]);
     },
   };
 }

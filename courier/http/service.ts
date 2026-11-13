@@ -56,11 +56,13 @@ const CORS = {
   'access-control-allow-headers': 'content-type',
 };
 
-function send(res: ServerResponse, answer: HttpAnswer, extra: Record<string, string> = {}): void {
+function write(res: ServerResponse, answer: HttpAnswer, extra: Record<string, string> = {}): void {
+  const retry = answer.body.retryAfterSeconds;
   res.writeHead(answer.status, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
     ...CORS,
+    ...(typeof retry === 'number' ? { 'retry-after': String(retry) } : {}),
     ...extra,
   });
   res.end(JSON.stringify(answer.body));
@@ -105,6 +107,18 @@ function readBody(req: IncomingMessage, bound: number): Promise<Body> {
 
 export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, res: ServerResponse) => void {
   const limiter = deps.limiter;
+
+  /**
+   * Sends an answer. First, what the chain reads learned of the
+   * chain-unreachable condition is written (the request holds no connection
+   * of the pool by now, so the bookkeeping never waits on a connection the
+   * request holds, and where nothing changed it is no statement); then the
+   * answer, with its retry time where it names one.
+   */
+  async function send(res: ServerResponse, answer: HttpAnswer, extra: Record<string, string> = {}): Promise<void> {
+    await deps.chain.settle().catch((err: unknown) => deps.log(`condition: the chain-unreachable bookkeeping could not be written${failureCode(err) === undefined ? '' : ` (${failureCode(err)})`}`));
+    write(res, answer, extra);
+  }
 
   /**
    * One request. `matched` is the route the courier matched, or one fixed word
@@ -177,9 +191,7 @@ export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, 
         deps.counters.count('INVALID_PARAM');
         return send(res, refusal(400, 'INVALID_PARAM', 'The body is not JSON.'));
       }
-      const answer = await postOrders(deps, parsed);
-      const retry = answer.body.retryAfterSeconds;
-      return send(res, answer, typeof retry === 'number' ? { 'retry-after': String(retry) } : {});
+      return send(res, await postOrders(deps, parsed));
     }
     const order = /^\/v1\/orders\/([^/]+)$/.exec(path);
     if (req.method === 'GET' && order !== null) {
@@ -199,7 +211,7 @@ export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, 
       // recorded, and the answer does not say otherwise. The one failure the courier records as its own fault is
       // the door's hash mismatch, which the door writes itself.
       deps.log(`request ${matched.route} failed: ${node.kind}${code === undefined ? '' : ` (${code})`}`);
-      if (!res.headersSent) send(res, refusal(500, 'INTERNAL_ERROR', 'The courier failed on this request.'));
+      if (!res.headersSent) write(res, refusal(500, 'INTERNAL_ERROR', 'The courier failed on this request.'));
       else res.destroy();
     });
   };

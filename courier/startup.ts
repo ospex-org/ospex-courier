@@ -70,7 +70,8 @@ export async function startService(env: Record<string, string | undefined>, opti
   // The database.
   let store: Store;
   try {
-    store = createStore(openPool(config.databaseUrl, pinnedAuthority(config.databaseCaFile)), log);
+    const authority = pinnedAuthority(config.databaseCaFile);
+    store = createStore(openPool(config.databaseUrl, authority), openPool(config.databaseUrl, authority, 1), log);
   } catch (err) {
     throw new StartupRefused(err instanceof StoreRefused ? err.message : 'DATABASE_URL could not be read as a postgres:// URL');
   }
@@ -113,7 +114,10 @@ export async function startService(env: Record<string, string | undefined>, opti
 
   const counters = createCounters(now);
   const limiter = createAddressLimiter(BOUNDS.requestsPerAddressPerMinute);
-  const chain = createChainReader({ rpc, conditions: store.conditions, run: run.id, now, log });
+  // Whether the chain-unreachable condition stands open from before this start: read once, so the first read that
+  // succeeds clears it and no later read asks the records whether it changed.
+  const openAtStart = (await store.conditions.open_()).some((c) => c.key === 'chain-unreachable');
+  const chain = createChainReader({ rpc, conditions: store.conditions, run: run.id, openAtStart, now, log });
   const handler = createRequestHandler({ store, chain, set, node, run, counters, limiter, settings: { lowPol: config.lowPol }, published, notYetBuilt: NOT_YET_BUILT, log });
   // The server's own timeout on a request arriving: a stated number (http/limits.ts), not Node's five minutes; and
   // how often it looks, so the close comes within a second of the number and not within Node's thirty.

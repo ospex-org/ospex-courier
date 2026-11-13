@@ -118,8 +118,11 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
   // 7. The account has registered the relay.
   if (!read.registered) return counted(refusal(422, 'NOT_REGISTERED', `The account has not registered the courier's relay, ${deps.set.relay}, with the matching contract.`));
 
-  // Checks 5 and 8 to 16, in one transaction under the order's hash lock.
-  const client = await deps.store.pool.connect();
+  // Checks 5 and 8 to 16, in one transaction under the order's hash lock, on the door's own connection: one post at
+  // a time in this process holds it, the others wait for it holding nothing, and the pool the reads go through is
+  // never held idle on the courier's row. A read of the chain inside this transaction notes what it learns of the
+  // chain-unreachable condition in memory; the service writes it once the connection is released (settle).
+  const client = await deps.store.door.connect();
   try {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock($1::bigint)', [lockKey(hash)]);
