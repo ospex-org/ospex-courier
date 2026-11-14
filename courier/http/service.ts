@@ -1,24 +1,25 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { describeNodeFailure } from '../chain/rpc';
 import { failureCode } from '../records/store';
-import { createAddressLimiter, type AddressLimiter, type Counters } from './limits';
-import { getBook, getReady, getRuns, getStatus, type HttpAnswer, type RouteDeps } from './routes';
+import { BOUNDS, type Counters } from './limits';
+import { getBook, getOrder, getReady, getRuns, getStatus, postOrders, type HttpAnswer, type RouteDeps } from './routes';
 
 // The courier's HTTP service: node:http and routes by hand. JSON under /v1;
 // no sign-in and no shared secret, since a signed order is its own permission
 // and the book is public. https only, behind Heroku's router; plain http only
 // from this machine, which is how the tests reach it.
 //
-//   GET /healthz          the process answers; nothing more
-//   GET /readyz           the database answers
-//   GET /v1/status        what stands now
-//   GET /v1/runs          the runs, paged
-//   GET /v1/book?gameId=  the markets of a game that hold a live quote, at one block
+//   GET  /healthz              the process answers; nothing more
+//   GET  /readyz               the database answers
+//   GET  /v1/status            what stands now
+//   GET  /v1/runs              the runs, paged
+//   GET  /v1/book?gameId=      the markets of a game that hold a live quote, at one block
+//   GET  /v1/book?gameId=&scorer=&lineTicks=   one market's quotes, a page a side, at one block
+//   POST /v1/orders            the door: a signed order, under a role
+//   GET  /v1/orders/{hash}     the courier's record of one order
 
 export interface ServiceDeps extends RouteDeps {
   counters: Counters;
-  limiter?: AddressLimiter;
-  log(line: string): void;
 }
 
 const THIS_MACHINE = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
@@ -36,7 +37,13 @@ function transport(req: IncomingMessage): 'https' | 'this-machine' | 'not-https'
   return THIS_MACHINE.has(req.socket.remoteAddress ?? '') ? 'this-machine' : 'no-header-from-elsewhere';
 }
 
-/** The caller's network address, as the router reports it or as the socket has it. Used for the limit and never kept. */
+/**
+ * The caller's network address, as the router reports it or as the socket has
+ * it: the last value of X-Forwarded-For, which is the one the router appended.
+ * Used for the limit and kept no longer than its minute. The courier therefore
+ * runs behind one router that appends the caller's address and is reachable no
+ * other way: anywhere else the last forwarded value is the caller's own choice.
+ */
 function callerAddress(req: IncomingMessage): string {
   const forwarded = req.headers['x-forwarded-for'];
   if (typeof forwarded === 'string' && forwarded.trim() !== '') return forwarded.split(',').pop()?.trim() ?? '';
@@ -49,11 +56,13 @@ const CORS = {
   'access-control-allow-headers': 'content-type',
 };
 
-function send(res: ServerResponse, answer: HttpAnswer, extra: Record<string, string> = {}): void {
+function write(res: ServerResponse, answer: HttpAnswer, extra: Record<string, string> = {}): void {
+  const retry = answer.body.retryAfterSeconds;
   res.writeHead(answer.status, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
     ...CORS,
+    ...(typeof retry === 'number' ? { 'retry-after': String(retry) } : {}),
     ...extra,
   });
   res.end(JSON.stringify(answer.body));
@@ -61,18 +70,78 @@ function send(res: ServerResponse, answer: HttpAnswer, extra: Record<string, str
 
 const refusal = (status: number, code: string, error: string): HttpAnswer => ({ status, body: { error, code } });
 
-export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, res: ServerResponse) => void {
-  const limiter = deps.limiter ?? createAddressLimiter(600);
+type Body = { ok: true; text: string } | { ok: false; why: 'too large' | 'cut' };
 
-  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? '/', 'http://courier');
+/**
+ * The body of a POST, read up to its bound and no further: a body over the
+ * bound is refused before it is read whole, and before anything is parsed. A
+ * body that never arrives whole (the connection cut, or closed by the server's
+ * own timeout) is `cut`: there is nothing to answer and nothing was refused.
+ */
+function readBody(req: IncomingMessage, bound: number): Promise<Body> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    const finish = (value: Body) => {
+      if (done) return;
+      done = true;
+      resolve(value);
+    };
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > bound) {
+        req.removeAllListeners('data');
+        req.resume();
+        return finish({ ok: false, why: 'too large' });
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => finish({ ok: true, text: Buffer.concat(chunks).toString('utf8') }));
+    req.on('error', () => finish({ ok: false, why: 'cut' }));
+    req.on('close', () => {
+      if (!req.complete) finish({ ok: false, why: 'cut' });
+    });
+  });
+}
+
+export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, res: ServerResponse) => void {
+  const limiter = deps.limiter;
+
+  /**
+   * Sends an answer, with its retry time where it names one. Nothing of the
+   * chain-unreachable condition is settled here or anywhere in the service:
+   * each read of the chain applies its own outcome to the records before it
+   * returns (chain/snapshot.ts), so a request leaves nothing behind on any
+   * path out, the catch-all included.
+   */
+  const send = write;
+
+  /**
+   * One request. `matched` is the route the courier matched, or one fixed word
+   * when it matched none: what a failure is logged under, never the request's
+   * own target, which is the caller's text.
+   */
+  async function handle(req: IncomingMessage, res: ServerResponse, matched: { route: string }): Promise<void> {
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://courier');
+    } catch {
+      // A target that does not parse as a URL: refused before anything else, and nothing of it is kept or logged.
+      deps.counters.count('INVALID_PARAM');
+      return send(res, refusal(400, 'INVALID_PARAM', "The request's target could not be read as a URL."));
+    }
     const path = url.pathname;
     if (req.method === 'OPTIONS') {
+      matched.route = 'OPTIONS';
       res.writeHead(204, CORS);
       res.end();
       return;
     }
-    if (req.method === 'GET' && path === '/healthz') return send(res, { status: 200, body: { ok: true } });
+    if (req.method === 'GET' && path === '/healthz') {
+      matched.route = 'GET /healthz';
+      return send(res, { status: 200, body: { ok: true } });
+    }
 
     // The door's first two checks for every other route: https, then the caller's minute. A request that fails
     // either is answered at once, counted, and nothing else happens: no database and no chain.
@@ -87,20 +156,59 @@ export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, 
       return send(res, refusal(429, 'RATE_LIMIT_EXCEEDED', 'Too many requests from this address in the last minute.'), { 'retry-after': String(minute.retryAfterSeconds) });
     }
 
-    if (req.method === 'GET' && path === '/readyz') return send(res, await getReady(deps));
-    if (req.method === 'GET' && path === '/v1/status') return send(res, await getStatus(deps));
-    if (req.method === 'GET' && path === '/v1/runs') return send(res, await getRuns(deps, url.searchParams));
-    if (req.method === 'GET' && path === '/v1/book') return send(res, await getBook(deps, url.searchParams));
+    if (req.method === 'GET' && path === '/readyz') {
+      matched.route = 'GET /readyz';
+      return send(res, await getReady(deps));
+    }
+    if (req.method === 'GET' && path === '/v1/status') {
+      matched.route = 'GET /v1/status';
+      return send(res, await getStatus(deps));
+    }
+    if (req.method === 'GET' && path === '/v1/runs') {
+      matched.route = 'GET /v1/runs';
+      return send(res, await getRuns(deps, url.searchParams));
+    }
+    if (req.method === 'GET' && path === '/v1/book') {
+      matched.route = 'GET /v1/book';
+      return send(res, await getBook(deps, url.searchParams));
+    }
+    if (req.method === 'POST' && path === '/v1/orders') {
+      matched.route = 'POST /v1/orders';
+      const body = await readBody(req, BOUNDS.orderBodyBytes);
+      if (!body.ok) {
+        // A request that did not arrive whole: the connection is gone or going, nothing is answered and nothing counted.
+        if (body.why === 'cut') return;
+        deps.counters.count('BODY_TOO_LARGE');
+        return send(res, refusal(413, 'BODY_TOO_LARGE', `An order's body is at most ${BOUNDS.orderBodyBytes} bytes.`), { connection: 'close' });
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body.text);
+      } catch {
+        deps.counters.count('INVALID_PARAM');
+        return send(res, refusal(400, 'INVALID_PARAM', 'The body is not JSON.'));
+      }
+      return send(res, await postOrders(deps, parsed));
+    }
+    const order = /^\/v1\/orders\/([^/]+)$/.exec(path);
+    if (req.method === 'GET' && order !== null) {
+      matched.route = 'GET /v1/orders/{hash}';
+      return send(res, await getOrder(deps, order[1] ?? ''));
+    }
     deps.counters.count('NOT_FOUND');
     return send(res, refusal(404, 'NOT_FOUND', 'Not found.'));
   }
 
   return (req, res) => {
-    handle(req, res).catch((err: unknown) => {
+    const matched = { route: 'unmatched' };
+    handle(req, res, matched).catch((err: unknown) => {
       const node = describeNodeFailure(err);
       const code = failureCode(err);
-      deps.log(`request ${req.method ?? ''} ${(req.url ?? '').split('?')[0] ?? ''} failed: ${node.kind}${code === undefined ? '' : ` (${code})`}`);
-      if (!res.headersSent) send(res, refusal(500, 'INTERNAL_ERROR', 'The courier failed on this request; it is recorded as its own fault.'));
+      // Logged by the route matched and the failure's class and code, never by the request's target; nothing is
+      // recorded, and the answer does not say otherwise. The one failure the courier records as its own fault is
+      // the door's hash mismatch, which the door writes itself.
+      deps.log(`request ${matched.route} failed: ${node.kind}${code === undefined ? '' : ` (${code})`}`);
+      if (!res.headersSent) write(res, refusal(500, 'INTERNAL_ERROR', 'The courier failed on this request.'));
       else res.destroy();
     });
   };

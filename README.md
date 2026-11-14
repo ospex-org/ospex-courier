@@ -10,12 +10,17 @@ contract checks every signed value, and the relay passes the call through unread
 
 ## This build
 
-The first build: the repository, the settings, the schema, the start-up against the set read from a signpost, the
-local chain rig and the proxy, the runs and the status address, what a node does with a block's hash and with an
-override, and the store's TLS check, verification on, proved against a test authority. It holds no key, signs
-nothing and sends nothing. What it does not yet do is listed on its own status address under `notYetBuilt`: orders
-in and the book's quotes, stops, the lanes and the pre-check, the sender and the key, the incidents and their
-cursor.
+The second build: orders in. The door (`POST /v1/orders`) takes a signed order under a role, runs the sixteen
+checks in order, and records what it admits, each outcome a line; the book's quotes are served, a page a side, in
+the fill-priority order (`docs/FILL_PRIORITY.md`); the two budgets of admitted requests; the game rule against the
+published list; the hash lock; the mark of expired quotes against the final block; and the cost of the book's scan
+measured against the plan's three books in both maintenance states (`docs/COST.md`), with the table's maintenance
+settings set from the measurement. On the first build's: the repository, the settings, the schema, the start-up
+against the set read from a signpost, the local chain rig and the proxy, the runs and the status address, what a
+node does with a block's hash and with an override, and the store's TLS check. It holds no key, signs nothing and
+sends nothing: a bet posted is recorded and waits. What it does not yet do is listed on its own status address
+under `notYetBuilt`: stops, the lanes and the pre-check, the sender and the key, the incidents and their cursor,
+and the netted pull's `payable`.
 
 ## Running it
 
@@ -30,6 +35,7 @@ a value in this repository (`.env.example` lists them).
 | `COURIER_LOW_POL` | Under this many POL the key's wallet is reported low. 3 unless set. Read now, used from the sender's build. |
 | `PORT` | Where the process listens. 0 is any free port, which is how the tests start it. |
 | `DATABASE_CA_FILE` | Optional: a file holding the certificate authority the database is verified against, in place of the pinned `db/database-ca.pem`. It can name another authority and nothing else; verification is never off. |
+| `PUBLISHED_REPORTERS_FILE` | Optional: a file holding the published list of reporters, in place of the repository's `published-reporters.json`; the tests name the rig's reporter. It can name another list and nothing else; the game rule is never off. |
 
 - **`yarn start`** is the web process. At start it reads the settings, the database and its schema, the chain and
   the set from the signpost, proves what the node can do, writes this run's row, and listens. Each refusal to start
@@ -54,12 +60,83 @@ hashes as the entry says, now and not only when the entry was written; the core 
 coin; the relay passes to the set's matching contract and answers the matching contract's own timelock. It then
 proves what its node can do, writes its run, and listens.
 
+## The door: `POST /v1/orders`
+
+```
+{ "role": "rest" | "take",
+  "order": { "account", "gameId", "scorer", "lineTicks", "positionType",
+             "oddsTick", "riskAmount", "nonce", "expiry", "minFill" },
+  "signature": "0x… (65 bytes)" }
+```
+
+The ten fields are the contract's `OspexOrder`, signed under its EIP-712 domain (name `Ospex`, version `3`, the
+chain, the matching contract); the amounts are decimal strings in the coin's smallest unit. `role` is not signed:
+`rest` keeps the order on the book until its expiry, its cancel or its stop, and the courier never uses it to take;
+`take` is a bet, to be filled against the book in one Cross and kept no further. An order hash has one role at this
+courier, the first one posted.
+
+Sixteen checks, in order; the first that fails is the answer. Before admission (no row, no line; counted by code
+on the status address): the body's shape and its size (8 KB), the caller's minute, the order's own rules as the
+contract has them (`PRICE_OUT_OF_RANGE`, `STAKE_NOT_IN_LOTS`, `MIN_FILL_ABOVE_STAKE`, `UNKNOWN_MARKET_CONTRACT`,
+`INVALID_LINE`), the signature (`BAD_SIGNATURE`), the hash on record (a repeat is answered from the record, the
+first answer whole, with no chain read; the other role is `ROLE_CONFLICT`), one read of the chain at the latest block named by its hash
+(`CHAIN_UNREACHABLE`), the account's registration of the relay (`NOT_REGISTERED`), and the two budgets
+(`RATE_LIMIT_EXCEEDED`, naming which). From then on the request is admitted, and whatever becomes of it is a line:
+the contract's own `getOrderHash` must equal the hash computed here (else `INTERNAL_ERROR`, recorded as the
+courier's own fault); a stop on record (`STOPPED`); the game, whose start must be written, whose reporters must
+be exactly the published list, which must not have ended and whose close must not have passed (`UNKNOWN_GAME`,
+`NO_WRITTEN_START`, `REPORTERS_NOT_THE_PUBLISHED_LIST`, `GAME_ENDED`, `BETS_CLOSED`); the order's standing on chain
+(`CANCELLED`, `EXPIRED`, `FILLED`), the expiry exact with no margin; for a quote, fewer than 16 live quotes of the
+account on that side of that market (`TOO_MANY_QUOTES`): one page of the account's unexpired quotes the courier has
+not marked ended, at most seventeen rows; sixteen or more standing, the chain is asked once about sixteen of them,
+the ones it shows cancelled or under the account's floor are marked `cancelled` in the records at the block read,
+and the count is read once more, so one post is one page and at most one read of the chain for the quotes whatever
+the account has posted before (each read of the chain is tried once more when it fails, so a post makes at most six
+requests to the node: the header, its own read and the quotes' read, twice each; a game's page at most four, its two
+headers; a market's page at most six, its two headers and the quotes' read); for a bet, the signed stake not above the cap until the lift, both read from the matching contract at the
+block (`ABOVE_CAP`), the expiry at most 30 seconds past the chain's time (`EXPIRY_TOO_FAR`), and fewer than two of
+the account's bets, and 32 in all, waiting their turn (`QUEUE_FULL`). Checks 5 and 8 to 16 run in one database
+transaction under the order's hash lock. A quote accepted is `201 resting`; a bet accepted is `202 queued`, recorded
+and waiting, and in this build nothing examines or sends it. Either answer is the order's record, which carries the
+chain's time it was taken at as `chainTime`; a repeat post is answered with the same record.
+
+The two budgets are rows in the database, one count for every process and across a restart: an account's 240
+admitted requests at once and 12 a minute after; the courier's 2,400 at once and 60 a minute after, for all
+accounts together. Their clock is the chain's time, read at the block the door named. A request over a budget is
+not admitted, and the row counts how many and when last.
+
+`GET /v1/orders/{hash}` is the courier's record of one order. Its `state` is `resting` for a quote the courier has
+not marked ended, `queued` for a bet waiting its turn, else how the order ended here: `stopped`, `expired`,
+`filled`, or `cancelled`, with `endedAt` and, for `cancelled`, `endedBlock`, the block the chain was read at.
+
+**The mark of a quote the chain shows ended.** Every request that asks the chain about a quote the courier holds (the
+door's count above; the market's page, below) and is shown it ended marks it in the records in that same request,
+at the block it read, and a marked quote is asked about no more: `cancelled` where the chain shows it cancelled or
+under its account's floor for the market, the maker's own acts; `filled` where it shows less than a lot of its stake
+left, a fill through another courier the account registered (this courier's own fills are the sender build's, marked
+`filled` too, at their final block). A quote partly filled with a lot or more left stands, counted and listed with
+what remains. The mark is at the block read and not at finality: if a reorganization undoes the cancel or the fill,
+the quote stays marked here, this courier carries it no further, and a maker who wants it carried signs a new one;
+the block's number and hash on the mark let a later build tell a mark whose block is no longer on the chain. One thing
+a read can show is not marked: an account that has dropped the relay, which is not an end of the quote and is undone
+by the account itself, so its quotes are not listed while it stands unregistered and are listed again after. The
+expiry mark is unchanged: against the final block's time, in the book's reads. The plan's fill marks were this
+courier's own final Crosses; the fill seen through another courier, marked at the block read, is an amendment to it,
+said as one.
+
 ## What is served
 
 JSON, under `/v1`, over https only (behind Heroku's router; plain http is served only from this machine). No sign-in
 and no secret: the book is public. Every refusal is `{error, code}`, a plain sentence and an UPPER_SNAKE code.
 Reads from one network address are limited to 600 a minute, counted in memory; the courier keeps no log of
-addresses.
+addresses, and an address whose minute has passed leaves the count on a clock, whether or not it is seen again, so
+what is held is a minute's addresses and no more; the status address says how many stand (`addressMinute`), never
+which. The address is the last value of `X-Forwarded-For`, the one the router appended, so the courier runs behind
+one router that appends the caller's address, Heroku's, and is reachable no other way: anywhere else the last
+forwarded value is the caller's own choice, and with it the count. The server waits ten seconds for a request to
+arrive whole, headers and body (`timeouts` on the status address), then answers 408 and closes the connection: an
+order's body is at most 8 KB and a read has none, so a request still arriving after ten seconds is not one the
+courier waits on; Node's own default is five minutes.
 
 - `GET /healthz`: the process answers, and no more. `GET /readyz`: the database answers.
 - `GET /v1/status`: what stands now. This run; the open conditions; the number of the newest report line; the last
@@ -68,23 +145,68 @@ addresses.
   sender, and the key's address (none in this build); what the node can do; the published bounds; the settings;
   this run's counts of requests refused before admission, by code; the database's size; and what is not yet built.
   If the database cannot be read it answers `503` and says that: it does not serve what it last knew as if it were
-  now.
+  now. A condition listed means the last state-changing decision the records made for it was an opening; one not
+  listed means that decision was a clearing, or there has been no opening. Neither is a present-tense assertion
+  that the chain is up or down: the records apply outcomes in the order they process them (below), and a `503
+  CHAIN_UNREACHABLE` on a read is that read's own failure, not the listing's.
 - `GET /v1/runs?after=&limit=`: the runs, 100 to a page: each start of the process, and each stop the process
   wrote itself. A process that dies writes nothing, and no later start writes it for it. This is the courier's own
   account of when it was running, not a measure of whether a caller could reach it.
-- `GET /v1/book?gameId=`: the markets of a game that hold a live quote, at one block, named by number, hash and
-  time. This build carries no orders, so the answer is an empty book at a named block.
+- `GET /v1/book?gameId=[&after=scorer:lineTicks&limit=]`: the markets of a game that hold a live quote, 100 to a
+  page in the order of the market contract's address and then the line, each side's count within the bound of
+  2,000 rows and whether the bound ended the count, at one block named by number, hash and time, with the final
+  block beside it; `more` says whether markets follow and `next` names the last market of the page, which the
+  next request passes as `after`. A page's work is the page's: the game's (market, side) pairs are walked along an
+  index on the game from the cursor, one probe a pair, at most two for each market of the page plus one, and only
+  the page's markets are scanned; what the book holds on other games enters nowhere. `GET /v1/book?gameId=&scorer=&lineTicks=[&side=A|B&after=tick:record&limit=]`: one market's
+  quotes, 50 a side to a page at most, in the fill-priority order; each with `remaining` (the signed stake less
+  what the chain shows filled) and `payable` (what the account's balance and allowance cover, this quote alone);
+  once per account on the page, its balance and allowance; a page short of its limit says whether the book or the
+  bound ended it, and where the next page starts. Listed: quotes not stopped, not expired at the block, not
+  cancelled or under a floor, with a lot or more left, whose account still has the relay registered. A request that
+  is returned an expired quote marks it, where the final block's time plus one has reached its expiry, so the next
+  request does not meet it; a backlog the final block has not passed is met again, and the answer names the bound
+  and never an empty book. A quote the chain shows ended is marked by the page that read it, at the block read (the
+  mark, above), and is returned to no later request: `cancelled` or `filled`, counted on the page as
+  `markedCancelled` and `markedFilled`. The game's list asks the chain nothing: its counts are the courier's records as
+  they stand, right once any request has asked the chain about the quotes, and the market's page is the one checked
+  against the chain.
 
-One standing condition is raised in this build: `chain-unreachable`, when a read of the chain fails and fails
-again when tried once more; it clears at the next read that succeeds. Each opening and clearing is a numbered line
-in the records.
+One standing condition is raised in this build: `chain-unreachable`. It opens when the records process a read of
+the chain that failed and failed again on its one retry, including a required header or state value that cannot be
+decoded or a refusal to read the named block; it clears when the records next process a usable read that succeeded
+while it is open, whichever process made the read. An intelligible negative answer from a contract (a game the set
+does not know, where the call allowed failure) is a successful read, not the chain unreachable; a fault of the
+courier's own is no failure of the node's and opens nothing. Outcomes are applied in the records' processing order,
+not in the order the chain was observed: a success recorded late may clear a failure observed after it, and a
+failure recorded late may open after a success observed after it. No outcome is discarded because its age, its wait
+on the process or its trip to the database exceeded a time; no time decides a transition. Each opening and clearing
+is a numbered line in the records, written in one transaction with the condition's row, and every write of the
+condition is one writer form: the key's lock, the open row locked, the deciding fact read again on fresh state after
+the lock, the line and the row together; the lookup a read makes before it decides only that nothing need be
+written. Four cases and no others: closed and a success, nothing; closed and a failure, one opening and its line;
+open and a success, one clearing and its line; open and a failure, nothing. Each read applies its own outcome before
+it returns, so no outcome is lent to a later request, no path out of a request has anything to settle, and no
+process holds a belief about the condition. The request holds no connection of the reads' pool at any of its reads,
+so the condition's statements never wait on a connection the request holds. The times on the rows and the lines are
+the writing transaction's, diagnostics: neither is proof of the order the chain was observed in.
 
 ## The database
 
 The courier's own Postgres, `db/schema.sql`: ten tables (orders, stops, lanes, crosses, legs, events, conditions,
-accounts, runs, games) and the indexes the book and the door read along. The schema's comments say what each bound
+accounts, runs, games) and the indexes the book and the door read along. The process holds two pools on it: four
+connections for the reads and the records, and one for the door, on which a post's admission transaction (the
+budgets' rows locked, through the record's commit, a read of the chain inside it) runs one post at a time in the
+process; the posts waiting hold nothing, so a reader and another account are answered while a burst of posts runs,
+and the courier's row serializes the posts across processes anyway. A request that waits ten seconds for a
+connection of either pool and gets none is answered `503 DATABASE_UNREADABLE` with a retry time of one second. The schema's comments say what each bound
 counts: a scan along the book's index is bounded by the rows it is returned, which is what `LIMIT` counts, and not
-by the index entries it visits, the rows it fetches or the pages it reads to return them.
+by the index entries it visits, the rows it fetches or the pages it reads to return them. That work is measured
+(`docs/COST.md`, `tests/cost.test.ts`), and the orders table's maintenance is chosen with the measurement in view:
+due for vacuum at 2,000 dead versions whatever its size (a chosen batch, the bound of rows one request is returned,
+not a measured optimum or a ceiling), with its indexes cleaned at every vacuum. The status address
+serves the settings as the database holds them, under `database.maintenance`, and the bytes a row takes with its
+indexes under `database.tables` and `database.growth`.
 
 Off this machine the connection uses TLS and checks the server's certificate against a pinned authority. No
 authority is pinned yet: `db/database-ca.pem` is added at the first release, as the public bundle that verifies the
@@ -95,13 +217,20 @@ port and database are read.
 ## The published list
 
 `published-reporters.json` is the list of reporters a game must have, exactly, for the courier to carry it. It is a
-file in this repository, changed by a reviewed commit, and is never read from the chain's approved list.
+file in this repository, changed by a reviewed commit, and is never read from the chain's approved list. The door
+compares a game's reporters with it at every order; the status address serves the list under `published`.
 
 ## The tests
 
 `yarn test` needs: `TEST_DATABASE_URL`, a Postgres server on this machine (the tests create and drop their own
-databases there); `anvil` and `forge` on the PATH, with the contracts built once by `yarn build:contracts`; and
+databases there; the cost test lays 500,000 rows and needs the `pgstattuple` extension, which the server's contrib
+modules provide); `anvil` and `forge` on the PATH, with the contracts built once by `yarn build:contracts`; and
 `openssl` on the PATH, for the TLS test's authorities. CI (`.github/workflows/ci.yml`) provides all three.
+
+The orders, the book and the budgets are tested from a user's side: orders signed with real keys, posted over HTTP
+to the courier running as its own process, and judged by the answer, the rows and the lines. The rig's final block
+is named by the test through the proxy where a test needs it: anvil's own answer for the `finalized` tag is the
+block 64 behind the head.
 
 The rig is a local chain with the set deployed from the pinned contracts, from their build artifacts: a six-decimal
 coin; a stock timelock with a test key as its proposer and a 60-second delay; the games set with a fixture reporter
@@ -125,12 +254,13 @@ published-reporters.json the published list, changed by a reviewed commit
 courier/
   server.ts  config.ts  startup.ts
   http/      service.ts  routes.ts  limits.ts
-  chain/     abi.ts  set.ts  snapshot.ts  rpc.ts  node.ts
-  records/   store.ts  events.ts  runs.ts  conditions.ts
+  chain/     abi.ts  set.ts  snapshot.ts  rpc.ts  node.ts  reads.ts
+  orders/    order.ts  door.ts  budgets.ts  published.ts
+  records/   store.ts  orders.ts  events.ts  runs.ts  conditions.ts
   status/    status.ts
   book/      read.ts
 scripts/     apply-schema.ts  check-node.ts
-docs/        INCIDENT_NOTES.md
+docs/        INCIDENT_NOTES.md  FILL_PRIORITY.md  COST.md
 tests/       the suite, its support (the rig, the proxy, the TLS front) and fixtures
 contracts/   a submodule: the contracts repository at the pinned commit, for the tests only
 ```

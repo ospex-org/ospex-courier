@@ -62,14 +62,30 @@ CREATE TABLE IF NOT EXISTS orders (
   received_at     timestamptz NOT NULL DEFAULT now(),
   received_block  numeric(78, 0) NOT NULL,
   received_hash   text NOT NULL CHECK (received_hash ~ '^0x[0-9a-f]{64}$'),
-  -- Empty while the order is live as far as the courier itself knows; else how it ended here. What only the
-  -- chain knows (a cancel, a floor, a fill sent by another courier) is read at a block, never stored.
-  ended           text CHECK (ended IN ('stopped', 'expired', 'filled')),
+  -- The receipt block's time: the chain's time the order was taken at, which the first answer carries and a repeat
+  -- post is answered from, with no chain read.
+  received_time   numeric(78, 0) NOT NULL,
+  -- Empty while the order is live as far as the courier itself knows; else how it ended here: a stop on record;
+  -- expired at the final block; or what a read of the chain showed, marked by the request that read it at the block
+  -- it read (ended_block): cancelled, the quote cancelled or under its account's floor for the market (the maker's
+  -- own act), or filled, less than a lot of its stake left (a fill through another courier; this courier's own
+  -- fills are the sender build's, which marks filled too). The relay dropped is read at a block and not stored: not
+  -- an end of the quote, and undone by the account itself.
+  ended           text CHECK (ended IN ('stopped', 'expired', 'filled', 'cancelled')),
   ended_at        timestamptz,
+  -- The block the chain read that marked the quote cancelled or filled was made at: number and hash, so a later
+  -- build can tell a mark whose block is no longer on the chain. Empty for the other marks: a stop has its message,
+  -- and the expiry mark is against the final block's time.
+  ended_block     numeric(78, 0),
+  ended_block_hash text CHECK (ended_block_hash ~ '^0x[0-9a-f]{64}$'),
   -- For a bet, where it stands. A quote has none.
   bet_state       text CHECK (bet_state IN ('waiting', 'held', 'sent', 'refused', 'lapsed')),
   CONSTRAINT orders_side_is_position_type CHECK (side = position_type),
   CONSTRAINT orders_ended_whole CHECK ((ended IS NULL) = (ended_at IS NULL)),
+  CONSTRAINT orders_ended_block_whole CHECK (
+    (ended_block IS NULL) = (ended_block_hash IS NULL)
+    AND (ended_block IS NULL OR ended IS NOT NULL)
+    AND (ended IS NULL OR ended NOT IN ('cancelled', 'filled') OR ended_block IS NOT NULL)),
   CONSTRAINT orders_bet_state_for_bets CHECK ((role = 'take') = (bet_state IS NOT NULL))
 );
 
@@ -85,12 +101,54 @@ CREATE INDEX IF NOT EXISTS orders_book
   ON orders (market_key, side, odds_tick, record_number)
   WHERE role = 'rest' AND ended IS NULL;
 
--- The door's count of an account's live quotes on one side of one market: the live ones first, so the count
--- ends at the first expired row and is returned at most 17 rows whatever the account has posted. Again a
--- count of rows returned; what the database passes over to return them is the paragraph above.
+-- The door's count of an account's quotes on one side of one market the courier has not marked ended: one page
+-- of the unexpired ones, at most 17 rows, whatever the account has posted. Sixteen or more standing, the chain is
+-- asked once about sixteen and the ones it shows cancelled or under the floor are marked here, so the records
+-- never hold more than sixteen unended quotes of an account on a side except where the chain has not yet been
+-- asked about them. Again a count of rows returned; what the database passes over to return them is the
+-- paragraph above.
 CREATE INDEX IF NOT EXISTS orders_live_quotes_per_account
   ON orders (account, market_key, side, expiry DESC)
   WHERE role = 'rest' AND ended IS NULL;
+
+-- The markets of a game that hold a quote the courier has not marked ended, for the game's page of the book: the
+-- (market, side) pairs of ONE game, walked one index probe a pair from the page's cursor, at most two a market of
+-- the page plus one. A page's work is the page's, whatever the book holds on other games. Without this index the
+-- walk was along the book's index over every pair the whole book holds, and the game was kept afterwards.
+CREATE INDEX IF NOT EXISTS orders_markets_of_game
+  ON orders (game_id, scorer, line_ticks, side)
+  WHERE role = 'rest' AND ended IS NULL;
+
+-- The door's count of the bets waiting their turn (two an account, 32 in all), and later the pre-check's next bet:
+-- the bets not yet final, in record order. The count is of rows returned along this index, bounded by the counts it
+-- enforces; without it the count would be a scan of every order ever kept, and the plan has a post, a bet and a
+-- read each go through an index made for the lookup.
+CREATE INDEX IF NOT EXISTS orders_bets_waiting
+  ON orders (record_number)
+  WHERE role = 'take' AND bet_state IN ('waiting', 'held') AND ended IS NULL;
+
+-- The table's maintenance, chosen with the measurement in view (docs/COST.md). The mark of an expired quote, a
+-- stop or a fill leaves a dead version in the table and an entry in the index until vacuum removes them, and a
+-- scan along the book's index visits the dead entries that stand in its range ahead of the rows it returns. At
+-- Postgres's defaults a table is due for vacuum once its dead versions pass 50 plus a fifth of its rows, which is
+-- a number history sets: the dead a scan can meet would grow with the orders kept. Here the table is due once
+-- 2,000 dead versions have gathered, whatever its size. 2,000 is a chosen batch, the bound of rows one request is
+-- returned and so the most one request marks; it is not a measured optimum, and the threshold is when the table
+-- becomes due, not a ceiling on its dead versions: autovacuum's workers can be busy elsewhere, and a version an
+-- older transaction can still see is not removed until it cannot. A vacuum left to itself may skip the indexes
+-- when the pages holding dead items are under two per cent of the table's pages, and leave the dead index
+-- entries a scan visits standing; vacuum_index_cleanup = on makes each vacuum of this table clean its indexes,
+-- which is where the scan's cost lives. What the measurement shows is the state after a vacuum with the cleanup
+-- forced on; it does not show what the default (auto) or off would have left standing here, nor how long
+-- production's autovacuum takes to come round: those are read from the live table's statistics once it runs. The
+-- status address serves these settings as the database holds them.
+ALTER TABLE orders SET (
+  autovacuum_vacuum_threshold = 2000,
+  autovacuum_vacuum_scale_factor = 0,
+  autovacuum_analyze_threshold = 2000,
+  autovacuum_analyze_scale_factor = 0,
+  vacuum_index_cleanup = on
+);
 
 -- ──────────────────────────── stops ───────────────────────────────────────
 -- One row per order hash a stop stopped, keyed by the hash: the account, the
@@ -238,7 +296,14 @@ CREATE OR REPLACE TRIGGER events_no_truncate
 -- ──────────────────────────── conditions ──────────────────────────────────
 -- The standing conditions of the reports: a key, when it opened and the line
 -- that says so, when it cleared and that line, and the facts. One condition
--- of a key is open at a time; a key that opens again is a new row.
+-- of a key is open at a time; a key that opens again is a new row. A row open
+-- means the last decision the records made for the key was an opening; a row
+-- cleared means it was a clearing. The records apply outcomes in the order
+-- they process them, not in the order the chain was observed, and neither an
+-- open row nor a cleared one says the chain is up or down this instant. The
+-- times here, and a line's `at`, are the writing transaction's time: they are
+-- diagnostics, not the order the chain was observed in, and no time decides a
+-- transition.
 CREATE TABLE IF NOT EXISTS conditions (
   id           bigserial PRIMARY KEY,
   key          text NOT NULL CHECK (key IN (

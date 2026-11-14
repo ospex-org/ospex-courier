@@ -4,8 +4,9 @@ import { chainId, createJsonRpc, describeNodeFailure, type JsonRpc } from './cha
 import { readSet, SetRefused, type BettingSet } from './chain/set';
 import { createChainReader, type ChainReader } from './chain/snapshot';
 import { readCourierConfig, type CourierConfig } from './config';
-import { createCounters } from './http/limits';
+import { BOUNDS, createAddressLimiter, createCounters, TIMEOUTS } from './http/limits';
 import { createRequestHandler } from './http/service';
+import { PublishedListRefused, readPublishedReporters } from './orders/published';
 import { applySchema, createStore, databaseRefusal, missingSchema, openPool, pinnedAuthority, StoreRefused, type Store } from './records/store';
 import type { Run } from './records/runs';
 
@@ -23,11 +24,11 @@ export class StartupRefused extends Error {
 
 /** What this build does not yet do, published on the status address. */
 export const NOT_YET_BUILT = [
-  "orders in, and the book's quotes (the orders build)",
-  'stops (the stop build)',
-  'the lanes and the pre-check (the pre-check build)',
-  'the sender and the key (the sender build)',
+  'stops (the stop build): a stop on record is honoured at the door, but none can be recorded yet',
+  'the lanes and the pre-check (the pre-check build): a bet posted is recorded and waits, and nothing examines it',
+  'the sender and the key (the sender build): nothing is signed or sent',
   'incidents and their cursor (the reports build)',
+  "the netted pull's payable (the order-4 build): the book's payable is what a balance and an allowance cover",
 ] as const;
 
 export interface RunningService {
@@ -58,10 +59,19 @@ export async function startService(env: Record<string, string | undefined>, opti
   if (!read.ok) throw new StartupRefused(`settings: ${read.problems.join('; ')}`);
   const config = read.config;
 
+  // The published list of reporters: a file, read once.
+  let published;
+  try {
+    published = readPublishedReporters(config.publishedReportersFile);
+  } catch (err) {
+    throw new StartupRefused(err instanceof PublishedListRefused ? `the published list: ${err.message}` : 'the published list could not be read');
+  }
+
   // The database.
   let store: Store;
   try {
-    store = createStore(openPool(config.databaseUrl, pinnedAuthority(config.databaseCaFile)), log);
+    const authority = pinnedAuthority(config.databaseCaFile);
+    store = createStore(openPool(config.databaseUrl, authority), openPool(config.databaseUrl, authority, 1), log);
   } catch (err) {
     throw new StartupRefused(err instanceof StoreRefused ? err.message : 'DATABASE_URL could not be read as a postgres:// URL');
   }
@@ -103,9 +113,15 @@ export async function startService(env: Record<string, string | undefined>, opti
   await store.events.write({ run: run.id, kind: 'run started', facts: { chainId: set.chainId.toString(), entry: set.entryId.toString(), nodeUsable: node.usable } });
 
   const counters = createCounters(now);
+  const limiter = createAddressLimiter(BOUNDS.requestsPerAddressPerMinute);
+  // The reads of the chain. Each applies its outcome to the records at once; this process keeps nothing of the
+  // chain-unreachable condition, since another process may open or clear it at any moment while this one runs.
   const chain = createChainReader({ rpc, conditions: store.conditions, run: run.id, now, log });
-  const handler = createRequestHandler({ store, chain, set, node, run, counters, settings: { lowPol: config.lowPol }, notYetBuilt: NOT_YET_BUILT, log });
-  const server: Server = createServer(handler);
+  const handler = createRequestHandler({ store, chain, set, node, run, counters, limiter, settings: { lowPol: config.lowPol }, published, notYetBuilt: NOT_YET_BUILT, log });
+  // The server's own timeout on a request arriving: a stated number (http/limits.ts), not Node's five minutes; and
+  // how often it looks, so the close comes within a second of the number and not within Node's thirty.
+  const server: Server = createServer({ requestTimeout: TIMEOUTS.requestMs, connectionsCheckingInterval: TIMEOUTS.checkEveryMs }, handler);
+  server.headersTimeout = TIMEOUTS.headersMs;
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(config.port, () => {
@@ -130,6 +146,7 @@ export async function startService(env: Record<string, string | undefined>, opti
       closing ??= (async () => {
         await new Promise<void>((resolve) => server.close(() => resolve()));
         server.closeAllConnections();
+        limiter.close();
         try {
           await store.events.write({ run: run.id, kind: 'run stopped', reason });
           await store.runs.stop(run.id, reason);

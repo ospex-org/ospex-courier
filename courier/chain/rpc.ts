@@ -85,32 +85,56 @@ export function createJsonRpc(url: string, timeoutMs = 10_000): JsonRpc {
   };
 }
 
-function toHeader(raw: Record<string, unknown>): Header {
-  return {
-    number: BigInt(raw.number as string),
-    hash: raw.hash as Hex,
-    parentHash: raw.parentHash as Hex,
-    timestamp: BigInt(raw.timestamp as string),
-  };
+const QUANTITY = /^0x[0-9a-fA-F]{1,64}$/;
+const HASH = /^0x[0-9a-fA-F]{64}$/;
+
+/**
+ * The header a read requires out of the node's block, each field checked for what it must be and decoded: a block
+ * short of a field, or with one that is not a hex quantity or a hash, is an answer the read cannot use, which is the
+ * node's `malformed` failure and not a cast.
+ */
+function toHeader(raw: unknown, method: string): Header {
+  const block = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : null;
+  const number = block?.number;
+  const hash = block?.hash;
+  const parentHash = block?.parentHash;
+  const timestamp = block?.timestamp;
+  if (typeof number !== 'string' || !QUANTITY.test(number) || typeof timestamp !== 'string' || !QUANTITY.test(timestamp) || typeof hash !== 'string' || !HASH.test(hash) || typeof parentHash !== 'string' || !HASH.test(parentHash)) {
+    throw new NodeFailure('malformed', method, null, 'the block lacks a field the header needs, or one does not decode');
+  }
+  return { number: BigInt(number), hash: hash as Hex, parentHash: parentHash as Hex, timestamp: BigInt(timestamp) };
 }
 
 /** The header of the block a tag names. */
 export async function headerByTag(rpc: JsonRpc, tag: 'latest' | 'finalized'): Promise<Header> {
-  const raw = await rpc.request<Record<string, unknown> | null>('eth_getBlockByNumber', [tag, false]);
+  const raw = await rpc.request<unknown>('eth_getBlockByNumber', [tag, false]);
   if (raw === null) throw new NodeFailure('malformed', 'eth_getBlockByNumber', null, `no block for ${tag}`);
-  return toHeader(raw);
+  return toHeader(raw, 'eth_getBlockByNumber');
 }
 
 /** The header of the block with this hash, or null where the node has none. */
 export async function headerByHash(rpc: JsonRpc, hash: Hex): Promise<Header | null> {
-  const raw = await rpc.request<Record<string, unknown> | null>('eth_getBlockByHash', [hash, false]);
-  return raw === null ? null : toHeader(raw);
+  const raw = await rpc.request<unknown>('eth_getBlockByHash', [hash, false]);
+  return raw === null ? null : toHeader(raw, 'eth_getBlockByHash');
 }
 
 /** The header of the block at this height, or null. */
 export async function headerByNumber(rpc: JsonRpc, number: bigint): Promise<Header | null> {
-  const raw = await rpc.request<Record<string, unknown> | null>('eth_getBlockByNumber', [`0x${number.toString(16)}`, false]);
-  return raw === null ? null : toHeader(raw);
+  const raw = await rpc.request<unknown>('eth_getBlockByNumber', [`0x${number.toString(16)}`, false]);
+  return raw === null ? null : toHeader(raw, 'eth_getBlockByNumber');
+}
+
+/**
+ * A decoding of what a read requires out of the node's answer, where the bytes may not be what the ABI says: an answer
+ * that does not decode is the node's `malformed` failure of the read, named for what did not decode, never a cast and
+ * never a fault of the courier's.
+ */
+export function decoded<T>(what: string, decode: () => T): T {
+  try {
+    return decode();
+  } catch {
+    throw new NodeFailure('malformed', 'eth_call', null, `${what} did not decode`);
+  }
 }
 
 export async function chainId(rpc: JsonRpc): Promise<bigint> {
@@ -185,13 +209,13 @@ export async function multicallAt(rpc: JsonRpc, header: Header, calls: Array<{ t
     args: [[...probes, ...calls.map((c) => ({ target: c.target, allowFailure: c.allowFailure ?? false, callData: c.callData }))]],
   });
   const out = await callAt(rpc, { to: MULTICALL_ADDRESS, data }, byHash(header.hash));
-  const results = decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', data: out }) as readonly MulticallResult[];
-  const [number, time, parent] = results;
-  if (number === undefined || time === undefined || parent === undefined) throw new NodeFailure('malformed', 'eth_call', null, 'the multicall answered too few results');
+  const results = decoded('the multicall envelope', () => decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', data: out }) as readonly MulticallResult[]);
+  if (results.length !== probes.length + calls.length) throw new NodeFailure('malformed', 'eth_call', null, 'the multicall answered the wrong number of results');
+  const [number, time, parent] = results as [MulticallResult, MulticallResult, MulticallResult];
   const found = {
-    number: decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'getBlockNumber', data: number.returnData }) as bigint,
-    timestamp: decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'getCurrentBlockTimestamp', data: time.returnData }) as bigint,
-    parentHash: decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'getLastBlockHash', data: parent.returnData }) as Hex,
+    number: decoded("the block's number", () => decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'getBlockNumber', data: number.returnData }) as bigint),
+    timestamp: decoded("the block's time", () => decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'getCurrentBlockTimestamp', data: time.returnData }) as bigint),
+    parentHash: decoded("the parent's hash", () => decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'getLastBlockHash', data: parent.returnData }) as Hex),
   };
   if (found.number !== header.number || found.timestamp !== header.timestamp || found.parentHash.toLowerCase() !== header.parentHash.toLowerCase()) {
     throw new StateMismatch(header, found);

@@ -67,12 +67,11 @@ test('the courier read the set from the signpost and the status names every addr
   assert.equal((body.bounds as { scanRows: number }).scanRows, 2000);
 });
 
-test('the book of the game is empty, at a block named by number, hash and time', async () => {
+test('the book of the game is empty, at a block named by number, hash and time, with the final block beside it', async () => {
   const requestsBefore = stack.proxy.count('eth_getBlockByNumber');
   const { status, body } = await get(stack.courier.url, `/v1/book?gameId=${rig.gameId}`);
   assert.equal(status, 200, JSON.stringify(body));
   assert.deepEqual(body.markets, []);
-  assert.equal(body.boundReached, false);
   assert.equal(body.bound, 2000);
   assert.equal(body.gameId, rig.gameId.toString());
   const block = body.block as { number: string; hash: Hex; time: string };
@@ -80,24 +79,34 @@ test('the book of the game is empty, at a block named by number, hash and time',
   assert.equal(block.number, latest.number.toString());
   assert.equal(block.hash, latest.hash);
   assert.equal(block.time, latest.timestamp.toString());
-  assert.equal(stack.proxy.count('eth_getBlockByNumber'), requestsBefore + 1, 'one header read, through the proxy');
+  const final = body.final as { number: string; hash: Hex; time: string };
+  assert.ok(BigInt(final.number) <= latest.number, 'the final block is at or under the latest');
+  assert.equal(stack.proxy.count('eth_getBlockByNumber'), requestsBefore + 2, 'two header reads, the latest and the final block, through the proxy');
   const after = await get(stack.courier.url, '/v1/status');
   const last = after.body.lastBlockRead as { number: string; hash: string };
   assert.equal(last.hash, latest.hash);
 });
 
-test('the book refuses a game id that is not a number, and a market read this build does not serve', async () => {
+test('the book refuses a game id that is not a number, and serves one market empty', async () => {
   assert.equal((await get(stack.courier.url, '/v1/book?gameId=abc')).body.code, 'INVALID_PARAM');
   assert.equal((await get(stack.courier.url, '/v1/book')).body.code, 'INVALID_PARAM');
-  assert.equal((await get(stack.courier.url, `/v1/book?gameId=${rig.gameId}&scorer=${rig.addresses.moneyline}&lineTicks=0`)).body.code, 'INVALID_PARAM');
+  const market = await get(stack.courier.url, `/v1/book?gameId=${rig.gameId}&scorer=${rig.addresses.moneyline}&lineTicks=0`);
+  assert.equal(market.status, 200, JSON.stringify(market.body));
+  const sides = market.body.sides as Record<string, { quotes: unknown[]; endedBy: string }>;
+  assert.deepEqual(sides.A?.quotes, []);
+  assert.deepEqual(sides.B?.quotes, []);
+  assert.equal(sides.A?.endedBy, 'book');
 });
 
 test('/healthz and /readyz answer; an unknown path is refused by code', async () => {
   assert.deepEqual((await get(stack.courier.url, '/healthz')).body, { ok: true });
   assert.deepEqual((await get(stack.courier.url, '/readyz')).body, { ok: true });
-  const missing = await get(stack.courier.url, '/v1/orders/0x00');
+  const missing = await get(stack.courier.url, '/v1/nothing');
   assert.equal(missing.status, 404);
   assert.equal(missing.body.code, 'NOT_FOUND');
+  const notAHash = await get(stack.courier.url, '/v1/orders/0x00');
+  assert.equal(notAHash.status, 400);
+  assert.equal(notAHash.body.code, 'INVALID_PARAM');
 });
 
 test('https only: a request the router says came plain is refused, one it says came over https is served', async () => {
@@ -125,6 +134,45 @@ test('the runs list this run, started and not stopped, and page by number', asyn
   assert.deepEqual(none.body.runs, []);
   assert.equal((await get(stack.courier.url, '/v1/runs?limit=0')).body.code, 'INVALID_PARAM');
   assert.equal((await get(stack.courier.url, '/v1/runs?limit=101')).body.code, 'INVALID_PARAM');
+});
+
+test('the runs are paged in the order of their numbers across a change of digits, every run once, and the cursor reaches the rest', async () => {
+  // Five runs planted at numbers 99,998 to 100,002: as text, "100000" sorts before "99998", so a page or a cursor
+  // that compared the numbers as text would serve them out of order, or not at all. Far above the sequence, so no
+  // later start collides with them.
+  const planted = [99_998, 99_999, 100_000, 100_001, 100_002];
+  const pool = openPool(stack.databaseUrl, null);
+  try {
+    for (const [i, id] of planted.entries()) {
+      await pool.query('INSERT INTO runs (id, started_at, stopped_at, stop_reason) VALUES ($1, now() - make_interval(mins => $2), now() - make_interval(mins => $3), $4)', [id, 60 - i * 10, 55 - i * 10, 'close']);
+    }
+  } finally {
+    await pool.end();
+  }
+  const served: number[] = [];
+  let after = 99_997;
+  let pages = 0;
+  for (;;) {
+    const { status, body } = await get(stack.courier.url, `/v1/runs?after=${after}&limit=2`);
+    assert.equal(status, 200, JSON.stringify(body));
+    const runs = body.runs as Array<{ id: number; stopReason: string | null }>;
+    assert.ok(runs.length <= 2, 'at most the limit');
+    served.push(...runs.map((r) => r.id));
+    pages++;
+    if (body.more !== true) {
+      assert.deepEqual(runs.map((r) => r.id), [100_002], 'the last page holds the last run');
+      break;
+    }
+    assert.equal(runs.length, 2, 'a page that says more follow is full');
+    after = runs[runs.length - 1]?.id as number;
+    assert.ok(pages < 10, 'the cursor must reach the end');
+  }
+  assert.deepEqual(served, planted, 'every planted run once, in the order of the numbers: 99,999 before 100,000');
+  assert.equal(pages, 3, 'five runs in pages of two: three pages');
+  // The same five from the cursor at the digit boundary itself.
+  const fromBoundary = await get(stack.courier.url, '/v1/runs?after=99999&limit=100');
+  assert.deepEqual((fromBoundary.body.runs as Array<{ id: number }>).map((r) => r.id), [100_000, 100_001, 100_002], 'after 99,999 come the six-digit numbers');
+  assert.equal(fromBoundary.body.more, false);
 });
 
 test('a process that closes writes its run\'s stop, with the two lines of the run', async () => {
