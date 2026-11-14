@@ -616,6 +616,147 @@ test('one writer for every write: a writer stopped between its recheck and its w
   }
 });
 
+// ──────────────── the line and the row roll back together: a row the database refuses takes its line with it ────────────────
+
+/** Every row of the conditions table as the records hold it, its version included: what a write the database refused must leave exactly as it was. */
+async function conditionRows(): Promise<Array<Record<string, string | null>>> {
+  const pool = openPool(stack.databaseUrl, null);
+  try {
+    // The order is the table's column, a number: a bare `ORDER BY id` would be the output column, text, and past nine
+    // rows the last row by text is not the newest.
+    const { rows } = await pool.query<Record<string, string | null>>(
+      'SELECT id::text AS id, xmin::text AS version, key, opened_at::text AS opened_at, opened_line::text AS opened_line, cleared_at::text AS cleared_at, cleared_line::text AS cleared_line, facts::text AS facts FROM conditions ORDER BY conditions.id',
+    );
+    return rows;
+  } finally {
+    await pool.end();
+  }
+}
+
+/**
+ * While it stands, the database refuses every write of a condition's row: a check no row can pass, added without a
+ * scan of the rows that stand. The writer writes the line before the row, so the refusal lands after the line would
+ * be written, which is what the tests want to see roll back with it. Lifted once, and once only.
+ */
+async function refusingConditionRows(): Promise<{ lift(): Promise<void> }> {
+  const pool = openPool(stack.databaseUrl, null);
+  try {
+    await pool.query('ALTER TABLE conditions ADD CONSTRAINT conditions_refused_by_the_test CHECK (false) NOT VALID');
+  } catch (err) {
+    await pool.end();
+    throw err;
+  }
+  let lifted = false;
+  return {
+    async lift() {
+      if (lifted) return;
+      lifted = true;
+      try {
+        await pool.query('ALTER TABLE conditions DROP CONSTRAINT conditions_refused_by_the_test');
+      } finally {
+        await pool.end();
+      }
+    },
+  };
+}
+
+/** The database's refusal of a row by a check: what the writer's error must be when the row is refused. */
+const CHECK_VIOLATION = (err: unknown) => (err as { code?: string }).code === '23514';
+
+/** The line the courier logs when a condition's bookkeeping fails. The failure's code is the database's. */
+const BOOKKEEPING_REFUSED = 'condition: the chain-unreachable bookkeeping could not be read or written (23514)';
+
+/** Whether the courier's process logged the line since the count given, waiting up to two seconds for the pipe. */
+async function loggedSince(count: number, line: string): Promise<boolean> {
+  for (let i = 0; i < 40; i++) {
+    if (stack.courier.lines.slice(count).includes(line)) return true;
+    await sleep(50);
+  }
+  return false;
+}
+
+test("a database rejection at the opening, after its line is written: the line and the row roll back together, no line is committed, no row changes; the read is answered 503 as ever and nothing is listed, the outcome lost; with the rejection lifted, the next read that fails twice opens", async () => {
+  await closedAtTheStart();
+  const a = stack.courier.url;
+  const other = await recordsAs(stack.databaseUrl);
+  let refusing: { lift(): Promise<void> } | null = null;
+  try {
+    const lines = await conditionLines();
+    const rows = await conditionRows();
+    refusing = await refusingConditionRows();
+    // 1. Another process's writer: the line's insert goes through, the row's is refused, the transaction rolls back
+    // and the refusal is the writer's error.
+    await assert.rejects(other.conditions.applyFailure('chain-unreachable', FAILURE, other.run), CHECK_VIOLATION, "the writer's error is the database's refusal of the row");
+    assert.deepEqual(await conditionLines(), lines, 'no committed line: the line rolled back with the row');
+    assert.deepEqual(await conditionRows(), rows, 'no row, and no row version changed');
+    assert.deepEqual(await conditionsOf(a), [], 'nothing listed');
+    // 2. The courier's own process: a read that fails twice is answered 503 as ever; its bookkeeping refused is one
+    // line of its log, and the outcome is dropped.
+    const logged = stack.courier.lines.length;
+    await openOn(a);
+    assert.ok(await loggedSince(logged, BOOKKEEPING_REFUSED), `the refusal is a line of the courier's log; its lines since: ${stack.courier.lines.slice(logged).join(' | ')}`);
+    assert.deepEqual(await conditionLines(), lines, 'no committed line');
+    assert.deepEqual(await conditionRows(), rows, 'no row');
+    assert.deepEqual(await conditionsOf(a), [], 'nothing listed: the outcome was lost, as the status page says it can be');
+    // 3. Lifted: the next read that fails twice opens, the line and the row together; the next that succeeds clears.
+    await refusing.lift();
+    await openOn(a);
+    assert.deepEqual((await conditionLines()).slice(lines.length).map((l) => l.kind), ['condition opened'], 'a later read applies its own outcome');
+    assert.equal((await conditionRows()).length, rows.length + 1, 'one row more, with its line');
+    assert.equal((await conditionsOf(a)).length, 1);
+    assert.equal((await bookRead(a)).status, 200);
+    assert.deepEqual(await conditionsOf(a), []);
+  } finally {
+    await refusing?.lift();
+    await other.close();
+    stack.proxy.clear();
+  }
+});
+
+test("a database rejection at the clearing, after its line is written: the line and the row roll back together, no line is committed, the open row's version is unchanged; the page is served and the condition stays listed, the outcome lost; with the rejection lifted, the next read that succeeds clears it", async () => {
+  await closedAtTheStart();
+  const a = stack.courier.url;
+  const other = await recordsAs(stack.databaseUrl);
+  let refusing: { lift(): Promise<void> } | null = null;
+  try {
+    await openOn(a);
+    const lines = await conditionLines();
+    const rows = await conditionRows();
+    assert.equal((await conditionsOf(a)).length, 1, 'open at the start');
+    refusing = await refusingConditionRows();
+    // 1. Another process's writer: the line's insert goes through, the row's update is refused, both roll back.
+    await assert.rejects(other.conditions.applySuccess('chain-unreachable', SUCCESS, other.run), CHECK_VIOLATION, "the writer's error is the database's refusal of the row");
+    assert.deepEqual(await conditionLines(), lines, 'no committed line: the line rolled back with the row');
+    assert.deepEqual(await conditionRows(), rows, "the open row's version is unchanged: the update rolled back");
+    assert.equal((await conditionsOf(a)).length, 1, 'listed still');
+    // 2. The courier's own process: a read that succeeds is served; its bookkeeping refused is one line of its log,
+    // and the outcome is dropped: the condition stays listed though the chain answered.
+    const logged = stack.courier.lines.length;
+    assert.equal((await bookRead(a)).status, 200, 'the page is served: the bookkeeping is awaited but best-effort');
+    assert.ok(await loggedSince(logged, BOOKKEEPING_REFUSED), `the refusal is a line of the courier's log; its lines since: ${stack.courier.lines.slice(logged).join(' | ')}`);
+    assert.deepEqual(await conditionLines(), lines, 'no committed line');
+    assert.deepEqual(await conditionRows(), rows, 'no row changed');
+    assert.equal((await conditionsOf(a)).length, 1, 'listed still: the clearing was lost, as the status page says it can be');
+    // 3. Lifted: the next read that succeeds clears it, the line and the row together.
+    await refusing.lift();
+    assert.equal((await bookRead(a)).status, 200);
+    assert.deepEqual((await conditionLines()).slice(lines.length).map((l) => l.kind), ['condition cleared'], 'a later read applies its own outcome');
+    const cleared = await conditionRows();
+    assert.equal(cleared.length, rows.length, 'the same rows');
+    const open = rows.find((r) => r.cleared_at === null);
+    assert.ok(open !== undefined, 'the row that was open');
+    const same = cleared.find((r) => r.id === open.id);
+    assert.ok(same !== undefined, 'the row that was open is still there');
+    assert.notEqual(same.version, open.version, 'the row changed with its line');
+    assert.notEqual(same.cleared_line, null, 'cleared, with the line');
+    assert.deepEqual(await conditionsOf(a), []);
+  } finally {
+    await refusing?.lift();
+    await other.close();
+    stack.proxy.clear();
+  }
+});
+
 test("a fault of the courier's own inside a read is no failure of the node's: thrown at once, not tried again, recorded as nothing; the node's failures are tried once more and recorded", async () => {
   const header = { number: '0x10', hash: `0x${'1'.repeat(64)}`, parentHash: `0x${'2'.repeat(64)}`, timestamp: '0x5f' };
   const applied: string[] = [];
