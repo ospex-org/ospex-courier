@@ -622,8 +622,10 @@ test('one writer for every write: a writer stopped between its recheck and its w
 async function conditionRows(): Promise<Array<Record<string, string | null>>> {
   const pool = openPool(stack.databaseUrl, null);
   try {
+    // The order is the table's column, a number: a bare `ORDER BY id` would be the output column, text, and past nine
+    // rows the last row by text is not the newest.
     const { rows } = await pool.query<Record<string, string | null>>(
-      'SELECT id::text AS id, xmin::text AS version, key, opened_at::text AS opened_at, opened_line::text AS opened_line, cleared_at::text AS cleared_at, cleared_line::text AS cleared_line, facts::text AS facts FROM conditions ORDER BY id',
+      'SELECT id::text AS id, xmin::text AS version, key, opened_at::text AS opened_at, opened_line::text AS opened_line, cleared_at::text AS cleared_at, cleared_line::text AS cleared_line, facts::text AS facts FROM conditions ORDER BY conditions.id',
     );
     return rows;
   } finally {
@@ -741,8 +743,12 @@ test("a database rejection at the clearing, after its line is written: the line 
     assert.deepEqual((await conditionLines()).slice(lines.length).map((l) => l.kind), ['condition cleared'], 'a later read applies its own outcome');
     const cleared = await conditionRows();
     assert.equal(cleared.length, rows.length, 'the same rows');
-    assert.notEqual(cleared[cleared.length - 1]?.version, rows[rows.length - 1]?.version, 'the row changed with its line');
-    assert.notEqual(cleared[cleared.length - 1]?.cleared_line, null, 'cleared, with the line');
+    const open = rows.find((r) => r.cleared_at === null);
+    assert.ok(open !== undefined, 'the row that was open');
+    const same = cleared.find((r) => r.id === open.id);
+    assert.ok(same !== undefined, 'the row that was open is still there');
+    assert.notEqual(same.version, open.version, 'the row changed with its line');
+    assert.notEqual(same.cleared_line, null, 'cleared, with the line');
     assert.deepEqual(await conditionsOf(a), []);
   } finally {
     await refusing?.lift();
