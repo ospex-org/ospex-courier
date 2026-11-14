@@ -211,6 +211,17 @@ export async function multicallAt(rpc: JsonRpc, header: Header, calls: Array<{ t
   const out = await callAt(rpc, { to: MULTICALL_ADDRESS, data }, byHash(header.hash));
   const results = decoded('the multicall envelope', () => decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', data: out }) as readonly MulticallResult[]);
   if (results.length !== probes.length + calls.length) throw new NodeFailure('malformed', 'eth_call', null, 'the multicall answered the wrong number of results');
+  // A result marked failed where the call allowed no failure is an answer the read cannot use, whatever its bytes
+  // decode to: a conforming multicall reverts the whole call on such a failure, so a flag like this is the node's
+  // answer and not the contract's. The three probes allow none; an inner call allows it only where the read said so
+  // (the games set's negatives), and those keep their flag for the read to judge. Checked here, before any result
+  // leaves this function, so no decoder of a required value is reached past it.
+  for (let i = 0; i < results.length; i++) {
+    const allowed = i < probes.length ? false : (calls[i - probes.length]?.allowFailure ?? false);
+    if (!allowed && (results[i] as MulticallResult).success !== true) {
+      throw new NodeFailure('malformed', 'eth_call', null, i < probes.length ? 'a block probe answered failed' : 'a required call answered failed');
+    }
+  }
   const [number, time, parent] = results as [MulticallResult, MulticallResult, MulticallResult];
   const found = {
     number: decoded("the block's number", () => decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'getBlockNumber', data: number.returnData }) as bigint),

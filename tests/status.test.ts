@@ -276,6 +276,80 @@ test("an answer the read cannot use, twice, is the chain unreachable: with an op
   }
 });
 
+/**
+ * The node's answer with every byte real and only the flags changed: the three block probes marked failed, or every
+ * inner result marked failed. The market page's inner calls allow no failure, so each is a required result; a
+ * conforming multicall would have reverted the whole call, so a flag like this is an answer the read cannot use.
+ */
+function withFlagsFalse(which: 'probes' | 'required'): (params: unknown[], result: unknown) => unknown {
+  return (params, result) => {
+    const call = params[0] as { to?: string; data?: Hex } | undefined;
+    if (typeof result !== 'string' || call?.to?.toLowerCase() !== MULTICALL_ADDRESS.toLowerCase() || call.data === undefined) return result;
+    if (decodeFunctionData({ abi: MULTICALL_ABI, data: call.data }).functionName !== 'aggregate3') return result;
+    const answers = [...(decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', data: result as Hex }) as ReadonlyArray<{ success: boolean; returnData: Hex }>)];
+    return encodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', result: answers.map((a, i) => ((which === 'probes') === i < 3 ? { success: false, returnData: a.returnData } : a)) });
+  };
+}
+
+for (const which of ['probes', 'required'] as const) {
+  const what = which === 'probes' ? 'the three block probes marked failed, their bytes real' : 'every required result marked failed, its bytes real';
+
+  test(`${what}, twice: the chain unreachable; with an opening made after this request's own good headers, the market page is 503 CHAIN_UNREACHABLE, the quotes' read was made twice, and the condition stands`, async () => {
+    await closedAtTheStart();
+    const a = stack.courier.url;
+    const second = await startCourier(stack.env);
+    try {
+      const b = second.url;
+      await quoteOnTheMarket(a);
+      const before = await conditionLines();
+      const held = stack.proxy.hold('eth_call');
+      const arrived = stack.proxy.count('eth_call');
+      const reading = marketRead(a);
+      await held.arrived;
+      assert.equal(stack.proxy.count('eth_call'), arrived + 1, "A's quotes' read is at the chain, held; its headers were read before it");
+      await openOn(b);
+      assert.equal((await conditionsOf(b)).length, 1, "B opened it after A's headers");
+      held.release({ kind: 'rewriteResult', result: withFlagsFalse(which) });
+      const answer = await reading;
+      stack.proxy.rule('eth_call', null);
+      assert.equal(answer.status, 503, JSON.stringify(answer.body));
+      assert.equal(answer.body.code, 'CHAIN_UNREACHABLE');
+      assert.equal(stack.proxy.count('eth_call'), arrived + 2, 'tried once more, and no more');
+      assert.equal((await conditionsOf(a)).length, 1, 'the opening stands: a result marked failed where the call allowed none is not a read that succeeded');
+      assert.deepEqual((await conditionLines()).slice(before.length).map((l) => l.kind), ['condition opened'], 'open and a failure: nothing written');
+      const served = await marketRead(a);
+      assert.equal(served.status, 200, JSON.stringify(served.body));
+      assert.deepEqual(await conditionsOf(a), []);
+      assert.deepEqual((await conditionLines()).slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared']);
+    } finally {
+      stack.proxy.clear();
+      await second.stop();
+    }
+  });
+
+  test(`${what}, once, then a usable retry: the page is served, the quotes' read was made twice, and nothing is opened or written`, async () => {
+    await closedAtTheStart();
+    const a = stack.courier.url;
+    await quoteOnTheMarket(a);
+    const before = await conditionLines();
+    const arrived = stack.proxy.count('eth_call');
+    const flagged = withFlagsFalse(which);
+    let answered = 0;
+    stack.proxy.rule('eth_call', { kind: 'rewriteResult', result: (params, result) => (answered++ === 0 ? flagged(params, result) : result) });
+    let answer;
+    try {
+      answer = await marketRead(a);
+    } finally {
+      stack.proxy.rule('eth_call', null);
+    }
+    assert.equal(answer.status, 200, JSON.stringify(answer.body));
+    assert.equal(stack.proxy.count('eth_call'), arrived + 2, 'the first answer was unusable, the one retry was good');
+    assert.equal(answered, 2, 'the proxy flagged the first and passed the second');
+    assert.deepEqual(await conditionsOf(a), [], 'a read that succeeded on its retry opens nothing');
+    assert.deepEqual((await conditionLines()).slice(before.length), [], 'and writes nothing');
+  });
+}
+
 test("an answer the read cannot use, once, then a usable retry: the page is served, the quotes' read was made twice, and nothing is opened or written", async () => {
   await closedAtTheStart();
   const a = stack.courier.url;

@@ -148,7 +148,11 @@ courier waits on; Node's own default is five minutes.
   now. A condition listed means the last state-changing decision the records made for it was an opening; one not
   listed means that decision was a clearing, or there has been no opening. Neither is a present-tense assertion
   that the chain is up or down: the records apply outcomes in the order they process them (below), and a `503
-  CHAIN_UNREACHABLE` on a read is that read's own failure, not the listing's.
+  CHAIN_UNREACHABLE` on a read is that read's own failure, not the listing's. The bookkeeping behind the listing is
+  awaited by each read but best-effort: a write to the database that fails, or a process that dies between its
+  read and its statement, loses that one outcome, and a later read applies its own outcome, with no promised time
+  by which the listing catches up. What is on the status address is what the courier wrote down, in the order it
+  wrote it down, and no more.
 - `GET /v1/runs?after=&limit=`: the runs, 100 to a page: each start of the process, and each stop the process
   wrote itself. A process that dies writes nothing, and no later start writes it for it. This is the courier's own
   account of when it was running, not a measure of whether a caller could reach it.
@@ -187,9 +191,16 @@ the lock, the line and the row together; the lookup a read makes before it decid
 written. Four cases and no others: closed and a success, nothing; closed and a failure, one opening and its line;
 open and a success, one clearing and its line; open and a failure, nothing. Each read applies its own outcome before
 it returns, so no outcome is lent to a later request, no path out of a request has anything to settle, and no
-process holds a belief about the condition. The request holds no connection of the reads' pool at any of its reads,
-so the condition's statements never wait on a connection the request holds. The times on the rows and the lines are
-the writing transaction's, diagnostics: neither is proof of the order the chain was observed in.
+process holds a belief about the condition. The bookkeeping is awaited but best-effort: a write to the database that
+fails is a log line and the outcome is lost with it, a process that dies between its read and its statement loses
+that outcome too, and a later read applies its own outcome, with no promised time by which the records catch up; so
+the records hold what the courier wrote down, and an outage or a recovery whose write was lost is not in them. That
+is a loss, not a discard: no outcome is discarded for its age. A result the node marks failed where the call allowed
+no failure (one of the three block probes, or a state value the read requires) is an answer the read cannot use,
+whatever its bytes decode to, and is tried once more like any failure; the games set's negatives, where the call
+allowed failure, keep their flag and their meaning. The request holds no connection of the reads' pool at any of its
+reads, so the condition's statements never wait on a connection the request holds. The times on the rows and the
+lines are the writing transaction's, diagnostics: neither is proof of the order the chain was observed in.
 
 ## The database
 
