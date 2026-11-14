@@ -26,6 +26,12 @@ export interface CourierConfig {
    * It can name another authority and nothing else; verification is never off.
    */
   databaseCaFile?: string;
+  /**
+   * The file holding the published list of reporters, when it is not the
+   * repository's published-reporters.json: the tests name the rig's reporter.
+   * It can name another list and nothing else; the game rule is never off.
+   */
+  publishedReportersFile?: string;
 }
 
 export type ConfigResult = { ok: true; config: CourierConfig } | { ok: false; problems: string[] };
@@ -90,6 +96,7 @@ export function readCourierConfig(env: Record<string, string | undefined>): Conf
   else if (!/^[0-9]{1,5}$/.test(portText) || port > 65535) problems.push('PORT must be a whole number from 0 to 65535');
 
   const databaseCaFile = get('DATABASE_CA_FILE');
+  const publishedReportersFile = get('PUBLISHED_REPORTERS_FILE');
 
   if (problems.length > 0) return { ok: false, problems };
   return {
@@ -102,6 +109,7 @@ export function readCourierConfig(env: Record<string, string | undefined>): Conf
       lowPol,
       port,
       ...(databaseCaFile === '' ? {} : { databaseCaFile }),
+      ...(publishedReportersFile === '' ? {} : { publishedReportersFile }),
     },
   };
 }

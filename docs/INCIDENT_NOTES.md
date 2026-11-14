@@ -5,6 +5,19 @@ has run against a live chain: the courier is not deployed.
 
 ## Found while building
 
+### A refusal's line was written on a connection already given back to the pool (orders build)
+
+The budgets test found it: 240 requests from one account, eight at a time, each admitted and refused at a later
+check, left the account's bucket at 47 instead of 0, and the 241st was admitted. The server's statement log showed
+a second request's `BEGIN` landing inside the first request's open transaction, on the same connection, with the
+warning "there is already a transaction in progress", and the first request's `COMMIT` ending both. The cause was
+in the door: each refusal after admission was `return refuse(...)` inside the transaction's `try` block, whose
+`finally` releases the connection to the pool. A bare `return promise` runs the `finally` before the promise
+settles, so the connection went back to the pool while `refuse` was still writing its line and committing on it,
+and the next request began its transaction on that connection; the row locks the budgets rest on were released
+early, and two requests read the same bucket. Every such return is now `return await`. Sequential requests never
+showed it; the first test to post concurrently did. The budgets test stays as the proof.
+
 ### CI's first run: the contracts' build wrote no artifact for the files it was given (first build)
 
 The first run of CI on the first push was red, 24 of 57 tests, every one the same missing file: the rig could not

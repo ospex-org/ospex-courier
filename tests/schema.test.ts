@@ -36,6 +36,7 @@ async function insertOrder(hash: string, role: 'rest' | 'take', overrides: Recor
     side: 0,
     received_block: '100',
     received_hash: HASH('e'),
+    received_time: '1794268000',
     bet_state: role === 'take' ? 'waiting' : null,
     ...overrides,
   };
@@ -88,12 +89,16 @@ test('the indexes the plan names are there, with their conditions', async () => 
   const live = def('orders_live_quotes_per_account');
   assert.match(live, /\(account, market_key, side, expiry DESC\)/);
   assert.match(live, /WHERE \(\(role = 'rest'::text\) AND \(ended IS NULL\)\)/);
+  const markets = def('orders_markets_of_game');
+  assert.match(markets, /\(game_id, scorer, line_ticks, side\)/);
+  assert.match(markets, /WHERE \(\(role = 'rest'::text\) AND \(ended IS NULL\)\)/);
   const open = def('crosses_one_open_per_lane');
   assert.match(open, /^CREATE UNIQUE INDEX/);
   assert.match(open, /\(lane\)/);
   assert.match(open, /WHERE \(state <> ALL/);
   assert.match(def('conditions_one_open_per_key'), /^CREATE UNIQUE INDEX .* \(key\) WHERE \(cleared_at IS NULL\)/);
   assert.match(def('events_report_lines'), /\(number\) WHERE \(kind = ANY/);
+  assert.match(def('orders_bets_waiting'), /\(record_number\) WHERE \(\(role = 'take'::text\) AND \(bet_state = ANY \(ARRAY\['waiting'::text, 'held'::text\]\)\) AND \(ended IS NULL\)\)$/);
   assert.match(def('orders_record_number_key'), /UNIQUE INDEX .* \(record_number\)/);
   assert.match(def('crosses_tx_hash_key'), /UNIQUE INDEX .* \(tx_hash\)/);
 });
@@ -122,6 +127,21 @@ test('an order keeps the contract\'s own rules: the price range, whole lots, the
   await refused(insertOrder(HASH('f9'), 'rest', { account: ADDRESS('A') }), '23514', 'an address in upper case');
   // The control: a bet with its state is taken.
   await insertOrder(HASH('f0'), 'take', { bet_state: 'waiting' });
+});
+
+test('a mark is whole: cancelled carries the block the chain was read at, number and hash together; a block without a mark, or an end the schema does not list, is refused', async () => {
+  const at = new Date();
+  await refused(insertOrder(HASH('e1'), 'rest', { ended: 'cancelled', ended_at: at }), '23514', 'cancelled with no block');
+  await refused(insertOrder(HASH('e2'), 'rest', { ended: 'cancelled', ended_at: at, ended_block: '5' }), '23514', 'cancelled with a block number and no hash');
+  await refused(insertOrder(HASH('e3'), 'rest', { ended_block: '5', ended_block_hash: HASH('b') }), '23514', 'a block with no mark');
+  await refused(insertOrder(HASH('e4'), 'rest', { ended: 'expired', ended_at: at, ended_block_hash: HASH('b') }), '23514', 'a hash with no number');
+  await refused(insertOrder(HASH('e5'), 'rest', { ended: 'gone', ended_at: at }), '23514', 'an end the schema does not list');
+  await refused(insertOrder(HASH('e6'), 'rest', { ended: 'cancelled' }), '23514', 'a mark with no time');
+  await refused(insertOrder(HASH('e9'), 'rest', { ended: 'filled', ended_at: at }), '23514', 'filled with no block');
+  // The controls: a cancelled mark and a filled mark with their block; an expiry mark with none.
+  await insertOrder(HASH('e7'), 'rest', { ended: 'cancelled', ended_at: at, ended_block: '5', ended_block_hash: HASH('b') });
+  await insertOrder(HASH('ea'), 'rest', { ended: 'filled', ended_at: at, ended_block: '6', ended_block_hash: HASH('b') });
+  await insertOrder(HASH('e8'), 'rest', { ended: 'expired', ended_at: at });
 });
 
 test('one bet, one Cross; one transaction hash; one open Cross a lane', async () => {

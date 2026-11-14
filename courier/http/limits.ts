@@ -30,20 +30,56 @@ export const BOUNDS = {
   page: 100,
 } as const;
 
+/**
+ * How long the server waits for a request to arrive whole, headers and body,
+ * in milliseconds: ten seconds. An order's body is at most 8,192 bytes and a
+ * read has none, so a request still arriving after ten seconds is not one the
+ * courier waits on; the connection is answered 408 and closed. Node's own
+ * default is five minutes, which a client that never finishes its body would
+ * hold a connection for. Published on the status address.
+ */
+export const TIMEOUTS = {
+  requestMs: 10_000,
+  /** The headers alone, within the same ten seconds (Node requires it at or under the request's). */
+  headersMs: 10_000,
+  /** How often the server looks for a request past its time: the close comes within this much of the ten seconds. Node's own default is thirty seconds. */
+  checkEveryMs: 1_000,
+} as const;
+
 export interface AddressLimiter {
   /** Takes one request from the address's minute. Refused when the address has made its limit in the last minute. */
   take(address: string): { allowed: true } | { allowed: false; retryAfterSeconds: number };
+  /** How many addresses hold a request in the last minute: what is kept, and all that is. */
+  addresses(): number;
+  /** Removes every address whose minute is empty. Run at every take and on the clock; here for the tests. */
+  sweep(): void;
+  /** Stops the clock. */
+  close(): void;
 }
 
 /**
  * A sliding minute per address, in memory: the times of its requests in the
  * last 60 seconds. Nothing durable, and nothing kept once an address's minute
- * is empty.
+ * is empty: an address leaves the map when its minute has passed, whether or
+ * not it is seen again, at the next request from any address and on a clock,
+ * so the map holds a minute's addresses and no more. The addresses are kept
+ * in the order of their last request taken, so a sweep reads from the front
+ * and stops at the first whose minute still holds one.
  */
-export function createAddressLimiter(perMinute: number, now: () => number = Date.now): AddressLimiter {
+export function createAddressLimiter(perMinute: number, now: () => number = Date.now, sweepEveryMs = 15_000): AddressLimiter {
   const windows = new Map<string, number[]>();
+  const sweep = () => {
+    const since = now() - 60_000;
+    for (const [address, times] of windows) {
+      if ((times[times.length - 1] ?? 0) > since) break;
+      windows.delete(address);
+    }
+  };
+  const clock = sweepEveryMs > 0 ? setInterval(sweep, sweepEveryMs) : null;
+  clock?.unref();
   return {
     take(address) {
+      sweep();
       const t = now();
       const since = t - 60_000;
       let times = windows.get(address);
@@ -54,11 +90,24 @@ export function createAddressLimiter(perMinute: number, now: () => number = Date
         if (times.length === 0) windows.delete(address), (times = undefined);
       }
       if (times !== undefined && times.length >= perMinute) {
+        // Refused: no request is added, and the address keeps its place, which is that of its last request taken.
         return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(((times[0] as number) + 60_000 - t) / 1000)) };
       }
+      // Taken: the address moves to the end, as the one with the newest request.
+      windows.delete(address);
       if (times === undefined) windows.set(address, [t]);
-      else times.push(t);
+      else {
+        times.push(t);
+        windows.set(address, times);
+      }
       return { allowed: true };
+    },
+    addresses() {
+      return windows.size;
+    },
+    sweep,
+    close() {
+      if (clock !== null) clearInterval(clock);
     },
   };
 }

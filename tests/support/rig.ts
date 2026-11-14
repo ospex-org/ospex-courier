@@ -92,6 +92,19 @@ export interface Rig {
   /** Runs a call on `target` through the timelock as it runs live: the key schedules it, the delay passes, a stranger executes it. */
   throughTimelock(target: Address, data: Hex): Promise<void>;
   wallet(account: HDAccount): WalletClient;
+  /** A transaction from `who`, mined; throws when it reverts. */
+  write(who: HDAccount, to: Address, abi: Abi, functionName: string, args?: readonly unknown[]): Promise<Hex>;
+  read<T>(to: Address, abi: Abi, functionName: string, args?: readonly unknown[]): Promise<T>;
+  /** The account at this index of the test mnemonic. */
+  account(index: number): HDAccount;
+  /** Gives an account coin, an allowance to the positions contract and the relay registered. */
+  fund(who: HDAccount): Promise<void>;
+  /** The next block mined carries this time. */
+  setNextBlockTime(time: bigint): Promise<void>;
+  /** The latest block's time. */
+  time(): Promise<bigint>;
+  /** One more game, created by the creator; its start written by the reporter when `startWritten` is true. Returns its id. */
+  createGame(options?: { startWritten?: boolean }): Promise<bigint>;
   close(): Promise<void>;
 }
 
@@ -120,11 +133,13 @@ async function startAnvil(): Promise<ChainProcess> {
     env: { ...process.env, FOUNDRY_DISABLE_NIGHTLY_WARNING: '1' },
   });
   // The chain never outlives the test process, and never keeps it alive: a test that fails before its rig is
-  // closed must not leave a chain running or a runner waiting on it.
+  // closed must not leave a chain running or a runner waiting on it. The listener leaves with the child.
   child.unref();
-  process.once('exit', () => {
+  const onExit = () => {
     if (child.exitCode === null) child.kill();
-  });
+  };
+  process.once('exit', onExit);
+  child.once('exit', () => process.off('exit', onExit));
   const url = `http://127.0.0.1:${port}`;
   const started = Date.now();
   for (;;) {
@@ -174,10 +189,11 @@ export async function startRig(): Promise<Rig> {
     if (receipt.status !== 'success' || !receipt.contractAddress) throw new Error(`deploying ${name} failed`);
     return receipt.contractAddress;
   };
-  const write = async (who: HDAccount, to: Address, abi: Abi, functionName: string, args: readonly unknown[] = []): Promise<void> => {
+  const write = async (who: HDAccount, to: Address, abi: Abi, functionName: string, args: readonly unknown[] = []): Promise<Hex> => {
     const hash = await wallet(who).sendTransaction({ to, data: encodeFunctionData({ abi, functionName, args } as never), account: who, chain } as never);
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
     if (receipt.status !== 'success') throw new Error(`${functionName} on ${to} reverted`);
+    return hash;
   };
   const read = async <T,>(to: Address, abi: Abi, functionName: string, args: readonly unknown[] = []): Promise<T> =>
     (await publicClient.readContract({ address: to, abi, functionName, args } as never)) as T;
@@ -202,7 +218,8 @@ export async function startRig(): Promise<Rig> {
 
   // The betting set: the core with the games set and the coin, the six modules on the core, bootstrapped under
   // their types, finalized.
-  const coreDeployBlock = await publicClient.getBlockNumber();
+  // The block itself, not getBlockNumber, which the client caches for its polling interval.
+  const coreDeployBlock = (await publicClient.getBlock()).number;
   const core = await deploy(accounts.deployer, 'OspexBetting.sol', 'OspexBetting', [games, coin]);
   const markets = await deploy(accounts.deployer, 'OspexMarkets.sol', 'OspexMarkets', [core]);
   const positions = await deploy(accounts.deployer, 'OspexPositions.sol', 'OspexPositions', [core]);
@@ -242,27 +259,38 @@ export async function startRig(): Promise<Rig> {
   // pay the creation fee.
   const coinAbi = abis.TestCoin as Abi;
   const matchingAbi = abis.OspexMatching as Abi;
-  for (const who of [accounts.maker, accounts.taker]) {
+  const fund = async (who: HDAccount): Promise<void> => {
+    // anvil gives ether to its first ten accounts only; any other needs some to pay for its own transactions.
+    await rpc('anvil_setBalance', [who.address, `0x${(100n * 10n ** 18n).toString(16)}`]);
     await write(accounts.deployer, coin, coinAbi, 'mint', [who.address, PURSE]);
     await write(who, coin, coinAbi, 'approve', [positions, 2n ** 256n - 1n]);
     await write(who, matching, matchingAbi, 'registerCourier', [relay]);
-  }
+  };
+  for (const who of [accounts.maker, accounts.taker]) await fund(who);
   await write(accounts.deployer, coin, coinAbi, 'mint', [accounts.creator.address, PURSE]);
   await write(accounts.creator, coin, coinAbi, 'approve', [games, 2n ** 256n - 1n]);
 
   // One game, its start written by the first-n reporter: a game the courier carries.
   const gamesAbi = abis.OspexGames as Abi;
-  const now = (await publicClient.getBlock()).timestamp;
-  const date = now + 86_400n;
-  await write(accounts.creator, games, gamesAbi, 'createGame', ['nba', 'Detroit Pistons', 'Washington Wizards', date, [{ seat: 3, id: 'g-77120' }, { seat: 1, id: '18432' }], TERMS.fee]);
-  const gameId = await read<bigint>(games, gamesAbi, 'gameCount');
   const readings = [
     { seat: 1, kind: 2, homeScore: 104, awayScore: 97 },
     { seat: 2, kind: 2, homeScore: 104, awayScore: 97 },
     { seat: 3, kind: 1, homeScore: 88, awayScore: 90 },
     { seat: 4, kind: 0, homeScore: 0, awayScore: 0 },
   ];
-  await write(accounts.deployer, reporter, abis.MockReporter as Abi, 'send', [{ gameId, kind: 1, start: date + 613n, homeScore: 0, awayScore: 0, readings, payout: '0x0000000000000000000000000000000000000000' }]);
+  let gamesMade = 0;
+  const createGame = async (options: { startWritten?: boolean } = {}): Promise<bigint> => {
+    const now = (await publicClient.getBlock()).timestamp;
+    const date = now + 86_400n;
+    const n = ++gamesMade;
+    await write(accounts.creator, games, gamesAbi, 'createGame', ['nba', `Home ${n}`, `Away ${n}`, date, [{ seat: 3, id: `g-${77_120 + n}` }, { seat: 1, id: String(18_432 + n) }], TERMS.fee]);
+    const id = await read<bigint>(games, gamesAbi, 'gameCount');
+    if (options.startWritten !== false) {
+      await write(accounts.deployer, reporter, abis.MockReporter as Abi, 'send', [{ gameId: id, kind: 1, start: date + 613n, homeScore: 0, awayScore: 0, readings, payout: '0x0000000000000000000000000000000000000000' }]);
+    }
+    return id;
+  };
+  const gameId = await createGame();
 
   // Enough blocks behind the head for a read 50 back.
   await rpc('anvil_mine', ['0x3c']);
@@ -289,6 +317,17 @@ export async function startRig(): Promise<Rig> {
     },
     throughTimelock,
     wallet,
+    write,
+    read,
+    account,
+    fund,
+    async setNextBlockTime(time) {
+      await rpc('evm_setNextBlockTimestamp', [Number(time)]);
+    },
+    async time() {
+      return (await publicClient.getBlock()).timestamp;
+    },
+    createGame,
     async close() {
       anvil.process.kill();
       await new Promise<void>((resolve) => {

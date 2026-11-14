@@ -4,7 +4,8 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { promisify } from 'node:util';
-import { connectionSettings, databaseRefusal, errorCode, failureCode, isCertificateFailure, openPool, pinnedAuthority, StoreRefused } from '../courier/records/store';
+import pg from 'pg';
+import { connectionSettings, databaseRefusal, errorCode, failureCode, isCertificateFailure, openPool, pinnedAuthority, POOL_WAIT_EXHAUSTED, StoreRefused } from '../courier/records/store';
 import { testServer } from './support/database';
 import { makeAuthorities, startTlsFront, type TestAuthorities, type TlsFront } from './support/tls';
 
@@ -140,6 +141,23 @@ test('the release step connects through the same function: applied with the righ
       return true;
     },
   );
+});
+
+test("a pool's wait for a connection that runs out is the driver's own codeless message, which the routes read as the database being unavailable", async () => {
+  // One connection, a short wait: a second connect() while the first client is held waits the whole wait and fails.
+  const pool = new pg.Pool({ ...connectionSettings(database.url, null, 1), connectionTimeoutMillis: 200 });
+  const held = await pool.connect();
+  try {
+    await assert.rejects(pool.connect(), (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.equal(failureCode(err), undefined, 'no code: the message is what tells it');
+      assert.match(err.message, POOL_WAIT_EXHAUSTED);
+      return true;
+    });
+  } finally {
+    held.release();
+    await pool.end();
+  }
 });
 
 test('the failure helpers find a code down a cause chain and show nothing else', () => {
