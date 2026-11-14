@@ -58,7 +58,7 @@ interface Line {
 }
 
 async function lines(where = ''): Promise<Line[]> {
-  const { rows } = await pool.query<Line>(`SELECT kind, order_hash, account, game_id::text AS game_id, reason, facts FROM events ${where} ORDER BY number`);
+  const { rows } = await pool.query<Line>(`SELECT kind, order_hash, account, game_id, reason, facts FROM events ${where} ORDER BY number`);
   return rows;
 }
 
@@ -375,7 +375,7 @@ test('the game rule: not a game is UNKNOWN_GAME; no written start is NO_WRITTEN_
   ]);
   const carried = await postOrder(url(), rig, maker, 'rest', orderOn(rig, maker, { expiry: T + 600n, gameId: unwritten }));
   assert.equal(carried.status, 201, JSON.stringify(carried.body));
-  const written = (await pool.query('SELECT start::text AS start, start_unreadable_at FROM games WHERE game_id = $1', [unwritten.toString()])).rows[0] as Record<string, unknown>;
+  const written = (await pool.query('SELECT start, start_unreadable_at FROM games WHERE game_id = $1', [unwritten.toString()])).rows[0] as Record<string, unknown>;
   assert.equal(written.start, (date + 613n).toString());
   assert.equal(written.start_unreadable_at, null);
 
@@ -771,7 +771,9 @@ test("the door's page is the sixteen with the newest expiry, by the numbers: a p
   const posted = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...market }));
   assert.equal(posted.status, 201, JSON.stringify(posted.body));
   const { rows } = await pool.query<{ record_number: string; ended: string | null }>(
-    `SELECT record_number::text AS record_number, ended FROM orders WHERE account = $1 AND record_number BETWEEN 9990 AND 10015 ORDER BY record_number`,
+    // Read with no cast, so this ORDER BY is the column's, the numbers': cast to text and named after the column, the
+    // output would have taken the bare name, and the rows would have come back in the text's order.
+    `SELECT record_number, ended FROM orders WHERE account = $1 AND record_number BETWEEN 9990 AND 10015 ORDER BY record_number`,
     [who.address.toLowerCase()],
   );
   assert.deepEqual(rows.filter((r) => r.ended === 'cancelled').map((r) => Number(r.record_number)), Array.from({ length: 16 }, (_, i) => 10_000 + i), 'the sixteen under the floor are marked');

@@ -95,8 +95,9 @@ const bookRead = (url: string) => get(url, `/v1/book?gameId=${stack.rig.gameId}`
 async function conditionLines(): Promise<Array<{ number: number; kind: string; run: number }>> {
   const pool = openPool(stack.databaseUrl, null);
   try {
-    // The order is the column's, a number, named with its table: a bare `ORDER BY number` would be the output column, text.
-    const { rows } = await pool.query<{ number: string; kind: string; run: string }>("SELECT e.number::text AS number, e.kind, e.run::text AS run FROM events e WHERE e.kind IN ('condition opened', 'condition cleared') AND e.reason = 'chain-unreachable' ORDER BY e.number");
+    // The order is the column's, a number, named with its table; and the numbers are read with no cast, so no output
+    // is a text a bare ORDER BY could take for the column.
+    const { rows } = await pool.query<{ number: string; kind: string; run: string }>("SELECT e.number, e.kind, e.run FROM events e WHERE e.kind IN ('condition opened', 'condition cleared') AND e.reason = 'chain-unreachable' ORDER BY e.number");
     const { rows: orphans } = await pool.query("SELECT e.number FROM events e LEFT JOIN conditions c ON c.opened_line = e.number OR c.cleared_line = e.number WHERE e.kind IN ('condition opened', 'condition cleared') AND c.id IS NULL");
     assert.deepEqual(orphans, [], "every opening and clearing line is a row's: the line and the row change together");
     const { rows: disordered } = await pool.query('SELECT id FROM conditions WHERE cleared_at < opened_at');
@@ -622,10 +623,12 @@ test('one writer for every write: a writer stopped between its recheck and its w
 async function conditionRows(): Promise<Array<Record<string, string | null>>> {
   const pool = openPool(stack.databaseUrl, null);
   try {
-    // The order is the table's column, a number: a bare `ORDER BY id` would be the output column, text, and past nine
-    // rows the last row by text is not the newest.
+    // The order is the table's column, a number, named with the table: a bare `ORDER BY id` would be the output
+    // column, and past nine rows the last row by text is not the newest. The ids and the line numbers are read with no
+    // cast (the driver hands a bigint over as text); the times, the version and the facts are cast to text so that
+    // every microsecond and every byte is compared, and a cast of a column is an output named after the column.
     const { rows } = await pool.query<Record<string, string | null>>(
-      'SELECT id::text AS id, xmin::text AS version, key, opened_at::text AS opened_at, opened_line::text AS opened_line, cleared_at::text AS cleared_at, cleared_line::text AS cleared_line, facts::text AS facts FROM conditions ORDER BY conditions.id',
+      'SELECT id, xmin::text AS version, key, opened_at::text, opened_line, cleared_at::text, cleared_line, facts::text FROM conditions ORDER BY conditions.id',
     );
     return rows;
   } finally {

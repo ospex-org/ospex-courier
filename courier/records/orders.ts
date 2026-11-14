@@ -96,10 +96,13 @@ export interface ScanResult {
   last: Cursor | null;
 }
 
-const ORDER_COLUMNS = `hash, role, account, game_id::text AS game_id, scorer, line_ticks, position_type, odds_tick, risk_amount::text AS risk_amount,
-  nonce::text AS nonce, expiry::text AS expiry, min_fill::text AS min_fill, signature, market_key, side, record_number::text AS record_number,
-  received_at, received_block::text AS received_block, received_hash, received_time::text AS received_time, ended, ended_at,
-  ended_block::text AS ended_block, ended_block_hash, bet_state`;
+// The columns as they are, no cast: the driver hands a numeric or a bigint over as the text the database sends, so the
+// caller receives the same string a `::text` would give, and no output here is a text that shares a column's name,
+// which is what a bare ORDER BY would take for the column.
+const ORDER_COLUMNS = `hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount,
+  nonce, expiry, min_fill, signature, market_key, side, record_number,
+  received_at, received_block, received_hash, received_time, ended, ended_at,
+  ended_block, ended_block_hash, bet_state`;
 
 function toRow(r: Record<string, unknown>): OrderRow {
   return {
@@ -324,9 +327,9 @@ export function createOrders(pool: pg.Pool): Orders {
     async quotesOfAccount(on, account, marketKey, side, blockTime) {
       const { rows } = await on.query<{ hash: Hex; expiry: string; risk_amount: string; nonce: string; record_number: string }>(
         // Ordered by the table's own columns, named with the table: a bare name in ORDER BY that an output column
-        // shares is the output column, and here the outputs are the numbers cast to text, whose order is not the
-        // numbers' once they differ in digits.
-        `SELECT o.hash, o.expiry::text AS expiry, o.risk_amount::text AS risk_amount, o.nonce::text AS nonce, o.record_number::text AS record_number FROM orders o
+        // shares is the output column. The numbers are read with no cast (the driver hands a numeric or a bigint over
+        // as text), so no output here is a text whose order is not the numbers'.
+        `SELECT o.hash, o.expiry, o.risk_amount, o.nonce, o.record_number FROM orders o
          WHERE o.role = 'rest' AND o.ended IS NULL AND o.account = $1 AND o.market_key = $2 AND o.side = $3 AND o.expiry > $5::numeric
          ORDER BY o.expiry DESC, o.record_number DESC LIMIT $4`,
         [account.toLowerCase(), marketKey.toLowerCase(), side, BOUNDS.liveQuotesPerAccountSideMarket + 1, (blockTime + 1n).toString()],

@@ -70,7 +70,7 @@ test("a registered account's requests, each different and each failing a later c
   const answers = await many(240, 8, (i, headers) => postOrder(url(), rig, maker, 'rest', orderOn(rig, maker, { expiry: T - BigInt(i) }), headers));
   assert.equal(answers.filter((a) => a.body.code === 'EXPIRED').length, 240, JSON.stringify(answers.find((a) => a.body.code !== 'EXPIRED')?.body));
   assert.equal(await count(`SELECT count(*)::int AS n FROM events WHERE kind = 'order refused'`), linesBefore + 240, 'one line each');
-  const rowsNow = (await pool.query(`SELECT account, budget::text AS budget, floor(extract(epoch FROM budget_at))::bigint::text AS at, refused FROM accounts ORDER BY account`)).rows;
+  const rowsNow = (await pool.query(`SELECT account, budget, floor(extract(epoch FROM budget_at))::bigint::text AS at, refused FROM accounts ORDER BY account`)).rows;
   const over = await postOrder(url(), rig, maker, 'rest', orderOn(rig, maker, { expiry: T - 500n }));
   assert.equal(over.status, 429, `${JSON.stringify(over.body)}; T ${T}; rows ${JSON.stringify(rowsNow)}; chain ${await rig.time()}`);
   assert.equal(over.body.code, 'RATE_LIMIT_EXCEEDED');
@@ -78,13 +78,13 @@ test("a registered account's requests, each different and each failing a later c
   assert.match(String(over.body.error), /This account has used its budget of admitted requests \(240 at once, 12 a minute after\)/);
   assert.ok(Number(over.headers.get('retry-after')) >= 1);
   assert.equal(await count(`SELECT count(*)::int AS n FROM events WHERE kind = 'order refused'`), linesBefore + 240, 'a refusal over the budget is not a line');
-  const row = (await pool.query('SELECT budget::text AS budget, refused::int AS refused, last_refused_at FROM accounts WHERE account = $1', [maker.address.toLowerCase()])).rows[0] as Record<string, unknown>;
+  const row = (await pool.query('SELECT budget, refused::int, last_refused_at FROM accounts WHERE account = $1', [maker.address.toLowerCase()])).rows[0] as Record<string, unknown>;
   assert.equal(row.refused, 1);
   assert.ok(row.last_refused_at instanceof Date);
   assert.ok(Number(row.budget) < 1);
   for (let i = 0; i < 5; i++) assert.equal((await postOrder(url(), rig, maker, 'rest', orderOn(rig, maker, { expiry: T - 600n - BigInt(i) }))).status, 429);
-  assert.equal(Number((await pool.query('SELECT refused::int AS refused FROM accounts WHERE account = $1', [maker.address.toLowerCase()])).rows[0].refused), 6, 'the count rises; a number, not a line');
-  const courier = (await pool.query(`SELECT budget::text AS budget FROM accounts WHERE account = 'courier'`)).rows[0] as { budget: string };
+  assert.equal(Number((await pool.query('SELECT refused::int FROM accounts WHERE account = $1', [maker.address.toLowerCase()])).rows[0].refused), 6, 'the count rises; a number, not a line');
+  const courier = (await pool.query(`SELECT budget FROM accounts WHERE account = 'courier'`)).rows[0] as { budget: string };
   assert.ok(Number(courier.budget) <= 2_400 - 240, 'each admitted request took one from the courier\'s budget too');
 });
 
@@ -139,7 +139,7 @@ test("the budget's clock never goes back: a request that read an older block tha
   // At T1 + 60 again: the minute does not refill twice.
   const again = await many(12, 8, (i, headers) => postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T1 - 500n - BigInt(i) }), headers));
   assert.equal(again.filter((a) => a.status === 429).length, 12, `admitted again: ${JSON.stringify(again.filter((a) => a.status !== 429).map((a) => a.body))}`);
-  const row = (await pool.query<{ refused: number }>('SELECT refused::int AS refused FROM accounts WHERE account = $1', [who.address.toLowerCase()])).rows[0];
+  const row = (await pool.query<{ refused: number }>('SELECT refused::int FROM accounts WHERE account = $1', [who.address.toLowerCase()])).rows[0];
   assert.equal(row?.refused, 14, 'the thirteenth, the stale one and the twelve: a number, not a line');
 });
 
@@ -164,7 +164,7 @@ test("the courier's budget: 2,400 admitted at once after a quiet hour, then 60 a
   assert.equal(next.status, 429, JSON.stringify(next.body));
   assert.equal(next.body.budget, 'courier', 'the courier\'s bucket, not the account\'s');
   assert.match(String(next.body.error), /The courier has used its budget of admitted requests for all accounts together \(2,400 at once, 60 a minute after\)/);
-  const courierRow = (await pool.query(`SELECT refused::int AS refused FROM accounts WHERE account = 'courier'`)).rows[0] as { refused: number };
+  const courierRow = (await pool.query(`SELECT refused::int FROM accounts WHERE account = 'courier'`)).rows[0] as { refused: number };
   assert.equal(courierRow.refused, 1);
 
   // A minute later on the chain's clock, exactly: a mined block's time follows the wall clock plus the offset, and
