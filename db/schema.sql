@@ -296,11 +296,14 @@ CREATE OR REPLACE TRIGGER events_no_truncate
 -- ──────────────────────────── conditions ──────────────────────────────────
 -- The standing conditions of the reports: a key, when it opened and the line
 -- that says so, when it cleared and that line, and the facts. One condition
--- of a key is open at a time; a key that opens again is a new row. The
--- instants are the outcomes' own, as the records place them on this
--- database's clock (the moment the chain was last seen failing, the moment it
--- answered again), not the moment the row was written; the line's `at` is
--- that.
+-- of a key is open at a time; a key that opens again is a new row. A row open
+-- means the last decision the records made for the key was an opening; a row
+-- cleared means it was a clearing. The records apply outcomes in the order
+-- they process them, not in the order the chain was observed, and neither an
+-- open row nor a cleared one says the chain is up or down this instant. The
+-- times here, and a line's `at`, are the writing transaction's time: they are
+-- diagnostics, not the order the chain was observed in, and no time decides a
+-- transition.
 CREATE TABLE IF NOT EXISTS conditions (
   id           bigserial PRIMARY KEY,
   key          text NOT NULL CHECK (key IN (
@@ -316,14 +319,6 @@ CREATE TABLE IF NOT EXISTS conditions (
 CREATE UNIQUE INDEX IF NOT EXISTS conditions_one_open_per_key
   ON conditions (key)
   WHERE cleared_at IS NULL;
-
--- While a condition stands open, the newest failure after its opening: its instant, its facts and its run. A read
--- that succeeded after the opening but before that failure then clears the condition and opens it again from that
--- failure, in one transaction, so the records show the recovery and the outage that went on, in that order. Added
--- below the CREATE, as the header says, so a database made before these columns has them too.
-ALTER TABLE conditions ADD COLUMN IF NOT EXISTS failed_at timestamptz;
-ALTER TABLE conditions ADD COLUMN IF NOT EXISTS failed_facts jsonb;
-ALTER TABLE conditions ADD COLUMN IF NOT EXISTS failed_run bigint REFERENCES runs (id);
 
 -- ──────────────────────────── accounts ────────────────────────────────────
 -- One row for each account that was ever admitted: its budget, a bucket and

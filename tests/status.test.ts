@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import { connect } from 'node:net';
-import { performance } from 'node:perf_hooks';
 import { after, before, test } from 'node:test';
+import type pg from 'pg';
 import { decodeFunctionData, decodeFunctionResult, encodeFunctionResult, type Hex } from 'viem';
 import { MULTICALL_ABI, MULTICALL_ADDRESS } from '../courier/chain/abi';
+import type { JsonRpc } from '../courier/chain/rpc';
+import { createChainReader } from '../courier/chain/snapshot';
+import { createAddressLimiter, createCounters } from '../courier/http/limits';
+import { createRequestHandler, type ServiceDeps } from '../courier/http/service';
 import { createConditions, type Conditions } from '../courier/records/conditions';
 import { openPool } from '../courier/records/store';
 import { get, startCourier } from './support/courier';
@@ -11,9 +16,11 @@ import { orderOn, postOrder } from './support/orders';
 import { startStack, type Stack } from './support/stack';
 
 // The status address and the conditions it can see in this build: the chain
-// unreachable, opened after a read fails twice and cleared by the next that
-// succeeds, whichever process makes it, each a numbered line; the database
-// stopped, answered 503 and nothing claimed; and the one caller's minute.
+// unreachable, opened when the records process a read that failed and failed
+// again on its one retry, cleared when they next process a usable read that
+// succeeded while it is open, each a numbered line, outcomes applied in the
+// order the records process them; the database stopped, answered 503 and
+// nothing claimed; and the one caller's minute.
 
 let stack: Stack;
 
@@ -72,7 +79,7 @@ test('a chain read that fails twice opens chain-unreachable, with a line; the ne
   }
 });
 
-// ──────────────── the condition across processes: the next read that succeeds clears it, whichever process makes it ────────────────
+// ──────────────── the condition across processes: the next read the records process that succeeds clears it, whichever process makes it ────────────────
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const conditionsOf = async (url: string) => (await get(url, '/v1/status')).body.conditions as Array<{ key: string; openedLine: number }>;
@@ -82,8 +89,8 @@ const bookRead = (url: string) => get(url, `/v1/book?gameId=${stack.rig.gameId}`
 /**
  * The lines of the condition's openings and clearings as the records hold them, in order, each with its number and
  * the run it is under; and, every time they are read, that the lines and the rows agree: every such line is a row's
- * opening or clearing line (the line and the row change together, or neither does), and no row's instants are out of
- * order (its clearing and its remembered failure are not before its opening).
+ * opening or clearing line (the line and the row change together, or neither does), and no row is cleared before it
+ * opened.
  */
 async function conditionLines(): Promise<Array<{ number: number; kind: string; run: number }>> {
   const pool = openPool(stack.databaseUrl, null);
@@ -92,8 +99,8 @@ async function conditionLines(): Promise<Array<{ number: number; kind: string; r
     const { rows } = await pool.query<{ number: string; kind: string; run: string }>("SELECT e.number::text AS number, e.kind, e.run::text AS run FROM events e WHERE e.kind IN ('condition opened', 'condition cleared') AND e.reason = 'chain-unreachable' ORDER BY e.number");
     const { rows: orphans } = await pool.query("SELECT e.number FROM events e LEFT JOIN conditions c ON c.opened_line = e.number OR c.cleared_line = e.number WHERE e.kind IN ('condition opened', 'condition cleared') AND c.id IS NULL");
     assert.deepEqual(orphans, [], "every opening and clearing line is a row's: the line and the row change together");
-    const { rows: disordered } = await pool.query('SELECT id FROM conditions WHERE cleared_at < opened_at OR failed_at < opened_at');
-    assert.deepEqual(disordered, [], "no row's clearing or remembered failure is placed before its opening");
+    const { rows: disordered } = await pool.query('SELECT id FROM conditions WHERE cleared_at < opened_at');
+    assert.deepEqual(disordered, [], 'no row is cleared before it opened');
     return rows.map((r) => ({ number: Number(r.number), kind: r.kind, run: Number(r.run) }));
   } finally {
     await pool.end();
@@ -153,7 +160,7 @@ test('two processes read successfully at once while the condition stands open: o
       const before = await conditionLines();
       await openOn(round % 2 === 1 ? a : b);
       // Both reads held at their first request of the chain until both have arrived there, then released together,
-      // so the two settle as near to at once as the test can make them.
+      // so the two reach the records as near to at once as the test can make them.
       const held = stack.proxy.hold('eth_getBlockByNumber');
       const arrived = stack.proxy.count('eth_getBlockByNumber');
       const reads = Promise.all([bookRead(a), bookRead(b)]);
@@ -196,7 +203,7 @@ test("a deploy's overlap: a process that started while the condition was closed 
   }
 });
 
-// ──────────────── the condition's lifecycle: the records decide, on the order of the opening and the read ────────────────
+// ──────────────── the condition's lifecycle: four cases, one writer, the records' own order ────────────────
 
 const marketRead = (url: string) => get(url, `/v1/book?gameId=${stack.rig.gameId}&scorer=${stack.rig.addresses.moneyline}&lineTicks=0&side=A`);
 
@@ -217,7 +224,19 @@ async function closedAtTheStart(): Promise<void> {
   assert.deepEqual(await conditionsOf(stack.courier.url), [], 'the condition is closed at the start');
 }
 
-test("the attack's sequence: a read that succeeded at the chain and then failed to decode (500) leaves nothing for a later request; another process's opening stands through the first process's status read and through the opener's next failed read", async () => {
+/**
+ * The node's answer to the quotes' read with its envelope whole and its block probes true, and every return data
+ * after them one byte that decodes as nothing: an answer the read cannot use.
+ */
+function withReturnDataGarbled(params: unknown[], result: unknown): unknown {
+  const call = params[0] as { to?: string; data?: Hex } | undefined;
+  if (typeof result !== 'string' || call?.to?.toLowerCase() !== MULTICALL_ADDRESS.toLowerCase() || call.data === undefined) return result;
+  if (decodeFunctionData({ abi: MULTICALL_ABI, data: call.data }).functionName !== 'aggregate3') return result;
+  const answers = [...(decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', data: result as Hex }) as ReadonlyArray<{ success: boolean; returnData: Hex }>)];
+  return encodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', result: answers.map((a, i) => (i < 3 ? a : { success: true, returnData: '0x01' as Hex })) });
+}
+
+test("an answer the read cannot use, twice, is the chain unreachable: with an opening made after this request's own good headers, the market page is 503 CHAIN_UNREACHABLE, the quotes' read was made twice, and the condition stands", async () => {
   await closedAtTheStart();
   const a = stack.courier.url;
   const second = await startCourier(stack.env);
@@ -225,44 +244,82 @@ test("the attack's sequence: a read that succeeded at the chain and then failed 
     const b = second.url;
     await quoteOnTheMarket(a);
     const before = await conditionLines();
-    // 1. On A, the chain answers the market page's read with bytes that do not decode: a success at the chain, a 500 at the route.
-    stack.proxy.rule('eth_call', { kind: 'rewriteResult', result: withReturnDataGarbled });
-    let garbled;
-    try {
-      garbled = await marketRead(a);
-    } finally {
-      stack.proxy.rule('eth_call', null);
-    }
-    assert.equal(garbled.status, 500, JSON.stringify(garbled.body));
-    assert.equal(garbled.body.code, 'INTERNAL_ERROR');
-    assert.deepEqual((await conditionLines()).slice(before.length), [], 'nothing was open, so the 500 wrote nothing');
-    // 2. The node refuses from now on. B's read fails twice and opens the condition.
-    stack.proxy.rule('eth_getBlockByNumber', { kind: 'refuse', code: -32000, message: 'held for the test' });
-    try {
-      const refused = await bookRead(b);
-      assert.equal(refused.status, 503, JSON.stringify(refused.body));
-      assert.equal((await conditionsOf(b)).length, 1, 'B opened it');
-      // 3. A's status read, which reads no chain: it lists the condition, and so does the status read after it. The
-      // success of step 1 was its own request's, settled when that request ended, and is not here to clear anything.
-      assert.equal((await conditionsOf(a)).length, 1, "A's status lists it");
-      assert.equal((await conditionsOf(a)).length, 1, "A's next status still lists it: the stale success of the 500 cleared nothing");
-      assert.equal((await conditionsOf(b)).length, 1, 'B lists it still');
-      assert.deepEqual((await conditionLines()).slice(before.length).map((l) => l.kind), ['condition opened'], 'one opening, and no clearing');
-      // 4. B's next read fails twice again: still listed, and nothing more written.
-      assert.equal((await bookRead(b)).status, 503);
-      assert.equal((await conditionsOf(b)).length, 1, "B lists it after its next failed read");
-      assert.equal((await conditionsOf(a)).length, 1);
-      assert.deepEqual((await conditionLines()).slice(before.length).map((l) => l.kind), ['condition opened'], 'one outage, one opening line');
-    } finally {
-      stack.proxy.rule('eth_getBlockByNumber', null);
-    }
-    // The node honest again: the next read that succeeds, on either process, clears it.
-    assert.equal((await bookRead(a)).status, 200);
+    // A's market read: its two headers read and good, then its quotes' read held at the proxy.
+    const held = stack.proxy.hold('eth_call');
+    const arrived = stack.proxy.count('eth_call');
+    const reading = marketRead(a);
+    await held.arrived;
+    assert.equal(stack.proxy.count('eth_call'), arrived + 1, "A's quotes' read is at the chain, held; its headers were read before it");
+    // B's read fails twice meanwhile and opens the condition: an opening after A's good headers.
+    await openOn(b);
+    assert.equal((await conditionsOf(b)).length, 1, "B opened it after A's headers");
+    // A's quotes' read is answered now with bytes that do not decode, and so is its one retry.
+    held.release({ kind: 'rewriteResult', result: withReturnDataGarbled });
+    const answer = await reading;
+    stack.proxy.rule('eth_call', null);
+    assert.equal(answer.status, 503, JSON.stringify(answer.body));
+    assert.equal(answer.body.code, 'CHAIN_UNREACHABLE');
+    assert.equal(stack.proxy.count('eth_call'), arrived + 2, 'tried once more, and no more');
+    assert.equal((await conditionsOf(a)).length, 1, 'the opening stands: an answer the read cannot use is not a read that succeeded');
+    assert.deepEqual((await conditionLines()).slice(before.length).map((l) => l.kind), ['condition opened'], 'open and a failure: nothing written');
+    // The node honest again: the next usable read clears it.
+    const served = await marketRead(a);
+    assert.equal(served.status, 200, JSON.stringify(served.body));
     assert.deepEqual(await conditionsOf(a), []);
     assert.deepEqual(await conditionsOf(b), []);
     const lines = await conditionLines();
     assert.deepEqual(lines.slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared']);
-    assert.equal(lines[lines.length - 1]?.run, await runOf(a), "the clearing is the run of the read that succeeded after the opening");
+    assert.equal(lines[lines.length - 1]?.run, await runOf(a), "the clearing is A's, the usable read's");
+  } finally {
+    stack.proxy.clear();
+    await second.stop();
+  }
+});
+
+test("an answer the read cannot use, once, then a usable retry: the page is served, the quotes' read was made twice, and nothing is opened or written", async () => {
+  await closedAtTheStart();
+  const a = stack.courier.url;
+  await quoteOnTheMarket(a);
+  const before = await conditionLines();
+  const arrived = stack.proxy.count('eth_call');
+  let answered = 0;
+  stack.proxy.rule('eth_call', { kind: 'rewriteResult', result: (params, result) => (answered++ === 0 ? withReturnDataGarbled(params, result) : result) });
+  let answer;
+  try {
+    answer = await marketRead(a);
+  } finally {
+    stack.proxy.rule('eth_call', null);
+  }
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.equal(stack.proxy.count('eth_call'), arrived + 2, 'the first answer was unusable, the one retry was good');
+  assert.equal(answered, 2, 'the proxy garbled the first and passed the second');
+  assert.deepEqual(await conditionsOf(a), [], 'a read that succeeded on its retry opens nothing');
+  assert.deepEqual((await conditionLines()).slice(before.length), [], 'and writes nothing');
+});
+
+test('an allowed negative is a usable read: a quote for a game the set does not know is refused 422 UNKNOWN_GAME and opens nothing; with the condition open, the same refusal clears it', async () => {
+  await closedAtTheStart();
+  const a = stack.courier.url;
+  const second = await startCourier(stack.env);
+  try {
+    const rig = stack.rig;
+    const T = await rig.time();
+    const before = await conditionLines();
+    const refused = await postOrder(a, rig, rig.accounts.maker, 'rest', orderOn(rig, rig.accounts.maker, { expiry: T + 600n, gameId: 999_999_999n }));
+    assert.equal(refused.status, 422, JSON.stringify(refused.body));
+    assert.equal(refused.body.code, 'UNKNOWN_GAME');
+    assert.deepEqual(await conditionsOf(a), [], "the set's refusal of the game is an answer the read can use: nothing opened");
+    assert.deepEqual((await conditionLines()).slice(before.length), [], 'and nothing written');
+    // The condition open, by another process: the same refused post is a usable read, and clears it.
+    await openOn(second.url);
+    assert.equal((await conditionsOf(a)).length, 1);
+    const again = await postOrder(a, rig, rig.accounts.maker, 'rest', orderOn(rig, rig.accounts.maker, { expiry: T + 600n, gameId: 999_999_999n }));
+    assert.equal(again.status, 422, JSON.stringify(again.body));
+    assert.equal(again.body.code, 'UNKNOWN_GAME');
+    assert.deepEqual(await conditionsOf(a), [], 'the read that carried the refusal was usable: it cleared the condition');
+    const lines = await conditionLines();
+    assert.deepEqual(lines.slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared']);
+    assert.equal(lines[lines.length - 1]?.run, await runOf(a), "the clearing is A's, the refused post's read");
   } finally {
     await second.stop();
   }
@@ -296,7 +353,7 @@ test("B opens, A's later read that succeeds clears, and the node refuses again: 
   }
 });
 
-test("a read held at the chain until after another process's opening, then answered: it clears the opening, since it succeeded after it", async () => {
+test("a read begun before another process's opening and answered after it clears the opening: its success is processed while the condition is open", async () => {
   await closedAtTheStart();
   const a = stack.courier.url;
   const second = await startCourier(stack.env);
@@ -308,12 +365,12 @@ test("a read held at the chain until after another process's opening, then answe
     const held = stack.proxy.hold('eth_call');
     const arrived = stack.proxy.count('eth_call');
     const reading = marketRead(a);
-    for (let i = 0; i < 300 && stack.proxy.count('eth_call') < arrived + 1; i++) await sleep(10);
+    await held.arrived;
     assert.equal(stack.proxy.count('eth_call'), arrived + 1, "A's read is at the chain, held");
     // B's read fails twice meanwhile and opens the condition.
     await openOn(b);
-    assert.equal((await conditionsOf(b)).length, 1, 'B opened it while A\'s read was held');
-    // A's read is answered now: a success after the opening. It clears.
+    assert.equal((await conditionsOf(b)).length, 1, "B opened it while A's read was held");
+    // A's read is answered now and succeeds; the records process it while the condition is open. It clears.
     held.release();
     const served = await reading;
     assert.equal(served.status, 200, JSON.stringify(served.body));
@@ -328,47 +385,13 @@ test("a read held at the chain until after another process's opening, then answe
   }
 });
 
-test("a request that ends in the catch-all settles its read's outcome itself: the clearing is written before the request ends, and a later request writes nothing more", async () => {
-  await closedAtTheStart();
-  const a = stack.courier.url;
-  const second = await startCourier(stack.env);
-  try {
-    const b = second.url;
-    await quoteOnTheMarket(a);
-    const before = await conditionLines();
-    await openOn(b);
-    assert.equal((await conditionsOf(b)).length, 1, 'B opened it');
-    // A's market read: the chain answers, after the opening, with bytes that do not decode. The chain was reached; the
-    // route failed; the answer is 500, through the catch-all.
-    stack.proxy.rule('eth_call', { kind: 'rewriteResult', result: withReturnDataGarbled });
-    let garbled;
-    try {
-      garbled = await marketRead(a);
-    } finally {
-      stack.proxy.rule('eth_call', null);
-    }
-    assert.equal(garbled.status, 500, JSON.stringify(garbled.body));
-    assert.equal(garbled.body.code, 'INTERNAL_ERROR');
-    // Read from the records, before any later request of A's: the clearing is there, written by A's run.
-    const lines = await conditionLines();
-    assert.deepEqual(lines.slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared'], 'the request answered 500 settled its own read before it ended: the chain was reached after the opening, so the condition is cleared');
-    assert.equal(lines[lines.length - 1]?.run, await runOf(a), "the clearing is A's, the run of the request answered 500");
-    // A later request on A writes nothing more.
-    assert.deepEqual(await conditionsOf(a), []);
-    assert.deepEqual(await conditionsOf(b), []);
-    assert.equal((await conditionLines()).length, lines.length, 'nothing more was written');
-  } finally {
-    await second.stop();
-  }
-});
-
 /**
- * Another process's side of the records: the conditions on a pool of the test's own, under a run of its own, so an
- * outcome learned at a chosen moment on this process's clock can be applied when the test says. What the courier's
- * reads do at once, this does late, which is the one way to hold an outcome between its moment and its statement.
+ * Another process's side of the records: the conditions on a pool of the test's own, under a run of its own, on the
+ * address given (straight to the database, or through the relay the test can hold), so an outcome can be applied when
+ * the test says and its statements held in transit.
  */
-async function recordsAs(): Promise<{ conditions: Conditions; run: number; close(): Promise<void> }> {
-  const pool = openPool(stack.databaseUrl, null);
+async function recordsAs(databaseUrl: string): Promise<{ conditions: Conditions; run: number; close(): Promise<void> }> {
+  const pool = openPool(databaseUrl, null);
   const { rows } = await pool.query<{ id: string }>('INSERT INTO runs DEFAULT VALUES RETURNING id');
   return { conditions: createConditions(pool), run: Number(rows[0]?.id), close: () => pool.end() };
 }
@@ -376,109 +399,188 @@ async function recordsAs(): Promise<{ conditions: Conditions; run: number; close
 const SUCCESS = { block: '7', hash: '0x0000000000000000000000000000000000000000000000000000000000000007' };
 const FAILURE = { kind: 'refused', code: -32000, method: 'eth_getBlockByNumber', first: { kind: 'refused', code: -32000, method: 'eth_getBlockByNumber' } };
 
-test("a success from before another process's opening clears nothing, however long its statement waited; one from after it clears; one from between a clearing and the next opening leaves that next opening open", async () => {
+test('the two reorderings the records allow, as the sentence states them: a success recorded late clears a failure observed after it, and a failure recorded late opens after a success observed after it', async () => {
   await closedAtTheStart();
   const a = stack.courier.url;
-  const other = await recordsAs();
+  const late = await recordsAs(stack.relayedUrl);
+  const prompt = await recordsAs(stack.databaseUrl);
   try {
     const before = await conditionLines();
-    // A read of the other process's succeeds now; its statement runs after A's opening below.
-    const stale = performance.now();
-    await sleep(20);
+    // 1. The condition open. A read of `late`'s succeeds and its statement is held in transit; a read of `prompt`'s
+    // fails twice after that and is recorded first: open and a failure, nothing. Then the success is recorded: it
+    // clears, though the failure was observed after it.
     await openOn(a);
-    assert.equal((await conditionsOf(a)).length, 1, 'A opened it');
-    assert.deepEqual(await other.conditions.applySuccess('chain-unreachable', SUCCESS, other.run, stale), { cleared: false, reopened: null }, 'a success from before the opening clears nothing, whenever its statement runs');
-    assert.equal((await conditionsOf(a)).length, 1, 'the opening stands');
-    assert.deepEqual((await conditionLines()).slice(before.length).map((l) => l.kind), ['condition opened']);
-    // A read of the other process's succeeds now, after the opening: its statement clears it.
-    assert.deepEqual(await other.conditions.applySuccess('chain-unreachable', SUCCESS, other.run, performance.now()), { cleared: true, reopened: null });
-    assert.deepEqual(await conditionsOf(a), [], 'the process that opened it lists it no more');
-    let lines = await conditionLines();
-    assert.deepEqual(lines.slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared']);
-    assert.equal(lines[lines.length - 1]?.run, other.run, 'the clearing is the run of the process whose read succeeded');
-    // A read succeeds between that clearing and the next opening; its statement runs after the next opening, which
-    // it leaves alone: the success is from before it.
-    const between = performance.now();
-    await sleep(20);
-    await openOn(a);
-    assert.equal((await conditionsOf(a)).length, 1, 'A opened it again');
-    assert.deepEqual(await other.conditions.applySuccess('chain-unreachable', SUCCESS, other.run, between), { cleared: false, reopened: null }, 'a success from before the next opening clears nothing of it');
-    assert.equal((await conditionsOf(a)).length, 1, 'the next opening stands');
-    lines = await conditionLines();
-    assert.deepEqual(lines.slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared', 'condition opened']);
-    // A's own read after that opening clears it.
-    assert.equal((await bookRead(a)).status, 200);
-    assert.deepEqual(await conditionsOf(a), []);
-    assert.deepEqual((await conditionLines()).slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared', 'condition opened', 'condition cleared']);
-  } finally {
-    await other.close();
-  }
-});
-
-test('a success while the condition stood open, overtaken by a newer failure before its statement ran: the records show the recovery and the outage that went on, a clearing then an opening under the failure\'s run, and the condition stands', async () => {
-  await closedAtTheStart();
-  const a = stack.courier.url;
-  const other = await recordsAs();
-  try {
-    const before = await conditionLines();
-    await openOn(a);
-    const opened = await conditionsOf(a);
-    assert.equal(opened.length, 1, 'A opened it');
-    // The other process's read succeeds now, while the condition stands open.
-    const success = performance.now();
-    await sleep(20);
-    // A's read fails twice again, after that success, and its statement runs first: no line, the failure remembered.
-    await openOn(a);
-    assert.deepEqual((await conditionLines()).slice(before.length).map((l) => l.kind), ['condition opened'], 'a failure while the condition stands open adds no line');
-    assert.deepEqual(await conditionsOf(a), opened, 'and the opening is the same one');
-    // The success's statement runs now. It was after the opening and before the failure: the recovery is recorded,
-    // and so is the outage that went on, from the remembered failure, under the run whose read failed.
-    const applied = await other.conditions.applySuccess('chain-unreachable', SUCCESS, other.run, success);
-    assert.equal(applied.cleared, true, 'the opening the success came after is cleared');
-    assert.equal(applied.reopened?.kind, 'refused', 'and the condition is opened again from the remembered failure');
-    const lines = await conditionLines();
-    assert.deepEqual(lines.slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared', 'condition opened']);
-    assert.equal(lines[lines.length - 2]?.run, other.run, 'the clearing is under the run whose read succeeded');
-    assert.equal(lines[lines.length - 1]?.run, await runOf(a), 'the new opening is under the run whose read failed after that success');
-    const standing = await conditionsOf(a);
-    assert.equal(standing.length, 1, 'the condition stands: the outage went on after the recovery');
-    assert.equal(standing[0]?.openedLine, lines[lines.length - 1]?.number, 'what stands is the new opening');
-    assert.notEqual(standing[0]?.openedLine, opened[0]?.openedLine);
-    // A's own read after that clears it.
-    assert.equal((await bookRead(a)).status, 200);
-    assert.deepEqual(await conditionsOf(a), []);
-    assert.deepEqual((await conditionLines()).slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared', 'condition opened', 'condition cleared']);
-  } finally {
-    await other.close();
-  }
-});
-
-test('a read that failed twice before a recovery, its statement running after it, opens nothing: the failure belonged to the outage that ended; a failure after the recovery opens a new one', async () => {
-  await closedAtTheStart();
-  const a = stack.courier.url;
-  const other = await recordsAs();
-  try {
-    const before = await conditionLines();
-    // The other process's read fails twice now; its statement runs after the opening and the clearing below.
-    const stale = performance.now();
-    await sleep(20);
-    await openOn(a);
-    assert.equal((await bookRead(a)).status, 200);
-    assert.deepEqual(await conditionsOf(a), [], 'A opened it and cleared it');
-    assert.deepEqual(await other.conditions.applyFailure('chain-unreachable', FAILURE, other.run, stale), { opened: false }, 'a failure from before the recovery opens nothing');
-    assert.deepEqual(await conditionsOf(a), []);
+    stack.dbRelay.hold();
+    const success = late.conditions.applySuccess('chain-unreachable', SUCCESS, late.run);
+    await sleep(100);
+    assert.deepEqual(await prompt.conditions.applyFailure('chain-unreachable', FAILURE, prompt.run), { opened: false }, 'open and a failure: nothing');
+    stack.dbRelay.release();
+    assert.deepEqual(await success, { cleared: true }, 'the success, processed after the failure, clears');
+    assert.deepEqual(await conditionsOf(a), [], 'closed: the last decision the records made was a clearing');
     assert.deepEqual((await conditionLines()).slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared']);
-    // A failure after the recovery is a new outage.
-    assert.deepEqual(await other.conditions.applyFailure('chain-unreachable', FAILURE, other.run, performance.now()), { opened: true });
-    assert.equal((await conditionsOf(a)).length, 1, 'A lists what the other process opened');
-    const lines = await conditionLines();
+    // 2. The condition closed. A read of `late`'s fails twice and its statement is held; a read of `prompt`'s succeeds
+    // after that and is recorded first: closed and a success, nothing. Then the failure is recorded: it opens, though
+    // the success was observed after it.
+    stack.dbRelay.hold();
+    const failure = late.conditions.applyFailure('chain-unreachable', FAILURE, late.run);
+    await sleep(100);
+    assert.deepEqual(await prompt.conditions.applySuccess('chain-unreachable', SUCCESS, prompt.run), { cleared: false }, 'closed and a success: nothing');
+    stack.dbRelay.release();
+    assert.deepEqual(await failure, { opened: true }, 'the failure, processed after the success, opens');
+    assert.equal((await conditionsOf(a)).length, 1, 'listed: the last decision the records made was an opening');
+    let lines = await conditionLines();
     assert.deepEqual(lines.slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared', 'condition opened']);
-    assert.equal(lines[lines.length - 1]?.run, other.run);
+    assert.equal(lines[lines.length - 1]?.run, late.run);
+    // The next read that succeeds clears it, as ever.
     assert.equal((await bookRead(a)).status, 200);
     assert.deepEqual(await conditionsOf(a), []);
+    lines = await conditionLines();
+    assert.deepEqual(lines.slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared', 'condition opened', 'condition cleared']);
   } finally {
-    await other.close();
+    stack.dbRelay.release();
+    await late.close();
+    await prompt.close();
   }
+});
+
+/**
+ * A pool whose clients can be stopped at one statement: once armed with a pattern, the first statement after the
+ * one matching it waits until released, the client holding whatever it holds (its locks, its transaction). The way
+ * to stand a writer still between its recheck and its write, or between its lookup and its transaction.
+ */
+function pausingPool(databaseUrl: string): { pool: pg.Pool; arm(after: RegExp): { reached: Promise<void>; release(): void }; end(): Promise<void> } {
+  const real = openPool(databaseUrl, null);
+  let plan: { after: RegExp; reached: () => void; held: Promise<void> } | null = null;
+  let pauseNext = false;
+  // Every statement of the writer's goes through here, the pool's own and its clients': the one after the match waits.
+  async function through(run: (...a: unknown[]) => unknown, args: unknown[]): Promise<unknown> {
+    const first = args[0];
+    const text = typeof first === 'string' ? first : ((first as { text?: string } | undefined)?.text ?? '');
+    if (pauseNext && plan !== null) {
+      pauseNext = false;
+      const p = plan;
+      plan = null;
+      p.reached();
+      await p.held;
+    }
+    if (plan !== null && plan.after.test(text)) pauseNext = true;
+    return run(...args);
+  }
+  const pool = {
+    async connect() {
+      const client = await real.connect();
+      const query = client.query.bind(client) as (...a: unknown[]) => unknown;
+      const stopped = Object.create(client) as pg.PoolClient;
+      stopped.query = ((...args: unknown[]) => through(query, args)) as pg.PoolClient['query'];
+      stopped.release = (...a: Parameters<pg.PoolClient['release']>) => client.release(...a);
+      return stopped;
+    },
+    query: (...args: unknown[]) => through(real.query.bind(real) as (...a: unknown[]) => unknown, args),
+  } as unknown as pg.Pool;
+  return {
+    pool,
+    arm(after) {
+      let reached = () => undefined as void;
+      let release = () => undefined as void;
+      const reachedPromise = new Promise<void>((r) => (reached = r));
+      const held = new Promise<void>((r) => (release = r));
+      plan = { after, reached, held };
+      // A writer that is never stopped where the test expects is a red assertion within five seconds, not a hang.
+      const reachedOrNot = Promise.race([
+        reachedPromise,
+        new Promise<void>((_, reject) => setTimeout(() => reject(new Error('the writer was not stopped at the statement the test expected')), 5_000).unref()),
+      ]);
+      return { reached: reachedOrNot, release: () => release() };
+    },
+    end: () => real.end(),
+  };
+}
+
+test('one writer for every write: a writer stopped between its recheck and its write holds the lock, and the writer behind it finds the condition cleared; one stopped between its lookup and its transaction rechecks and writes nothing; one clearing for one opening, every line a row\'s', async () => {
+  await closedAtTheStart();
+  const a = stack.courier.url;
+  const paused = pausingPool(stack.databaseUrl);
+  const prompt = await recordsAs(stack.databaseUrl);
+  const pool = openPool(stack.databaseUrl, null);
+  try {
+    const { rows } = await pool.query<{ id: string }>('INSERT INTO runs DEFAULT VALUES RETURNING id');
+    const run = Number(rows[0]?.id);
+    const stopped = createConditions(paused.pool);
+    const before = await conditionLines();
+    // 1. Stopped after its recheck (the row locked, under the key's lock), before its write. The other writer's
+    // clearing must wait behind it, then find the row cleared and write nothing.
+    await openOn(a);
+    let stop = paused.arm(/SELECT id FROM conditions WHERE key = \$1 AND cleared_at IS NULL/);
+    const first = stopped.applySuccess('chain-unreachable', SUCCESS, run);
+    await stop.reached;
+    const other = prompt.conditions.applySuccess('chain-unreachable', SUCCESS, prompt.run);
+    await sleep(150);
+    stop.release();
+    assert.deepEqual(await first, { cleared: true }, 'the stopped writer, resumed, clears: its recheck held');
+    assert.deepEqual(await other, { cleared: false }, 'the writer behind it finds the condition cleared and writes nothing');
+    assert.deepEqual(await conditionsOf(a), []);
+    let lines = await conditionLines();
+    assert.deepEqual(lines.slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared'], 'one clearing for one opening');
+    assert.equal(lines[lines.length - 1]?.run, run, 'the clearing is the stopped writer\'s');
+    // 2. Stopped between its lookup (the condition open) and its transaction. The other writer clears meanwhile; the
+    // stopped one, resumed, takes the lock, rechecks, finds nothing open and writes nothing.
+    await openOn(a);
+    stop = paused.arm(/SELECT 1 FROM conditions WHERE key = \$1 AND cleared_at IS NULL/);
+    const second = stopped.applySuccess('chain-unreachable', SUCCESS, run);
+    await stop.reached;
+    assert.deepEqual(await prompt.conditions.applySuccess('chain-unreachable', SUCCESS, prompt.run), { cleared: true }, 'the other writer clears while the first stands between its lookup and its transaction');
+    stop.release();
+    assert.deepEqual(await second, { cleared: false }, 'the stopped writer rechecks on fresh state and writes nothing: its lookup authorized no write');
+    assert.deepEqual(await conditionsOf(a), []);
+    lines = await conditionLines();
+    assert.deepEqual(lines.slice(before.length).map((l) => l.kind), ['condition opened', 'condition cleared', 'condition opened', 'condition cleared'], 'one clearing for each opening');
+    assert.equal(lines[lines.length - 1]?.run, prompt.run, 'the second clearing is the other writer\'s');
+  } finally {
+    await paused.end();
+    await prompt.close();
+    await pool.end();
+  }
+});
+
+test("a fault of the courier's own inside a read is no failure of the node's: thrown at once, not tried again, recorded as nothing; the node's failures are tried once more and recorded", async () => {
+  const header = { number: '0x10', hash: `0x${'1'.repeat(64)}`, parentHash: `0x${'2'.repeat(64)}`, timestamp: '0x5f' };
+  const applied: string[] = [];
+  const conditions = {
+    applyFailure: async () => {
+      applied.push('failure');
+      return { opened: true };
+    },
+    applySuccess: async () => {
+      applied.push('success');
+      return { cleared: false };
+    },
+    open_: async () => [],
+  } as unknown as Conditions;
+  // A node that answers the header, and the multicall's three block probes true to it; a read whose decoding of
+  // what came back is the courier's own fault, thrown as a plain error.
+  const probes = encodeFunctionResult({
+    abi: MULTICALL_ABI,
+    functionName: 'aggregate3',
+    result: [
+      { success: true, returnData: encodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'getBlockNumber', result: 16n }) },
+      { success: true, returnData: encodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'getCurrentBlockTimestamp', result: 95n }) },
+      { success: true, returnData: encodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'getLastBlockHash', result: header.parentHash as Hex }) },
+    ],
+  });
+  let requests = 0;
+  const rpc = { request: async (method: string) => { requests++; return method === 'eth_call' ? probes : header; } } as unknown as JsonRpc;
+  const reader = createChainReader({ rpc, conditions, run: 1 });
+  const ours = new TypeError('planted by the test: a fault of the courier\'s own');
+  await assert.rejects(reader.read({ number: 16n, hash: header.hash as Hex, parentHash: header.parentHash as Hex, timestamp: 95n }, [], () => { throw ours; }), (err: unknown) => err === ours);
+  assert.equal(requests, 1, 'not tried again');
+  assert.deepEqual(applied, [], 'recorded as nothing: no opening, no success');
+  // The node's own failure of the read (its answer unusable) is tried once more and recorded.
+  const refusing = { request: async () => { requests++; return null; } } as unknown as JsonRpc;
+  const other = createChainReader({ rpc: refusing, conditions, run: 1 });
+  requests = 0;
+  await assert.rejects(other.latestHeader(), { name: 'ChainUnreachable' });
+  assert.equal(requests, 2, 'tried once more, and no more');
+  assert.deepEqual(applied, ['failure'], 'recorded as the condition\'s opening');
 });
 
 test('three processes whose reads fail twice at once write one opening; three whose reads succeed at once, the condition open, write one clearing', async () => {
@@ -558,7 +660,7 @@ test('with the database stopped, the status answers 503 and claims nothing; /rea
   assert.ok(typeof (recovered.body.run as { id: number }).id === 'number');
 });
 
-/** One request over a raw socket, as the bytes given; the whole answer, once the courier closes the connection. */
+/** One request over a raw socket, as the bytes given; the whole answer, once the server closes the connection. */
 function raw(port: number, request: string): Promise<string> {
   return new Promise((resolve) => {
     const socket = connect({ host: '127.0.0.1', port });
@@ -592,57 +694,45 @@ test("a request whose target does not parse is refused by the courier, and no lo
   assert.equal(after_, before + 3, 'the two targets and the hash: each counted, none kept');
 });
 
-/**
- * The node's answer to the quotes' read with its envelope whole and its block probes true, and every return data
- * after them one byte that decodes as nothing: a read that succeeds, whose decoding then fails inside the route.
- */
-function withReturnDataGarbled(params: unknown[], result: unknown): unknown {
-  const call = params[0] as { to?: string; data?: Hex } | undefined;
-  if (typeof result !== 'string' || call?.to?.toLowerCase() !== MULTICALL_ADDRESS.toLowerCase() || call.data === undefined) return result;
-  if (decodeFunctionData({ abi: MULTICALL_ABI, data: call.data }).functionName !== 'aggregate3') return result;
-  const answers = [...(decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', data: result as Hex }) as ReadonlyArray<{ success: boolean; returnData: Hex }>)];
-  return encodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', result: answers.map((a, i) => (i < 3 ? a : { success: true, returnData: '0x01' as Hex })) });
-}
-
-test("a request that enters the catch-all is logged under the route it matched and nothing else: its target's text, in the path and in the query, is in no line of the courier's", async () => {
-  const url = stack.courier.url;
-  const rig = stack.rig;
+test("a request that enters the catch-all is answered 500 INTERNAL_ERROR and logged under the route it matched and nothing else: its target's text, in the path and in the query, is in no line; the witness is the handler, since no request from outside reaches the catch-all once an answer the read cannot use is a failure of the read", async () => {
   const marker = 'PRIVATE_SENTINEL_c4e1';
-  // No request from outside enters the catch-all on its own at this head: every refusal and every failure the routes
-  // classify is answered before it. One does with the node's help: a market page whose quotes' state the node answers
-  // with bytes that do not decode. So a quote stands on the market, and the node is made to answer that way.
-  const T = await rig.time();
-  const posted = await postOrder(url, rig, rig.accounts.maker, 'rest', orderOn(rig, rig.accounts.maker, { expiry: T + 600n }));
-  assert.equal(posted.status, 201, JSON.stringify(posted.body));
-  // The target carries the marker twice: in a path segment the URL's own rules remove (`/v1/<marker>/../book` is
-  // `/v1/book`), so the route is matched, and in the query. The raw socket sends it as written; a client library would
-  // tidy the path first.
-  const market = `gameId=${rig.gameId}&scorer=${rig.addresses.moneyline}&lineTicks=0&side=A`;
-  const target = `/v1/${marker}/../book?${market}&${marker}=1`;
-  const failedBefore = stack.courier.lines.filter((l) => l.startsWith('request GET /v1/book failed')).length;
-  stack.proxy.rule('eth_call', { kind: 'rewriteResult', result: withReturnDataGarbled });
-  let answer: string;
+  const lines: string[] = [];
+  // The handler as the courier builds it, over a chain reader that fails inside the courier with a fault of the
+  // courier's own, which no route classifies (not the chain unreachable, not the database), so it falls to the catch-all.
+  const limiter = createAddressLimiter(600);
+  const deps = {
+    store: {},
+    chain: { latestHeader: async () => { throw new Error('planted by the test: a fault of the courier\'s own'); } },
+    set: {},
+    node: {},
+    run: { id: 1 },
+    counters: createCounters(() => new Date()),
+    limiter,
+    settings: { lowPol: 0 },
+    published: [],
+    notYetBuilt: [],
+    log: (line: string) => lines.push(line),
+  } as unknown as ServiceDeps;
+  const server = createServer(createRequestHandler(deps));
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   try {
-    answer = await raw(stack.courier.port, `GET ${target} HTTP/1.1\r\nHost: courier\r\nConnection: close\r\n\r\n`);
+    const address = server.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+    // The marker twice in the target: in a path segment the URL's own rules remove (`/v1/<marker>/../book` is
+    // `/v1/book`), so the route is matched, and in the query. The raw socket sends it as written.
+    const target = `/v1/${marker}/../book?gameId=1&${marker}=1`;
+    const answer = await raw(port, `GET ${target} HTTP/1.1\r\nHost: courier\r\nConnection: close\r\n\r\n`);
+    assert.match(answer, /^HTTP\/1\.1 500 /, `the catch-all's own answer: ${JSON.stringify(answer.slice(0, 160))}`);
+    assert.match(answer, /"code":"INTERNAL_ERROR"/);
+    assert.ok(!answer.includes(marker), 'the answer carries nothing of the target');
+    for (let i = 0; i < 50 && lines.filter((l) => l.startsWith('request ')).length === 0; i++) await sleep(20);
+    const logged = lines.filter((l) => l.startsWith('request '));
+    assert.deepEqual(logged, ['request GET /v1/book failed: Error'], 'logged once, under the route matched, with the failure\'s class and nothing of the request');
+    assert.deepEqual(lines.filter((l) => l.includes(marker) || l.includes('/..')), [], 'no line carries the marker, or any of the target');
   } finally {
-    stack.proxy.rule('eth_call', null);
+    limiter.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
-  assert.match(answer, /^HTTP\/1\.1 500 /, `the catch-all's own answer: ${JSON.stringify(answer.slice(0, 160))}`);
-  assert.match(answer, /"code":"INTERNAL_ERROR"/);
-  assert.ok(!answer.includes(marker), 'the answer carries nothing of the target either');
-  for (let i = 0; i < 50 && stack.courier.lines.filter((l) => l.startsWith('request GET /v1/book failed')).length === failedBefore; i++) await new Promise((r) => setTimeout(r, 20));
-  const logged = stack.courier.lines.filter((l) => l.startsWith('request GET /v1/book failed'));
-  assert.equal(logged.length, failedBefore + 1, `the failure was logged once, under the route matched: ${JSON.stringify(stack.courier.lines.slice(-5))}`);
-  assert.match(logged[logged.length - 1] as string, /^request GET \/v1\/book failed: [A-Za-z]+$/, 'the line: the route, the failure\'s class, and nothing of the request');
-  assert.deepEqual(stack.courier.lines.filter((l) => l.includes(marker) || l.includes('/..')), [], 'no log line carries the marker, or any of the target');
-  // The same request with the node answering honestly is the page, with the quote on it: the failure was the node's
-  // answer and nothing of the request's.
-  const honest = await raw(stack.courier.port, `GET ${target} HTTP/1.1\r\nHost: courier\r\nConnection: close\r\n\r\n`);
-  assert.match(honest, /^HTTP\/1\.1 200 /, JSON.stringify(honest.slice(0, 160)));
-  assert.ok(honest.includes(`"orderHash":"${String(posted.body.orderHash)}"`), 'the quote is listed');
-  assert.equal(stack.courier.lines.filter((l) => l.startsWith('request GET /v1/book failed')).length, failedBefore + 1, 'the honest answer logged no failure');
-  const status = await get(url, '/v1/status');
-  assert.deepEqual(status.body.conditions, [], 'a read that succeeded and did not decode is the courier\'s failure, not the chain unreachable');
 });
 
 test('one network address has 600 requests a minute; the 601st is refused with a retry-after, counted, and another address is not touched', async () => {

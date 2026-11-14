@@ -145,7 +145,10 @@ courier waits on; Node's own default is five minutes.
   sender, and the key's address (none in this build); what the node can do; the published bounds; the settings;
   this run's counts of requests refused before admission, by code; the database's size; and what is not yet built.
   If the database cannot be read it answers `503` and says that: it does not serve what it last knew as if it were
-  now.
+  now. A condition listed means the last state-changing decision the records made for it was an opening; one not
+  listed means that decision was a clearing, or there has been no opening. Neither is a present-tense assertion
+  that the chain is up or down: the records apply outcomes in the order they process them (below), and a `503
+  CHAIN_UNREACHABLE` on a read is that read's own failure, not the listing's.
 - `GET /v1/runs?after=&limit=`: the runs, 100 to a page: each start of the process, and each stop the process
   wrote itself. A process that dies writes nothing, and no later start writes it for it. This is the courier's own
   account of when it was running, not a measure of whether a caller could reach it.
@@ -169,23 +172,24 @@ courier waits on; Node's own default is five minutes.
   they stand, right once any request has asked the chain about the quotes, and the market's page is the one checked
   against the chain.
 
-One standing condition is raised in this build: `chain-unreachable`, when a read of the chain fails and fails
-again when tried once more; it clears at the next read that succeeds, whichever process makes it. Each opening and
-clearing is a numbered line in the records, written in one transaction with the condition's row. The records decide
-every opening and clearing, and nothing a process remembers does: each read of the chain applies its outcome by the
-statement that follows the node's answer, before the request goes on, so no outcome is left for a later request and
-no path out of a request, the catch-all included, has anything to settle. A read that succeeded makes one statement,
-which clears the condition where one stands open from before that read and writes nothing where none does; a read
-that failed twice makes one statement where the condition is open (no line, the failure remembered on the row where
-newest) and a transaction under the condition's lock where none is (the opening, unless a clearing newer than the
-failure is on record). "Before" and "after" are decided on the database's one clock: an outcome is placed at the
-database's now() less the time it waited on its process for its statement, and the rows' instants are placed the
-same way, so two processes' clocks are never compared, and a success older than an opening clears nothing of it,
-however long its statement waited. Two processes that read successfully at once write one clearing line (the row
-is locked for the statement); a process that started while the condition was closed clears one that another process
-opened after; a success that a newer failure overtook before its statement ran is recorded as the recovery and the
-outage that went on, a clearing and a new opening, in one transaction. The request holds no connection of the
-reads' pool at any of its reads, so the statement never waits on a connection the request holds.
+One standing condition is raised in this build: `chain-unreachable`. It opens when the records process a read of
+the chain that failed and failed again on its one retry, including a required header or state value that cannot be
+decoded or a refusal to read the named block; it clears when the records next process a usable read that succeeded
+while it is open, whichever process made the read. An intelligible negative answer from a contract (a game the set
+does not know, where the call allowed failure) is a successful read, not the chain unreachable; a fault of the
+courier's own is no failure of the node's and opens nothing. Outcomes are applied in the records' processing order,
+not in the order the chain was observed: a success recorded late may clear a failure observed after it, and a
+failure recorded late may open after a success observed after it. No outcome is discarded because its age, its wait
+on the process or its trip to the database exceeded a time; no time decides a transition. Each opening and clearing
+is a numbered line in the records, written in one transaction with the condition's row, and every write of the
+condition is one writer form: the key's lock, the open row locked, the deciding fact read again on fresh state after
+the lock, the line and the row together; the lookup a read makes before it decides only that nothing need be
+written. Four cases and no others: closed and a success, nothing; closed and a failure, one opening and its line;
+open and a success, one clearing and its line; open and a failure, nothing. Each read applies its own outcome before
+it returns, so no outcome is lent to a later request, no path out of a request has anything to settle, and no
+process holds a belief about the condition. The request holds no connection of the reads' pool at any of its reads,
+so the condition's statements never wait on a connection the request holds. The times on the rows and the lines are
+the writing transaction's, diagnostics: neither is proof of the order the chain was observed in.
 
 ## The database
 

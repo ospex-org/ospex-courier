@@ -39,7 +39,8 @@ export type Rule =
   | { kind: 'rewrite'; params: (params: unknown[]) => unknown[] }
   /** Pass the request on, and answer with the node's result changed: the chain made to say something else. */
   | { kind: 'rewriteResult'; result: (params: unknown[], result: unknown) => unknown }
-  | { kind: 'hold'; released: Promise<void> };
+  /** Hold every request of the method until released; `arrived` is told of the first one. Released, a held request is answered under the rule then in force. */
+  | { kind: 'hold'; released: Promise<void>; arrived: () => void };
 
 export interface ChainProxy {
   url: string;
@@ -54,8 +55,12 @@ export interface ChainProxy {
   clear(): void;
   /** The block the proxy answers for the `finalized` tag: by number, read from the node on each request. Null: pass the tag on. */
   setFinal(number: bigint | null): void;
-  /** Hold every request of the method until `release` is called; resolves when the first such request has arrived. */
-  hold(method: string): { arrived: Promise<void>; release(): void };
+  /**
+   * Hold every request of the method until `release` is called; `arrived` resolves when the first such request has
+   * arrived. `release(then)` lets the held requests go on under `then` (a rule left in force for the method), or under
+   * no rule: passed on to the node.
+   */
+  hold(method: string): { arrived: Promise<void>; release(then?: Rule | null): void };
   close(): Promise<void>;
 }
 
@@ -110,9 +115,11 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       return { text: JSON.stringify({ ...answer, result: rule.result(params, answer.result) }), how: 'answered' };
     }
     if (rule?.kind === 'hold') {
+      rule.arrived();
       await rule.released;
-      const text = await upstream(raw);
-      return { text, how: 'held' };
+      // Answered under the rule in force now: the one the release installed, or none.
+      const again = await answerOne(req, raw);
+      return { text: again.text, how: 'held' };
     }
     // The finalized tag, answered here: the block the test named, read from the node by number.
     if (req.method === 'eth_getBlockByNumber' && params[0] === 'finalized' && finalNumber !== null) {
@@ -187,23 +194,15 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       let arrivedResolve = () => undefined as void;
       const released = new Promise<void>((resolve) => (release = resolve));
       const arrived = new Promise<void>((resolve) => (arrivedResolve = resolve));
-      rules.set(method, {
-        kind: 'hold',
-        released: released.then(() => undefined),
-      });
-      // Mark the arrival of the first held request.
-      const original = rules.get(method) as Rule;
-      rules.set(method, {
-        kind: 'hold',
-        released: (async () => {
-          arrivedResolve();
-          await (original as { released: Promise<void> }).released;
-        })(),
-      });
+      rules.set(method, { kind: 'hold', released, arrived: () => arrivedResolve() });
       return {
         arrived,
-        release: () => {
-          rules.delete(method);
+        release: (then = null) => {
+          if (then === null) rules.delete(method);
+          else {
+            rules.set(method, then);
+            arrivedAtRule.set(method, count(method));
+          }
           release();
         },
       };

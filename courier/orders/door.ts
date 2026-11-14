@@ -121,8 +121,9 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
   // Checks 5 and 8 to 16, in one transaction under the order's hash lock, on the door's own connection: one post at
   // a time in this process holds it, the others wait for it holding nothing, and the pool the reads go through is
   // never held idle on the courier's row. A read of the chain inside this transaction applies what it learns of the
-  // chain-unreachable condition at once, by one statement on the reads' pool: a connection of another pool than the
-  // one this transaction holds, so the statement never waits on a connection the request holds.
+  // chain-unreachable condition at once, on the reads' pool (a lookup, and a transaction under the condition's lock
+  // only where the condition changes): a connection of another pool than the one this transaction holds, so it never
+  // waits on a connection the request holds.
   const client = await deps.store.door.connect();
   try {
     await client.query('BEGIN');
