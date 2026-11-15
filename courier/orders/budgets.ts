@@ -76,7 +76,7 @@ export async function takeBudgets(client: pg.PoolClient, account: string, chainT
 }
 
 async function lockRow(client: pg.PoolClient, account: string): Promise<Row> {
-  const { rows } = await client.query<Row>(`SELECT account, budget::text AS budget, floor(extract(epoch FROM budget_at))::bigint::text AS at FROM accounts WHERE account = $1 FOR UPDATE`, [account]);
+  const { rows } = await client.query<Row>(`SELECT account, budget, floor(extract(epoch FROM budget_at))::bigint::text AS at FROM accounts WHERE account = $1 FOR UPDATE`, [account]);
   const row = rows[0];
   if (row === undefined) throw new Error(`the accounts row ${account} was not there after its insert`);
   return row;

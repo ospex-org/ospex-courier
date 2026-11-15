@@ -298,7 +298,7 @@ export function createStore(pool: pg.Pool, door: pg.Pool, log: (line: string) =>
       return Number(rows[0]?.size ?? '0');
     },
     async newestReportLine() {
-      const { rows } = await pool.query<{ number: string | null }>('SELECT max(number)::text AS number FROM events WHERE kind = ANY($1)', [REPORT_KINDS]);
+      const { rows } = await pool.query<{ number: string | null }>('SELECT max(number) AS number FROM events WHERE kind = ANY($1)', [REPORT_KINDS]);
       const n = rows[0]?.number;
       return n === null || n === undefined ? null : Number(n);
     },
