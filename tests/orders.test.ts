@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { after, before, test } from 'node:test';
 import pg from 'pg';
 import { decodeFunctionData, decodeFunctionResult, encodeAbiParameters, encodeFunctionData, encodeFunctionResult, keccak256, recoverTypedDataAddress, toBytes, type Abi, type Address, type Hex } from 'viem';
 import type { HDAccount } from 'viem/accounts';
 import { MATCHING_ABI, MULTICALL_ABI, MULTICALL_ADDRESS } from '../courier/chain/abi';
-import { orderHash, orderSigner, splitNonce } from '../courier/orders/order';
+import { isChainSignature, orderHash, orderSigner, splitNonce } from '../courier/orders/order';
 import { openPool } from '../courier/records/store';
 import { get, startCourier } from './support/courier';
 import {
@@ -869,6 +870,20 @@ test("a quote the chain shows filled, with less than a lot of its stake left, is
 
 // ──────────────────────────── the version, the floor and the grant ────────
 
+// The courier takes at most 600 requests a minute from one network address, and this file's cases above send
+// most of that within their minute. The cases below make their requests from an address of their own (the last
+// value of X-Forwarded-For, which is what the courier counts by), so neither count is the other's.
+const ELSEWHERE = { 'x-forwarded-for': '198.51.100.132' };
+const send: typeof post = (courier, path, body, headers = {}) => post(courier, path, body, { ...ELSEWHERE, ...headers });
+const read: typeof get = (courier, path, headers = {}) => get(courier, path, { ...ELSEWHERE, ...headers });
+const sendOrder: typeof postOrder = (courier, on, who, role, order, headers = {}) => postOrder(courier, on, who, role, order, { ...ELSEWHERE, ...headers });
+const sendOrderAs: typeof postOrderAs = (courier, on, signer, role, order, headers = {}) => postOrderAs(courier, on, signer, role, order, { ...ELSEWHERE, ...headers });
+
+/** The counts of requests refused before admission, by code: the courier's own, whoever asks. */
+async function refusedSoFar(): Promise<Record<string, number>> {
+  return ((await read(url(), '/v1/status')).body.refusedBeforeAdmission as { byCode: Record<string, number> }).byCode;
+}
+
 /** One side of one market's page, as the courier serves it. */
 interface SideServed {
   quotes: Array<{ orderHash: string; account: string; remaining: string }>;
@@ -879,7 +894,7 @@ interface SideServed {
 }
 
 async function sideOf(market: { scorer: Address; lineTicks: number }, side: 'A' | 'B'): Promise<SideServed> {
-  const page = await get(url(), `/v1/book?gameId=${rig.gameId}&scorer=${market.scorer}&lineTicks=${market.lineTicks}&side=${side}`);
+  const page = await read(url(), `/v1/book?gameId=${rig.gameId}&scorer=${market.scorer}&lineTicks=${market.lineTicks}&side=${side}`);
   assert.equal(page.status, 200, JSON.stringify(page.body));
   return (page.body.sides as Record<string, SideServed>)[side] as SideServed;
 }
@@ -914,9 +929,11 @@ async function budgetRows(account: Address): Promise<BudgetRow[]> {
 }
 
 /**
- * Sends one post for an order of `account` and asserts it cost the account nothing and left nothing: both budget
- * rows as they were, each with a budget it could have been taken from; no line written, of any kind; no row for the
- * order. Returns the answer, for the caller to judge.
+ * Sends one post for an order of `account` that its grant's judgement must refuse, and asserts it cost the account
+ * nothing and left nothing: both budget rows as they were, each with a budget it could have been taken from; no
+ * line written, of any kind; no row for the order. The post must also have asked the chain exactly once, one header
+ * and one read: so the answer is not an earlier check's, made before the door read the chain, and nothing was asked
+ * after it. Returns the answer, for the caller to judge.
  */
 async function costsNothing(account: Address, order: Order, send: () => Promise<Answer>): Promise<Answer> {
   const hash = await contractHash(rig, order);
@@ -924,7 +941,13 @@ async function costsNothing(account: Address, order: Order, send: () => Promise<
   assert.equal(rowsBefore.length, 2, 'the account and the courier each hold a budget row before the post');
   for (const row of rowsBefore) assert.ok(Number(row.budget) >= 1, `${row.account} has a budget to be taken from: ${row.budget}`);
   const linesBefore = (await lines()).length;
+  const chainBefore = { headers: stack.proxy.count('eth_getBlockByNumber'), calls: stack.proxy.count('eth_call'), all: stack.proxy.count() };
   const answer = await send();
+  assert.deepEqual(
+    { headers: stack.proxy.count('eth_getBlockByNumber') - chainBefore.headers, calls: stack.proxy.count('eth_call') - chainBefore.calls, all: stack.proxy.count() - chainBefore.all },
+    { headers: 1, calls: 1, all: 2 },
+    `the door read the chain once, and the refusal came from that read: ${JSON.stringify(answer.body)}`,
+  );
   assert.deepEqual(await budgetRows(account), rowsBefore, `both budget rows are as they were: ${JSON.stringify(answer.body)}`);
   assert.equal((await lines()).length, linesBefore, `no line was written: ${JSON.stringify(answer.body)}`);
   assert.equal(await orderRow(hash), null, 'the order holds no row');
@@ -962,7 +985,7 @@ test("the version and the floor, as the contract judges them: an order is judged
   const T = await rig.time();
   const line = { scorer: rig.addresses.spread, lineTicks: -2_015 };
   const at = (version: bigint, orderNumber: bigint, market: { scorer: Address; lineTicks: number } = line): Order => orderOn(rig, who, { expiry: T + 3_600n, ...market, nonce: nonceOf(version, 0, orderNumber) });
-  const send = (order: Order) => postOrder(url(), rig, who, 'rest', order);
+  const send = (order: Order) => sendOrder(url(), rig, who, 'rest', order);
   const refused: Order[] = [];
   const cancelled = async (order: Order, what: string) => {
     const answer = await send(order);
@@ -1019,13 +1042,13 @@ test("a cancel of everything moves the account to a new version: a new order at 
   const paged = { scorer: rig.addresses.total, lineTicks: 2_925 };
   const countedHashes: string[] = [];
   for (let i = 0; i < 16; i++) {
-    const answer = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...counted }));
+    const answer = await sendOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...counted }));
     assert.equal(answer.status, 201, `${i}: ${JSON.stringify(answer.body)}`);
     countedHashes.push(answer.body.orderHash as string);
   }
   const pagedHashes: string[] = [];
   for (let i = 0; i < 3; i++) {
-    const answer = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...paged }));
+    const answer = await sendOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...paged }));
     assert.equal(answer.status, 201, `${i}: ${JSON.stringify(answer.body)}`);
     pagedHashes.push(answer.body.orderHash as string);
   }
@@ -1041,7 +1064,7 @@ test("a cancel of everything moves the account to a new version: a new order at 
   assert.equal(await unendedRows(who), 19, 'cancelled on chain, the nineteen stand in the records until a request asks the chain about them');
 
   // A new order at the version left is refused at the door.
-  const stale = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...paged }));
+  const stale = await sendOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...paged }));
   assert.equal(stale.status, 422, JSON.stringify(stale.body));
   assert.equal(stale.body.code, 'CANCELLED');
 
@@ -1049,7 +1072,7 @@ test("a cancel of everything moves the account to a new version: a new order at 
   // marks the sixteen it shows at the version left, at the block it read, and is taken.
   const head = await rig.publicClient.getBlock();
   const callsBefore = stack.proxy.count('eth_call');
-  const taken = await post(url(), '/v1/orders', { role: 'rest', order: wire(ahead), signature: aheadSignature });
+  const taken = await send(url(), '/v1/orders', { role: 'rest', order: wire(ahead), signature: aheadSignature });
   assert.equal(taken.status, 201, JSON.stringify(taken.body));
   assert.equal(stack.proxy.count('eth_call') - callsBefore, 2, "the door's own read and one read of the sixteen");
   const countedMarks = await marks(countedHashes);
@@ -1086,39 +1109,40 @@ test("an agent's order at the door: signed by its grant's agent within the cap a
   assert.deepEqual([g, gListed], [1, 1], "each account's first grant");
   assert.equal(await rig.publicClient.readContract({ address: rig.addresses.matching, abi: MATCHING_ABI, functionName: 'isLiveAgent', args: [owner.address, agent.address] }), true, 'the chain holds the key as the live agent');
   const under = (account: HDAccount, grant: number, fields: Partial<Order> = {}): Order => orderOn(rig, account, { expiry: T + 3_600n, oddsTick: 200, riskAmount: 10_000n, ...line, nonce: nonceOf(0n, grant, nextOrderNumber()), ...fields });
-  const countsBefore = await refusedBeforeAdmission();
+  const countsBefore = await refusedSoFar();
   const linesBefore = (await lines()).length;
 
   // Admitted: the agent's signature, the stake at the cap, any line. The record is the account's, the signature the agent's.
   const atCap = under(owner, g, { riskAmount: cap });
-  const admitted = await postOrderAs(url(), rig, agent, 'rest', atCap);
+  const admitted = await sendOrderAs(url(), rig, agent, 'rest', atCap);
   assert.equal(admitted.status, 201, JSON.stringify(admitted.body));
   const row = await orderRow(admitted.body.orderHash as string);
   assert.deepEqual({ account: row?.account, nonce: String(row?.nonce), signature: row?.signature }, { account: owner.address.toLowerCase(), nonce: atCap.nonce.toString(), signature: admitted.signature.toLowerCase() });
-  const elsewhere = await postOrderAs(url(), rig, agent, 'rest', under(owner, g, offList));
+  const elsewhere = await sendOrderAs(url(), rig, agent, 'rest', under(owner, g, offList));
   assert.equal(elsewhere.status, 201, `a grant with no list passes every line: ${JSON.stringify(elsewhere.body)}`);
   assert.deepEqual((await sideOf(line, 'A')).quotes.map((q) => [q.orderHash, q.account]), [[admitted.body.orderHash, owner.address]], 'listed, under its account');
   assert.equal((await lines()).length, linesBefore + 2, 'each admitted order is a line');
 
   // Refused, each before admission, and each the contract's own refusal of the same order in a Cross.
-  const refusals: Array<{ what: string; order: Order; signer: HDAccount; code: string; onChain: string }> = [
-    { what: "the account's own key on a nonce under its grant", order: under(owner, g), signer: owner, code: 'BAD_SIGNATURE', onChain: 'OspexMatching__BadSignature' },
-    { what: 'a stranger on a nonce under the grant', order: under(owner, g), signer: stranger, code: 'BAD_SIGNATURE', onChain: 'OspexMatching__BadSignature' },
-    { what: 'a grant number the account never made', order: under(owner, g + 6), signer: agent, code: 'BAD_SIGNATURE', onChain: 'OspexMatching__NoSuchGrant' },
-    { what: 'one lot over the cap', order: under(owner, g, { riskAmount: cap + 100n }), signer: agent, code: 'AGENT_STAKE_ABOVE_CAP', onChain: 'OspexMatching__AgentStakeAboveCap' },
-    { what: "a line outside the grant's list", order: under(listed, gListed, offList), signer: agent, code: 'LINE_NOT_IN_GRANT', onChain: 'OspexMatching__LineNotInGrant' },
+  const refusals: Array<{ what: string; order: Order; signer: HDAccount; code: string; says: RegExp; onChain: string }> = [
+    { what: "the account's own key on a nonce under its grant", order: under(owner, g), signer: owner, code: 'BAD_SIGNATURE', says: /not the agent's of grant 1\b/, onChain: 'OspexMatching__BadSignature' },
+    { what: 'a stranger on a nonce under the grant', order: under(owner, g), signer: stranger, code: 'BAD_SIGNATURE', says: /not the agent's of grant 1\b/, onChain: 'OspexMatching__BadSignature' },
+    { what: 'a grant number the account never made', order: under(owner, g + 6), signer: agent, code: 'BAD_SIGNATURE', says: /names grant 7, and its account has made no grant of that number/, onChain: 'OspexMatching__NoSuchGrant' },
+    { what: 'one lot over the cap', order: under(owner, g, { riskAmount: cap + 100n }), signer: agent, code: 'AGENT_STAKE_ABOVE_CAP', says: /1\.00 USDC at most/, onChain: 'OspexMatching__AgentStakeAboveCap' },
+    { what: "a line outside the grant's list", order: under(listed, gListed, offList), signer: agent, code: 'LINE_NOT_IN_GRANT', says: /this order's line is not one of them/, onChain: 'OspexMatching__LineNotInGrant' },
   ];
   for (const r of refusals) {
     const signature = await sign(r.signer, r.order, 31337, rig.addresses.matching);
-    const answer = await post(url(), '/v1/orders', { role: 'rest', order: wire(r.order), signature });
+    const answer = await send(url(), '/v1/orders', { role: 'rest', order: wire(r.order), signature });
     assert.equal(answer.status, 422, `${r.what}: ${JSON.stringify(answer.body)}`);
     assert.equal(answer.body.code, r.code, r.what);
+    assert.match(String(answer.body.error), r.says, `${r.what}: the sentence is the grant's own check's`);
     assert.equal(await orderRow(await contractHash(rig, r.order)), null, `${r.what}: no row`);
     const refusal = await crossRefusal(rig, await betAgainst(r.order), [{ order: r.order, signature }]);
     assert.equal(refusal?.name, r.onChain, `${r.what}: the contract's own refusal of a Cross that lists it`);
   }
   assert.equal((await lines()).length, linesBefore + 2, 'no refusal before admission is a line');
-  const countsAfter = await refusedBeforeAdmission();
+  const countsAfter = await refusedSoFar();
   assert.deepEqual(
     { bad: (countsAfter.BAD_SIGNATURE ?? 0) - (countsBefore.BAD_SIGNATURE ?? 0), cap: countsAfter.AGENT_STAKE_ABOVE_CAP ?? 0, list: countsAfter.LINE_NOT_IN_GRANT ?? 0 },
     { bad: 3, cap: (countsBefore.AGENT_STAKE_ABOVE_CAP ?? 0) + 1, list: (countsBefore.LINE_NOT_IN_GRANT ?? 0) + 1 },
@@ -1126,13 +1150,13 @@ test("an agent's order at the door: signed by its grant's agent within the cap a
   );
   // The cap is named, in the sentence and beside it.
   const overCap = under(owner, g, { riskAmount: cap + 100n });
-  const over = await postOrderAs(url(), rig, agent, 'rest', overCap);
+  const over = await sendOrderAs(url(), rig, agent, 'rest', overCap);
   assert.equal(over.body.error, 'Grant 1 lets its agent sign an order for 1.00 USDC at most. This order is signed for 1.0001 USDC.');
   assert.equal(over.body.stakeCap, cap.toString());
 
   // The controls. On the listed line the other account's grant admits; and the admitted order fills: one Cross sent by
   // the test from the relay's sender, the agent's signature on the quote.
-  const onList = await postOrderAs(url(), rig, agent, 'rest', under(listed, gListed));
+  const onList = await sendOrderAs(url(), rig, agent, 'rest', under(listed, gListed));
   assert.equal(onList.status, 201, `the line the grant names: ${JSON.stringify(onList.body)}`);
   const fills = under(owner, g);
   const fillsSignature = await sign(agent, fills, 31337, rig.addresses.matching);
@@ -1148,7 +1172,7 @@ test("an agent's order on record, posted again, is answered from the record and 
   const line = { scorer: rig.addresses.spread, lineTicks: -2_095 };
   const g = await grantAgent(rig, owner, agent.address, 1_000_000n, T + 100_000n);
   const order = orderOn(rig, owner, { expiry: T + 3_600n, ...line, nonce: nonceOf(0n, g, nextOrderNumber()) });
-  const first = await postOrderAs(url(), rig, agent, 'rest', order);
+  const first = await sendOrderAs(url(), rig, agent, 'rest', order);
   assert.equal(first.status, 201, JSON.stringify(first.body));
   assert.equal(first.body.signature, first.signature.toLowerCase(), "the record carries the agent's signature");
   const rowsBefore = await budgetRows(owner.address);
@@ -1156,23 +1180,23 @@ test("an agent's order on record, posted again, is answered from the record and 
   const chainCalls = stack.proxy.count();
 
   // The agent's own repeat is the record.
-  const again = await post(url(), '/v1/orders', { role: 'rest', order: wire(order), signature: first.signature });
+  const again = await send(url(), '/v1/orders', { role: 'rest', order: wire(order), signature: first.signature });
   assert.equal(again.status, 200, JSON.stringify(again.body));
   assert.deepEqual(again.body, first.body);
   // A repeat carrying a stranger's signature is answered with the same record, which anyone can read by its hash: it
   // is no admission, and the record still carries the agent's signature.
-  const strangers = await postOrderAs(url(), rig, rig.accounts.stranger, 'rest', order);
+  const strangers = await sendOrderAs(url(), rig, rig.accounts.stranger, 'rest', order);
   assert.equal(strangers.status, 200, JSON.stringify(strangers.body));
   assert.deepEqual(strangers.body, first.body);
-  assert.deepEqual((await get(url(), `/v1/orders/${first.body.orderHash}`)).body, first.body, 'the record anyone is served by its hash');
+  assert.deepEqual((await read(url(), `/v1/orders/${first.body.orderHash}`)).body, first.body, 'the record anyone is served by its hash');
   // The grant revoked, a repeat is still the record as it stands: a repeat judges nothing, and the quote's end is
   // the next read of the chain's to mark.
   await revokeAgent(rig, owner);
-  const afterRevoke = await post(url(), '/v1/orders', { role: 'rest', order: wire(order), signature: first.signature });
+  const afterRevoke = await send(url(), '/v1/orders', { role: 'rest', order: wire(order), signature: first.signature });
   assert.equal(afterRevoke.status, 200, JSON.stringify(afterRevoke.body));
   assert.deepEqual(afterRevoke.body, first.body);
   // Under the other role: a conflict.
-  const conflict = await post(url(), '/v1/orders', { role: 'take', order: wire(order), signature: first.signature });
+  const conflict = await send(url(), '/v1/orders', { role: 'take', order: wire(order), signature: first.signature });
   assert.equal(conflict.status, 409, JSON.stringify(conflict.body));
   assert.equal(conflict.body.code, 'ROLE_CONFLICT');
 
@@ -1190,24 +1214,24 @@ test("a grant number forged on another account's order costs that account nothin
   const T = await rig.time();
   const line = { scorer: rig.addresses.spread, lineTicks: -2_055 };
   // The victim is registered, has an order admitted (so it holds a budget row, as the courier does), and has a grant standing.
-  assert.equal((await postOrder(url(), rig, victim, 'rest', orderOn(rig, victim, { expiry: T + 3_600n, ...line }))).status, 201);
+  assert.equal((await sendOrder(url(), rig, victim, 'rest', orderOn(rig, victim, { expiry: T + 3_600n, ...line }))).status, 201);
   const g = await grantAgent(rig, victim, agent.address, 1_000_000n, T + 100_000n);
   const under = (grant: number): Order => orderOn(rig, victim, { expiry: T + 3_600n, ...line, nonce: nonceOf(0n, grant, nextOrderNumber()) });
-  const countsBefore = (await refusedBeforeAdmission()).BAD_SIGNATURE ?? 0;
+  const countsBefore = (await refusedSoFar()).BAD_SIGNATURE ?? 0;
 
   for (const [what, grant] of [['the standing grant', g], ['a number never made', g + 41]] as Array<[string, number]>) {
     for (const role of ['rest', 'take'] as const) {
       const forged = under(grant);
-      const answer = await costsNothing(victim.address, forged, () => postOrderAs(url(), rig, stranger, role, forged));
+      const answer = await costsNothing(victim.address, forged, () => sendOrderAs(url(), rig, stranger, role, forged));
       assert.equal(answer.status, 422, `${what}, ${role}: ${JSON.stringify(answer.body)}`);
       assert.equal(answer.body.code, 'BAD_SIGNATURE', `${what}, ${role}`);
     }
   }
-  assert.equal(((await refusedBeforeAdmission()).BAD_SIGNATURE ?? 0) - countsBefore, 4, 'each counted, by its code');
+  assert.equal(((await refusedSoFar()).BAD_SIGNATURE ?? 0) - countsBefore, 4, 'each counted, by its code');
 
   // The control: the same shape signed by the grant's agent is admitted, and both rows are written.
   const rowsBefore = await budgetRows(victim.address);
-  const real = await postOrderAs(url(), rig, agent, 'rest', under(g));
+  const real = await sendOrderAs(url(), rig, agent, 'rest', under(g));
   assert.equal(real.status, 201, JSON.stringify(real.body));
   const rowsAfter = await budgetRows(victim.address);
   assert.deepEqual(rowsAfter.map((r, i) => r.row_version !== rowsBefore[i]?.row_version), [true, true], 'an admitted order writes both budget rows: the witness above can see a debit');
@@ -1228,12 +1252,12 @@ test("a grant's standing, exact: its agent's order is taken while the grant ends
   assert.equal(await rig.time(), ends - 2n);
   const quote = under();
   const quoteSignature = await sign(agent, quote, 31337, rig.addresses.matching);
-  const taken = await post(url(), '/v1/orders', { role: 'rest', order: wire(quote), signature: quoteSignature });
+  const taken = await send(url(), '/v1/orders', { role: 'rest', order: wire(quote), signature: quoteSignature });
   assert.equal(taken.status, 201, `ending at the chain's time plus two: ${JSON.stringify(taken.body)}`);
   assert.equal(taken.body.chainTime, (ends - 2n).toString());
   const second = under();
   const secondSignature = await sign(agent, second, 31337, rig.addresses.matching);
-  assert.equal((await post(url(), '/v1/orders', { role: 'rest', order: wire(second), signature: secondSignature })).status, 201);
+  assert.equal((await send(url(), '/v1/orders', { role: 'rest', order: wire(second), signature: secondSignature })).status, 201);
 
   // The contract's side: a Cross on the first quote, mined at the last second before the grant's end, fills.
   const bet = await betAgainst(quote);
@@ -1245,7 +1269,7 @@ test("a grant's standing, exact: its agent's order is taken while the grant ends
   // The latest block one second before the grant's end: an order under it can fill in no later block, and is refused,
   // before admission.
   const late = under();
-  const gone = await costsNothing(owner.address, late, () => postOrderAs(url(), rig, agent, 'rest', late));
+  const gone = await costsNothing(owner.address, late, () => sendOrderAs(url(), rig, agent, 'rest', late));
   assert.equal(gone.status, 422, JSON.stringify(gone.body));
   assert.equal(gone.body.code, 'GRANT_GONE');
   assert.deepEqual({ grantNumber: gone.body.grantNumber, currentGrant: gone.body.currentGrant, endsAt: gone.body.endsAt, chainTime: gone.body.chainTime }, { grantNumber: g, currentGrant: g, endsAt: ends.toString(), chainTime: (ends - 1n).toString() });
@@ -1269,7 +1293,7 @@ test("a grant's standing, exact: its agent's order is taken while the grant ends
   assert.equal(await rig.read<bigint>(rig.addresses.matching, rig.abis.OspexMatching as Abi, 's_filledRisk', [await contractHash(rig, second)]), 0n);
 
   // An order the account signs itself, grant number 0, stands whatever became of its grant.
-  const own = await postOrder(url(), rig, owner, 'rest', orderOn(rig, owner, { expiry: ends + 3_600n, ...line }));
+  const own = await sendOrder(url(), rig, owner, 'rest', orderOn(rig, owner, { expiry: ends + 3_600n, ...line }));
   assert.equal(own.status, 201, JSON.stringify(own.body));
 });
 
@@ -1284,17 +1308,17 @@ test("the former agent's order costs the account nothing: under its old number a
   const line = { scorer: rig.addresses.spread, lineTicks: -2_075 };
   const under = (grant: number): Order => orderOn(rig, owner, { expiry: far, ...line, nonce: nonceOf(0n, grant, nextOrderNumber()) });
   const admitted = async (signer: HDAccount, grant: number, what: string) => {
-    const answer = await postOrderAs(url(), rig, signer, 'rest', under(grant));
+    const answer = await sendOrderAs(url(), rig, signer, 'rest', under(grant));
     assert.equal(answer.status, 201, `${what}: ${JSON.stringify(answer.body)}`);
   };
   const gone = async (signer: HDAccount, grant: number, what: string) => {
     const order = under(grant);
-    const answer = await costsNothing(owner.address, order, () => postOrderAs(url(), rig, signer, 'rest', order));
+    const answer = await costsNothing(owner.address, order, () => sendOrderAs(url(), rig, signer, 'rest', order));
     assert.equal(answer.status, 422, `${what}: ${JSON.stringify(answer.body)}`);
     assert.equal(answer.body.code, 'GRANT_GONE', what);
     return answer;
   };
-  const countsBefore = (await refusedBeforeAdmission()).GRANT_GONE ?? 0;
+  const countsBefore = (await refusedSoFar()).GRANT_GONE ?? 0;
 
   const g1 = await grantAgent(rig, owner, first.address, cap, far);
   await admitted(first, g1, 'the live grant, the control');
@@ -1309,6 +1333,11 @@ test("the former agent's order costs the account nothing: under its old number a
   // Another key granted: the first key's grant is replaced.
   const g3 = await grantAgent(rig, owner, other.address, cap, far);
   await gone(first, g2, "under a grant another key's replaced");
+  // Under the new grant's number the first key is no agent at all, the grant naming another: the signer's refusal,
+  // and as free of cost.
+  const notItsGrant = under(g3);
+  const wrongKey = await costsNothing(owner.address, notItsGrant, () => sendOrderAs(url(), rig, first, 'rest', notItsGrant));
+  assert.equal(wrongKey.body.code, 'BAD_SIGNATURE', JSON.stringify(wrongKey.body));
   await admitted(other, g3, 'the key the grant now names');
 
   // The grant revoked.
@@ -1328,7 +1357,7 @@ test("the former agent's order costs the account nothing: under its old number a
   const ended = await gone(other, g4, "ending at the chain's time plus one");
   assert.deepEqual({ grantNumber: ended.body.grantNumber, currentGrant: ended.body.currentGrant, endsAt: ended.body.endsAt, chainTime: ended.body.chainTime }, { grantNumber: g4, currentGrant: g4, endsAt: ends.toString(), chainTime: (ends - 1n).toString() });
 
-  assert.equal(((await refusedBeforeAdmission()).GRANT_GONE ?? 0) - countsBefore, 4, 'each counted, by its code');
+  assert.equal(((await refusedSoFar()).GRANT_GONE ?? 0) - countsBefore, 4, 'each counted, by its code');
   assert.equal((await lines(`WHERE kind = 'order refused' AND reason = 'GRANT_GONE'`)).length, 0, 'no refusal for a gone grant is a line: each was before admission');
 });
 
@@ -1342,18 +1371,18 @@ test("a revoke ends the agent's quotes: the sixteen it posted on one side are ma
   const under = (positionType: 0 | 1): Order => orderOn(rig, owner, { expiry: T + 3_600n, ...line, positionType, nonce: nonceOf(0n, g, nextOrderNumber()) });
   const sideA: string[] = [];
   for (let i = 0; i < 16; i++) {
-    const answer = await postOrderAs(url(), rig, agent, 'rest', under(0));
+    const answer = await sendOrderAs(url(), rig, agent, 'rest', under(0));
     assert.equal(answer.status, 201, `${i}: ${JSON.stringify(answer.body)}`);
     sideA.push(answer.body.orderHash as string);
   }
   const sideB: string[] = [];
   for (let i = 0; i < 2; i++) {
-    const answer = await postOrderAs(url(), rig, agent, 'rest', under(1));
+    const answer = await sendOrderAs(url(), rig, agent, 'rest', under(1));
     assert.equal(answer.status, 201, `${i}: ${JSON.stringify(answer.body)}`);
     sideB.push(answer.body.orderHash as string);
   }
   // One quote the account signs itself, on the other side: its end is not the grant's.
-  const own = await postOrder(url(), rig, owner, 'rest', orderOn(rig, owner, { expiry: T + 3_600n, ...line, positionType: 1 }));
+  const own = await sendOrder(url(), rig, owner, 'rest', orderOn(rig, owner, { expiry: T + 3_600n, ...line, positionType: 1 }));
   assert.equal(own.status, 201, JSON.stringify(own.body));
   assert.equal((await sideOf(line, 'B')).quotes.length, 3, 'listed while the grant stands');
 
@@ -1362,14 +1391,14 @@ test("a revoke ends the agent's quotes: the sixteen it posted on one side are ma
 
   // The agent's new post is refused, before admission.
   const late = under(0);
-  const refused = await costsNothing(owner.address, late, () => postOrderAs(url(), rig, agent, 'rest', late));
+  const refused = await costsNothing(owner.address, late, () => sendOrderAs(url(), rig, agent, 'rest', late));
   assert.equal(refused.body.code, 'GRANT_GONE', JSON.stringify(refused.body));
 
   // The door's count: the account's own order finds sixteen standing, asks the chain once, marks the sixteen under
   // the revoked grant at the block it read, and is taken.
   const head = await rig.publicClient.getBlock();
   const callsBefore = stack.proxy.count('eth_call');
-  const taken = await postOrder(url(), rig, owner, 'rest', orderOn(rig, owner, { expiry: T + 3_600n, ...line }));
+  const taken = await sendOrder(url(), rig, owner, 'rest', orderOn(rig, owner, { expiry: T + 3_600n, ...line }));
   assert.equal(taken.status, 201, JSON.stringify(taken.body));
   assert.equal(stack.proxy.count('eth_call') - callsBefore, 2, "the door's own read and one read of the sixteen");
   const marked = await marks(sideA);
@@ -1380,8 +1409,63 @@ test("a revoke ends the agent's quotes: the sixteen it posted on one side are ma
   const page = await sideOf(line, 'B');
   assert.deepEqual({ listed: page.quotes.map((q) => q.orderHash), live: page.live, ended: page.endedOnChain, cancelled: page.markedCancelled }, { listed: [own.body.orderHash], live: 3, ended: 2, cancelled: 2 });
   for (const m of await marks(sideB)) assert.deepEqual(m, { ended: 'cancelled', block: head.number.toString(), hash: head.hash.toLowerCase() }, 'marked cancelled at the block the page read');
-  assert.equal((await get(url(), `/v1/orders/${sideB[0]}`)).body.state, 'cancelled');
+  assert.equal((await read(url(), `/v1/orders/${sideB[0]}`)).body.state, 'cancelled');
   assert.deepEqual((await marks([own.body.orderHash as string]))[0], { ended: null, block: null, hash: null }, "the account's own quote is not the grant's to end");
+});
+
+test("the door's count at a grant's last second: sixteen quotes the agent posted on one side all stand, and the account's own order is refused for the count, while the latest block is two seconds before the grant's end; one second before it the same count marks the sixteen cancelled at the block read, and the order is taken", async () => {
+  const owner = rig.account(37);
+  const agent = rig.account(38);
+  await rig.fund(owner);
+  const line = { scorer: rig.addresses.total, lineTicks: 2_945 };
+  const ends = (await rig.time()) + 400n;
+  const g = await grantAgent(rig, owner, agent.address, 1_000_000n, ends);
+  const hashes: string[] = [];
+  for (let i = 0; i < 16; i++) {
+    const answer = await sendOrderAs(url(), rig, agent, 'rest', orderOn(rig, owner, { expiry: ends + 3_600n, ...line, nonce: nonceOf(0n, g, nextOrderNumber()) }));
+    assert.equal(answer.status, 201, `${i}: ${JSON.stringify(answer.body)}`);
+    hashes.push(answer.body.orderHash as string);
+  }
+  const own = () => sendOrder(url(), rig, owner, 'rest', orderOn(rig, owner, { expiry: ends + 3_600n, ...line }));
+
+  // Two seconds before the end every one of the sixteen can still fill in the next block: asked about them, the
+  // chain shows none ended, and the account's order is one too many.
+  await rig.setNextBlockTime(ends - 2n);
+  await rig.mine(1);
+  assert.equal(await rig.time(), ends - 2n);
+  let callsBefore = stack.proxy.count('eth_call');
+  const full = await own();
+  assert.equal(full.status, 422, JSON.stringify(full.body));
+  assert.equal(full.body.code, 'TOO_MANY_QUOTES');
+  assert.equal(stack.proxy.count('eth_call') - callsBefore, 2, "the door's own read and one read of the sixteen");
+  assert.equal(await unendedRows(owner), 16, 'none is marked');
+
+  // One second before the end none can fill in a later block: the same count marks the sixteen, at the block it
+  // read, and the order is taken.
+  await rig.setNextBlockTime(ends - 1n);
+  await rig.mine(1);
+  const head = await rig.publicClient.getBlock();
+  assert.equal(head.timestamp, ends - 1n);
+  callsBefore = stack.proxy.count('eth_call');
+  const taken = await own();
+  assert.equal(taken.status, 201, JSON.stringify(taken.body));
+  assert.equal(stack.proxy.count('eth_call') - callsBefore, 2, "the door's own read and one read of the sixteen");
+  const marked = await marks(hashes);
+  assert.equal(marked.length, 16);
+  for (const m of marked) assert.deepEqual(m, { ended: 'cancelled', block: head.number.toString(), hash: head.hash.toLowerCase() }, 'marked cancelled at the block the door read');
+  assert.equal(await unendedRows(owner), 1, "the account's own order, alone");
+});
+
+test("the form of a signature, at its edges: a last byte of 27 or 28 is taken and 26, 29, 0 and 1 are not; an s of half the curve's order is taken and one above it is not, the half being the bound the pinned library's own check is written with", () => {
+  const curveOrder = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+  const half = curveOrder / 2n;
+  // The contract's check is the pinned library's: it refuses an s above this literal, and nothing else about s.
+  const library = readFileSync(new URL('../contracts/lib/openzeppelin-contracts/contracts/utils/cryptography/ECDSA.sol', import.meta.url), 'utf8');
+  assert.ok(library.includes(`uint256(s) > 0x${half.toString(16).toUpperCase()}`), "the pinned library's bound on s is half the curve's order");
+  const form = (s: bigint, v: number): Hex => `0x${'11'.repeat(32)}${s.toString(16).padStart(64, '0')}${v.toString(16).padStart(2, '0')}`;
+  assert.deepEqual([26, 27, 28, 29, 0, 1].map((v) => isChainSignature(form(1n, v))), [false, true, true, false, false, false], 'by the last byte');
+  assert.deepEqual([1n, half - 1n, half, half + 1n, curveOrder - 1n, 2n ** 256n - 1n].map((s) => isChainSignature(form(s, 27))), [true, true, true, false, false, false], 'by s');
+  assert.equal(isChainSignature('0x1234'), false, 'not 65 bytes');
 });
 
 test("the signature is of the form the chain takes: a quote whose signature ends in the parity, 0 or 1, in place of 27 or 28, or whose s is in the upper half of the curve's order, is BAD_SIGNATURE though a lenient recovery reads the maker from it, and the contract refuses a Cross that lists it for its signature; the same order signed in the chain's form is admitted, and its Cross fills", async () => {
@@ -1409,13 +1493,13 @@ test("the signature is of the form the chain takes: a quote whose signature ends
   cases.push({ what: 'an s in the upper half', order: high.order, chainForm: high.signature, refused: refusedForm(high.signature, 'upper s') });
   assert.deepEqual(cases.map((c) => c.what).sort(), ['an s in the upper half', 'the last byte 0', 'the last byte 1'], 'the three forms');
 
-  const countsBefore = (await refusedBeforeAdmission()).BAD_SIGNATURE ?? 0;
+  const countsBefore = (await refusedSoFar()).BAD_SIGNATURE ?? 0;
   const linesBefore = (await lines()).length;
   for (const c of cases) {
     // The form is the only fault: the same signer, read leniently, from the same hash.
     assert.equal((await lenient(c.order, c.refused)).toLowerCase(), maker.address.toLowerCase(), `${c.what}: a lenient recovery reads the maker`);
     assert.notEqual(c.refused, c.chainForm);
-    const answer = await post(url(), '/v1/orders', { role: 'rest', order: wire(c.order), signature: c.refused });
+    const answer = await send(url(), '/v1/orders', { role: 'rest', order: wire(c.order), signature: c.refused });
     assert.equal(answer.status, 422, `${c.what}: ${JSON.stringify(answer.body)}`);
     assert.equal(answer.body.code, 'BAD_SIGNATURE', c.what);
     assert.match(String(answer.body.error), /27 or 28/, `${c.what}: the sentence names the form`);
@@ -1424,7 +1508,7 @@ test("the signature is of the form the chain takes: a quote whose signature ends
     const refusal = await crossRefusal(rig, await betAgainst(c.order), [{ order: c.order, signature: c.refused }]);
     assert.deepEqual({ name: refusal?.name, hash: String(refusal?.args[0]).toLowerCase() }, { name: 'OspexMatching__BadSignature', hash: (await contractHash(rig, c.order)).toLowerCase() }, c.what);
   }
-  assert.equal(((await refusedBeforeAdmission()).BAD_SIGNATURE ?? 0) - countsBefore, 3, 'each counted');
+  assert.equal(((await refusedSoFar()).BAD_SIGNATURE ?? 0) - countsBefore, 3, 'each counted');
   assert.equal((await lines()).length, linesBefore, 'none a line');
 
   // One Cross sent for each form of one quote: the refused form does not fill; the chain's form, with the same bet, does.
@@ -1436,7 +1520,7 @@ test("the signature is of the form the chain takes: a quote whose signature ends
 
   // The controls: each order in the chain's form is admitted.
   for (const c of byParity.values()) {
-    const answer = await post(url(), '/v1/orders', { role: 'rest', order: wire(c.order), signature: c.signature });
+    const answer = await send(url(), '/v1/orders', { role: 'rest', order: wire(c.order), signature: c.signature });
     assert.equal(answer.status, 201, JSON.stringify(answer.body));
   }
   const sentChainForm = await crossFromTheTest(rig, await betAgainst(one.order), [{ order: one.order, signature: one.chainForm }]);
