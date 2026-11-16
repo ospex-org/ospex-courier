@@ -9,10 +9,10 @@ import { ORDER_RULES, splitNonce, type NonceParts } from './order';
 // the two marks (the door's, of an account's standing quotes; the book's, of a
 // page) are this one predicate, each from one read of the chain at one block.
 //
-// The order's half is the account's own act on the order: its cancel, a
-// cancel of everything (the account's version moved on from the one the
-// nonce names), or a floor raised above its order number on its line, at the
-// version the nonce names.
+// The order's half is the cancel, version and floor rule: its cancel, naming a
+// version that is not the account's current one (a cancel of everything moves
+// the account to a new version), or a floor raised above its order number on
+// its line, at the version the nonce names.
 //
 // The grant's half is for an order signed under a grant (a nonzero grant
 // number in its nonce): the grant is no longer the account's current one (a
@@ -40,7 +40,7 @@ export interface GrantStandingRead {
   endsAt: bigint;
 }
 
-/** The order's half: cancelled, at a version its account has left, or its order number under its line's floor at its version. */
+/** The order's half: cancelled, naming a version that is not its account's current one, or its order number under its line's floor at its version. */
 export function orderGone(nonce: NonceParts, read: OrderStandingRead): boolean {
   return read.cancelled || nonce.version !== read.version || nonce.orderNumber < read.floorAtVersion;
 }
