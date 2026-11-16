@@ -244,9 +244,19 @@ CREATE TABLE IF NOT EXISTS legs (
   recorded_taker_risk numeric(78, 0),
   -- The contract's own name for the skip, where it skipped the quote.
   skip_reason         text CHECK (skip_reason IN (
-                        'NoCourier', 'Cancelled', 'Expired', 'NoRoom', 'NothingFits', 'UnderMinFill', 'PullRefused')),
+                        'NoCourier', 'Cancelled', 'Expired', 'NoRoom', 'NothingFits', 'UnderMinFill', 'PullRefused',
+                        'GrantGone')),
   PRIMARY KEY (bet_hash, position)
 );
+
+-- The eighth reason, GrantGone, came with the contracts' approved agent: a quote signed under a grant that is no
+-- longer its account's current one, or that has ended. A table made before it holds the check with seven names, and
+-- IF NOT EXISTS above leaves a table that stands as it is; so the check is dropped and added again here, under the
+-- name the CREATE gives it, and a table that stood and one just made hold the same rule. The add holds the table's
+-- rows to the rule, which is one read of the table at each release; the table has no row before the sender's build.
+ALTER TABLE legs DROP CONSTRAINT IF EXISTS legs_skip_reason_check;
+ALTER TABLE legs ADD CONSTRAINT legs_skip_reason_check CHECK (skip_reason IN (
+  'NoCourier', 'Cancelled', 'Expired', 'NoRoom', 'NothingFits', 'UnderMinFill', 'PullRefused', 'GrantGone'));
 
 -- ──────────────────────────── events ──────────────────────────────────────
 -- One line per event: a number, the time, the run, the kind, and the order,
