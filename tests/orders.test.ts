@@ -421,7 +421,7 @@ test("the order's standing on chain: cancelled is CANCELLED; a nonce under the a
   // The floor, on the total market at line 2155 so no earlier quote of the maker's is touched.
   const market = { scorer: rig.addresses.total, lineTicks: 2_155 };
   const under = orderOn(rig, maker, { expiry: T + 600n, ...market });
-  await raiseFloor(rig, maker, under, under.nonce + 1n);
+  await raiseFloor(rig, maker, maker.address, under, under.nonce + 1n);
   T = await rig.time();
   const u = await postOrder(url(), rig, maker, 'rest', under);
   assert.equal(u.body.code, 'CANCELLED', JSON.stringify(u.body));
@@ -660,7 +660,7 @@ test('one post is one page and at most one read of the chain for the quotes, wha
       if (answer.order.nonce > top) top = answer.order.nonce;
       one = answer.order;
     }
-    await raiseFloor(rig, who, one as Order, top + 1n);
+    await raiseFloor(rig, who, who.address, one as Order, top + 1n);
   }
   // The 257th finds the last batch's sixteen standing, asks once, marks them, and is taken.
   const last = await postOne(0);
@@ -757,7 +757,7 @@ test("the door's page is the sixteen with the newest expiry, by the numbers: a p
   const T = await rig.time();
   const market = { scorer: rig.addresses.total, lineTicks: 2_605 };
   // The account's floor on this market at 500: a planted nonce under it is ended on chain, one above it is live.
-  await raiseFloor(rig, who, orderOn(rig, who, { expiry: T + 3_600n, ...market }), 500n);
+  await raiseFloor(rig, who, who.address, orderOn(rig, who, { expiry: T + 3_600n, ...market }), 500n);
   const key = keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'address' }, { type: 'int32' }], [rig.gameId, market.scorer, market.lineTicks]));
   await pool.query(
     `INSERT INTO orders (hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, market_key, side, received_block, received_hash, received_time, record_number)

@@ -274,7 +274,7 @@ test('remaining is the stake less what the chain shows filled; payable is what t
   page = (await market(url(), spread.scorer, spread.lineTicks, '&side=A')).sides.A as Page;
   assert.equal(page.quotes.length, 4);
   await cancelOnChain(rig, maker, cancelled);
-  await raiseFloor(rig, extra2, floored, floored.nonce + 1n);
+  await raiseFloor(rig, extra2, extra2.address, floored, floored.nonce + 1n);
   await rig.write(taker, rig.addresses.matching, rig.abis.OspexMatching as Abi, 'unregisterCourier', [rig.addresses.relay]);
   try {
     const head = await rig.publicClient.getBlock();
