@@ -272,7 +272,7 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
     // grant's. For a new order the grant's half was judged above, before the budgets, from this same read, so it
     // does not fire here; it is written here as the one predicate, whole.
     if (orderGone(nonce, read)) {
-      return await refuse(422, 'CANCELLED', 'This order is cancelled on chain: by its own cancel, by a cancel of everything that moved its account past the version it names, or by a floor raised above its order number on its line at that version.');
+      return await refuse(422, 'CANCELLED', 'This order is cancelled on chain: by its own cancel, by naming a version that is not its account\'s current one (a cancel of everything moves the account to a new version), or by a floor raised above its order number on its line at that version.');
     }
     if (read.grant !== null && read.currentGrant !== null && grantGone(nonce, { currentGrant: read.currentGrant, endsAt: read.grant.endsAt }, T)) {
       const gone = grantGoneRefusal(nonce.grantNumber, read.currentGrant, read.grant.endsAt, T);

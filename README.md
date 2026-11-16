@@ -97,8 +97,9 @@ the contract's own `getOrderHash` must equal the hash computed here (else `INTER
 courier's own fault); a stop on record (`STOPPED`); the game, whose start must be written, whose reporters must
 be exactly the published list, which must not have ended and whose close must not have passed (`UNKNOWN_GAME`,
 `NO_WRITTEN_START`, `REPORTERS_NOT_THE_PUBLISHED_LIST`, `GAME_ENDED`, `BETS_CLOSED`); the order's standing on chain
-(`CANCELLED`: cancelled, at a version the account has left, or under its floor at its version; `EXPIRED`;
-`FILLED`), the expiry exact with no margin; for a quote, fewer than 16 live quotes of the
+(`CANCELLED`: cancelled, at a version the account has left, or under its floor at its version; an order signed for
+a version the account is not yet at is refused the same way, and can be posted once the account is there;
+`EXPIRED`; `FILLED`), the expiry exact with no margin; for a quote, fewer than 16 live quotes of the
 account on that side of that market (`TOO_MANY_QUOTES`): one page of the account's unexpired quotes the courier has
 not marked ended, at most seventeen rows; sixteen or more standing, the chain is asked once about sixteen of them,
 the ones it shows cancelled, at a version the account has left, under its floor at its version, or under a grant
