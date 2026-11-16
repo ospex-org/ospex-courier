@@ -305,54 +305,83 @@ test('remaining is the stake less what the chain shows filled; payable is what t
   assert.equal(page.quotes.length, 2, 'registered again, the dropped account\'s quote is listed again, unmarked all along');
 });
 
-test("the market's page judges each quote as the contract does, at the version and under the grant its own nonce names: a quote at a version its account has left, one under its line's floor at the account's version and one under a grant that is gone are not listed and are marked cancelled at the block read; a quote at the floor and one under the grant that stands are listed", async () => {
+test("the market's page judges each quote as the contract does, at the version and under the grant its own nonce names: a quote at a version its account has left, one under its line's floor at the account's version and one under a grant that is gone are not listed and are marked cancelled at the block read; a quote at the floor and one under the grant that stands are listed; and a quote under a grant that stands is listed until the block whose time is one second before the grant's end", async () => {
   const mover = rig.account(21);
   const owner = rig.account(22);
   const agent = rig.account(23);
-  await rig.fund(mover);
-  await rig.fund(owner);
+  const ender = rig.account(24);
+  for (const who of [mover, owner, ender]) await rig.fund(who);
   const T = await rig.time();
+  const far = T + 100_000n;
   const spread = { scorer: rig.addresses.spread, lineTicks: 1_435 };
   const posted = async (signer: HDAccount, account: HDAccount, nonce: bigint, oddsTick: number): Promise<Hex> => {
-    const answer = await postOrderAs(url(), rig, signer, 'rest', orderOn(rig, account, { expiry: T + 3_600n, oddsTick, ...spread, nonce }));
+    const answer = await postOrderAs(url(), rig, signer, 'rest', orderOn(rig, account, { expiry: far, oddsTick, ...spread, nonce }));
     assert.equal(answer.status, 201, JSON.stringify(answer.body));
     return answer.body.orderHash as Hex;
   };
+  const sideA = async () => (await market(url(), spread.scorer, spread.lineTicks, '&side=A')).sides.A as Page;
+  const records = async (hashes: Hex[]) => {
+    const { rows } = await pool.query<{ hash: string; ended: string | null; block: string | null; block_hash: string | null }>(
+      `SELECT hash, ended, ended_block::text AS block, ended_block_hash AS block_hash FROM orders WHERE hash = ANY($1::text[])`,
+      [hashes],
+    );
+    return new Map(rows.map((r) => [r.hash, r]));
+  };
+
   // Standing, both: a quote of the mover's at version 0, where an account begins; and one the owner's agent signed
   // under the owner's first grant.
   const leftBehind = await posted(mover, mover, nonceOf(0n, 0, nextOrderNumber()), 180);
-  const g1 = await grantAgent(rig, owner, agent.address, 1_000_000n, T + 100_000n);
+  const g1 = await grantAgent(rig, owner, agent.address, 1_000_000n, far);
   const underOld = await posted(agent, owner, nonceOf(0n, g1, nextOrderNumber()), 183);
-  let page = (await market(url(), spread.scorer, spread.lineTicks, '&side=A')).sides.A as Page;
+  let page = await sideA();
   assert.deepEqual({ listed: hashesOf(page), ended: page.endedOnChain }, { listed: [leftBehind, underOld], ended: 0 }, 'both stand, and are listed');
 
   // The mover cancels everything. At the version it moved to it posts order numbers 7 and 8, then raises its floor on
-  // the line to 8: 7 is under it, 8 is at it.
+  // the line to 8: 7 is under it, 8 is at it. No other account on the page has a floor.
   const version = await cancelAll(rig, mover);
   assert.ok(version > 0n);
   const underFloor = await posted(mover, mover, nonceOf(version, 0, 7n), 181);
   const atFloor = await posted(mover, mover, nonceOf(version, 0, 8n), 182);
-  await raiseFloor(rig, mover, mover.address, orderOn(rig, mover, { expiry: T + 3_600n, ...spread }), 8n);
+  await raiseFloor(rig, mover, mover.address, orderOn(rig, mover, { expiry: far, ...spread }), 8n);
   // The owner grants the same key again: the first grant is gone, and a quote is posted under the second.
-  const g2 = await grantAgent(rig, owner, agent.address, 1_000_000n, T + 100_000n);
+  const g2 = await grantAgent(rig, owner, agent.address, 1_000_000n, far);
   assert.deepEqual([g1, g2], [1, 2]);
   const underNew = await posted(agent, owner, nonceOf(0n, g2, nextOrderNumber()), 184);
+  // A third account grants the same key until a second not far off, and a quote is posted under that grant: its
+  // current one, with another end than the owner's grants have.
+  const ends = (await rig.time()) + 300n;
+  const gEnding = await grantAgent(rig, ender, agent.address, 1_000_000n, ends);
+  const underEnding = await posted(agent, ender, nonceOf(0n, gEnding, nextOrderNumber()), 185);
 
-  const head = await rig.publicClient.getBlock();
-  page = (await market(url(), spread.scorer, spread.lineTicks, '&side=A')).sides.A as Page;
-  assert.deepEqual(hashesOf(page), [atFloor, underNew], 'listed: the quote at the floor, and the one under the grant that stands');
-  assert.deepEqual({ live: page.live, ended: page.endedOnChain, cancelled: page.markedCancelled }, { live: 5, ended: 3, cancelled: 3 }, 'the three ended are marked by this request');
-  // The records: the three marked cancelled at the block this request read; the two that stand unmarked.
+  let head = await rig.publicClient.getBlock();
+  assert.ok(head.timestamp < ends - 1n);
+  page = await sideA();
+  assert.deepEqual(hashesOf(page), [atFloor, underNew, underEnding], 'listed: the quote at the floor, and the two under grants that stand');
+  assert.deepEqual({ live: page.live, ended: page.endedOnChain, cancelled: page.markedCancelled }, { live: 6, ended: 3, cancelled: 3 }, 'the three ended are marked by this request');
+  // The records: the three marked cancelled at the block this request read; the three that stand unmarked.
   const gone = [leftBehind, underFloor, underOld];
-  const { rows } = await pool.query<{ hash: string; ended: string | null; block: string | null; block_hash: string | null }>(
-    `SELECT hash, ended, ended_block::text AS block, ended_block_hash AS block_hash FROM orders WHERE hash = ANY($1::text[])`,
-    [[...gone, atFloor, underNew]],
-  );
-  const byHash = new Map(rows.map((r) => [r.hash, r]));
+  let byHash = await records([...gone, atFloor, underNew, underEnding]);
   for (const h of gone) assert.deepEqual(byHash.get(h), { hash: h, ended: 'cancelled', block: head.number.toString(), block_hash: head.hash.toLowerCase() });
-  for (const h of [atFloor, underNew]) assert.deepEqual(byHash.get(h), { hash: h, ended: null, block: null, block_hash: null });
-  // Read again: the three marked are returned to no request.
-  page = (await market(url(), spread.scorer, spread.lineTicks, '&side=A')).sides.A as Page;
+  for (const h of [atFloor, underNew, underEnding]) assert.deepEqual(byHash.get(h), { hash: h, ended: null, block: null, block_hash: null });
+
+  // The latest block two seconds before the third account's grant ends: its quote can fill in the next block, and is listed.
+  await rig.setNextBlockTime(ends - 2n);
+  await rig.mine(1);
+  page = await sideA();
+  assert.deepEqual({ time: (await rig.time()) - ends, listed: hashesOf(page), ended: page.endedOnChain }, { time: -2n, listed: [atFloor, underNew, underEnding], ended: 0 });
+  // One second before the end: it can fill in no later block. It is not listed, and is marked at this block; the
+  // quote under the owner's grant, which ends far off, is listed still.
+  await rig.setNextBlockTime(ends - 1n);
+  await rig.mine(1);
+  head = await rig.publicClient.getBlock();
+  assert.equal(head.timestamp, ends - 1n);
+  page = await sideA();
+  assert.deepEqual({ listed: hashesOf(page), live: page.live, ended: page.endedOnChain, cancelled: page.markedCancelled }, { listed: [atFloor, underNew], live: 3, ended: 1, cancelled: 1 });
+  byHash = await records([underEnding, underNew]);
+  assert.deepEqual(byHash.get(underEnding), { hash: underEnding, ended: 'cancelled', block: head.number.toString(), block_hash: head.hash.toLowerCase() });
+  assert.deepEqual(byHash.get(underNew), { hash: underNew, ended: null, block: null, block_hash: null });
+  // Read again: the marked are returned to no request.
+  page = await sideA();
   assert.deepEqual({ live: page.live, ended: page.endedOnChain, cancelled: page.markedCancelled, listed: hashesOf(page) }, { live: 2, ended: 0, cancelled: 0, listed: [atFloor, underNew] });
 });
 
