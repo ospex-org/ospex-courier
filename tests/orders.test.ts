@@ -1384,6 +1384,65 @@ test("a revoke ends the agent's quotes: the sixteen it posted on one side are ma
   assert.deepEqual((await marks([own.body.orderHash as string]))[0], { ended: null, block: null, hash: null }, "the account's own quote is not the grant's to end");
 });
 
+test("the signature is of the form the chain takes: a quote whose signature ends in the parity, 0 or 1, in place of 27 or 28, or whose s is in the upper half of the curve's order, is BAD_SIGNATURE though a lenient recovery reads the maker from it, and the contract refuses a Cross that lists it for its signature; the same order signed in the chain's form is admitted, and its Cross fills", async () => {
+  const maker = rig.account(34);
+  await rig.fund(maker);
+  const T = await rig.time();
+  const line = { scorer: rig.addresses.spread, lineTicks: -2_085 };
+  const domain = domainOf(31337, rig.addresses.matching);
+  const lenient = (order: Order, signature: Hex) => recoverTypedDataAddress({ domain, types: ORDER_TYPE, primaryType: 'OspexOrder', message: order, signature });
+  // Quotes signed until both parities have come up, so the last byte written as the parity is 0 for one and 1 for another.
+  const byParity = new Map<number, { order: Order; signature: Hex }>();
+  for (let tries = 0; byParity.size < 2; tries++) {
+    assert.ok(tries < 64, 'both parities come up within a few signatures');
+    const order = orderOn(rig, maker, { expiry: T + 3_600n, oddsTick: 200, riskAmount: 10_000n, ...line });
+    const signature = await sign(maker, order, 31337, rig.addresses.matching);
+    byParity.set(Number.parseInt(signature.slice(130), 16) - 27, { order, signature });
+  }
+  const cases: Array<{ what: string; order: Order; chainForm: Hex; refused: Hex }> = [];
+  for (const [parity, { order, signature }] of byParity) {
+    const asParity = refusedForm(signature, 'v as parity');
+    assert.equal(Number.parseInt(asParity.slice(130), 16), parity);
+    cases.push({ what: `the last byte ${parity}`, order, chainForm: signature, refused: asParity });
+  }
+  const high = byParity.get(0) as { order: Order; signature: Hex };
+  cases.push({ what: 'an s in the upper half', order: high.order, chainForm: high.signature, refused: refusedForm(high.signature, 'upper s') });
+  assert.deepEqual(cases.map((c) => c.what).sort(), ['an s in the upper half', 'the last byte 0', 'the last byte 1'], 'the three forms');
+
+  const countsBefore = (await refusedBeforeAdmission()).BAD_SIGNATURE ?? 0;
+  const linesBefore = (await lines()).length;
+  for (const c of cases) {
+    // The form is the only fault: the same signer, read leniently, from the same hash.
+    assert.equal((await lenient(c.order, c.refused)).toLowerCase(), maker.address.toLowerCase(), `${c.what}: a lenient recovery reads the maker`);
+    assert.notEqual(c.refused, c.chainForm);
+    const answer = await post(url(), '/v1/orders', { role: 'rest', order: wire(c.order), signature: c.refused });
+    assert.equal(answer.status, 422, `${c.what}: ${JSON.stringify(answer.body)}`);
+    assert.equal(answer.body.code, 'BAD_SIGNATURE', c.what);
+    assert.match(String(answer.body.error), /27 or 28/, `${c.what}: the sentence names the form`);
+    assert.equal(await orderRow(await contractHash(rig, c.order)), null, `${c.what}: no row`);
+    // The contract's side: a Cross that lists the quote so signed is refused for that quote's signature, and for nothing else.
+    const refusal = await crossRefusal(rig, await betAgainst(c.order), [{ order: c.order, signature: c.refused }]);
+    assert.deepEqual({ name: refusal?.name, hash: String(refusal?.args[0]).toLowerCase() }, { name: 'OspexMatching__BadSignature', hash: (await contractHash(rig, c.order)).toLowerCase() }, c.what);
+  }
+  assert.equal(((await refusedBeforeAdmission()).BAD_SIGNATURE ?? 0) - countsBefore, 3, 'each counted');
+  assert.equal((await lines()).length, linesBefore, 'none a line');
+
+  // One Cross sent for each form of one quote: the refused form does not fill; the chain's form, with the same bet, does.
+  const one = cases[0] as { order: Order; chainForm: Hex; refused: Hex };
+  const bet = await betAgainst(one.order);
+  const sentRefused = await crossFromTheTest(rig, bet, [{ order: one.order, signature: one.refused }]);
+  assert.equal(sentRefused.filled, false, 'the Cross listing the refused form does not fill');
+  assert.equal(await rig.read<bigint>(rig.addresses.matching, rig.abis.OspexMatching as Abi, 's_filledRisk', [await contractHash(rig, one.order)]), 0n, 'nothing filled');
+
+  // The controls: each order in the chain's form is admitted.
+  for (const c of byParity.values()) {
+    const answer = await post(url(), '/v1/orders', { role: 'rest', order: wire(c.order), signature: c.signature });
+    assert.equal(answer.status, 201, JSON.stringify(answer.body));
+  }
+  const sentChainForm = await crossFromTheTest(rig, await betAgainst(one.order), [{ order: one.order, signature: one.chainForm }]);
+  assert.equal(sentChainForm.filled, true, `the same quote in the chain's form fills: ${JSON.stringify(sentChainForm)}`);
+});
+
 test('a stop on record for the hash is honoured at the door: STOPPED, as a line (the stop build writes the record; the door reads it)', async () => {
   const maker = rig.accounts.maker;
   const T = await rig.time();
