@@ -144,6 +144,10 @@ function toRow(r: Record<string, unknown>): OrderRow {
  * returned, the request marks ended every quote whose expiry is at or under
  * the final block's time plus one (it can fill in no block after F), and
  * passes to the caller those whose expiry is above the block's time plus one.
+ * The mark is of a quote not ended already, judged on the row as it stands when
+ * the mark reaches it: a quote another writer ended while this scan held it (a
+ * stop, or a read of the chain that showed it cancelled or filled) keeps that
+ * end, the first one, and is not relabelled expired.
  * $1 market key, $2 side, $3 $4 the cursor, $5 the bound, $6 F + 1, $7 T + 1,
  * $8 the page. The order and the cursor are both on the table's columns as
  * numbers (`odds_tick`, `record_number`); the text casts are inside the JSON
@@ -159,7 +163,7 @@ export const SCAN_SQL = `WITH scanned AS (
 ),
 marked AS (
   UPDATE orders SET ended = 'expired', ended_at = now()
-  WHERE hash IN (SELECT hash FROM scanned WHERE expiry <= $6::numeric)
+  WHERE hash IN (SELECT hash FROM scanned WHERE expiry <= $6::numeric) AND ended IS NULL
   RETURNING hash
 ),
 live AS (
