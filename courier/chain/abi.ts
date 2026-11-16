@@ -38,12 +38,24 @@ export type ModuleName = keyof typeof MODULE_TYPES;
 /** The signed order's struct, as the contract's cross, cancelOrder and getOrderHash take it. */
 const ORDER_STRUCT = '(address account, uint256 gameId, address scorer, int32 lineTicks, uint8 positionType, uint16 oddsTick, uint256 riskAmount, uint256 nonce, uint256 expiry, uint256 minFill)';
 
+/** A line as a grant's list names it: the three fields a signed order names a market by. */
+const LINE_STRUCT = '(uint256 gameId, address scorer, int32 lineTicks)';
+
 /**
  * The matching contract: what the courier reads of it (the door's and the
  * book's reads, the constants the door holds to), the registration the rig
  * makes, and the calls the tests make from the chain's side (a cancel, a
- * raised floor, the lift, and one Cross sent by the test from the relay's
- * sender to show the contract's own boundary).
+ * raised floor, the cancel of everything, a grant and its revoke, the lift,
+ * and one Cross sent by the test from the relay's sender to show the
+ * contract's own boundary).
+ *
+ * An order's standing is read as the contract judges it: the account's
+ * version, the floor of the order's line at the order's own version (the
+ * nonce's top 128 bits, not the account's current version: `getFloor` reads
+ * only the current one, so it is not here), and for an order under a grant
+ * the account's current grant, the grant's record and whether its list names
+ * the line. `splitNonce` is the contract's own split of a nonce, which the
+ * tests hold the courier's to; the courier splits the nonce itself.
  */
 export const MATCHING_ABI = parseAbi([
   'function i_timelock() view returns (address)',
@@ -61,10 +73,19 @@ export const MATCHING_ABI = parseAbi([
   'function LOT() view returns (uint256)',
   'function MAX_TAKING_LIFE() view returns (uint256)',
   'function s_cancelledOrders(bytes32 orderHash) view returns (bool)',
-  'function s_minNonces(address account, bytes32 marketKey) view returns (uint256)',
+  'function s_version(address account) view returns (uint128)',
+  'function s_floors(address account, uint128 version, bytes32 lineKey) view returns (uint96)',
+  'function s_currentGrant(address account) view returns (uint32)',
+  'function getGrant(address account, uint32 number) view returns (address agent, uint64 endsAt, uint256 stakeCap, uint16 lineCount)',
+  'function isGrantLine(address account, uint32 number, uint256 gameId, address scorer, int32 lineTicks) view returns (bool)',
+  'function isLiveAgent(address account, address who) view returns (bool)',
+  'function splitNonce(uint256 nonce) pure returns (uint128 version, uint32 grantNumber, uint96 orderNumber)',
   'function s_filledRisk(bytes32 orderHash) view returns (uint256)',
   `function cancelOrder(${ORDER_STRUCT} order)`,
-  'function raiseMinNonce(uint256 gameId, address scorer, int32 lineTicks, uint256 newMinNonce)',
+  'function raiseFloor(address account, uint256 gameId, address scorer, int32 lineTicks, uint96 floor)',
+  'function cancelAll(address account)',
+  `function grantAgent(address agent, uint256 stakeCap, uint64 endsAt, ${LINE_STRUCT}[] lines) returns (uint32 number)`,
+  'function revokeAgent()',
   'function liftTakingStakeCap()',
   `function cross((${ORDER_STRUCT} order, bytes signature) taking, (${ORDER_STRUCT} order, bytes signature)[] resting)`,
 ]);
