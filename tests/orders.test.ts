@@ -2,13 +2,36 @@ import assert from 'node:assert/strict';
 import { connect } from 'node:net';
 import { after, before, test } from 'node:test';
 import pg from 'pg';
-import { decodeFunctionData, decodeFunctionResult, encodeAbiParameters, encodeFunctionData, encodeFunctionResult, keccak256, toBytes, type Abi, type Address, type Hex } from 'viem';
+import { decodeFunctionData, decodeFunctionResult, encodeAbiParameters, encodeFunctionData, encodeFunctionResult, keccak256, recoverTypedDataAddress, toBytes, type Abi, type Address, type Hex } from 'viem';
 import type { HDAccount } from 'viem/accounts';
-import { MULTICALL_ABI, MULTICALL_ADDRESS } from '../courier/chain/abi';
-import { orderHash, orderSigner } from '../courier/orders/order';
+import { MATCHING_ABI, MULTICALL_ABI, MULTICALL_ADDRESS } from '../courier/chain/abi';
+import { orderHash, orderSigner, splitNonce } from '../courier/orders/order';
 import { openPool } from '../courier/records/store';
 import { get, startCourier } from './support/courier';
-import { cancelOnChain, contractHash, crossFromTheTest, liftCap, orderOn, post, postOrder, raiseFloor, sign, wire, type Order } from './support/orders';
+import {
+  cancelAll,
+  cancelOnChain,
+  contractHash,
+  crossFromTheTest,
+  crossRefusal,
+  domainOf,
+  grantAgent,
+  liftCap,
+  nextOrderNumber,
+  nonceOf,
+  ORDER_TYPE,
+  orderOn,
+  post,
+  postOrder,
+  postOrderAs,
+  raiseFloor,
+  refusedForm,
+  revokeAgent,
+  sign,
+  wire,
+  type Answer,
+  type Order,
+} from './support/orders';
 import type { Rig } from './support/rig';
 import { publishedList, startStack, type Stack } from './support/stack';
 
@@ -842,6 +865,208 @@ test("a quote the chain shows filled, with less than a lot of its stake left, is
   const seventeenth = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, oddsTick: 200, riskAmount: 10_000n, ...market }));
   assert.equal(seventeenth.body.code, 'TOO_MANY_QUOTES', JSON.stringify(seventeenth.body));
   assert.equal(await unendedRows(who), 16, 'the partly filled quote counts: sixty lots can still fill');
+});
+
+// ──────────────────────────── the version, the floor and the grant ────────
+
+/** One side of one market's page, as the courier serves it. */
+interface SideServed {
+  quotes: Array<{ orderHash: string; account: string; remaining: string }>;
+  live: number;
+  endedOnChain: number;
+  markedCancelled: number;
+  markedFilled: number;
+}
+
+async function sideOf(market: { scorer: Address; lineTicks: number }, side: 'A' | 'B'): Promise<SideServed> {
+  const page = await get(url(), `/v1/book?gameId=${rig.gameId}&scorer=${market.scorer}&lineTicks=${market.lineTicks}&side=${side}`);
+  assert.equal(page.status, 200, JSON.stringify(page.body));
+  return (page.body.sides as Record<string, SideServed>)[side] as SideServed;
+}
+
+/** The floor the chain holds for an account on a line at a version. */
+async function floorOnChain(account: Address, version: bigint, line: { scorer: Address; lineTicks: number }): Promise<bigint> {
+  const key = keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'address' }, { type: 'int32' }], [rig.gameId, line.scorer, line.lineTicks]));
+  return BigInt(await rig.publicClient.readContract({ address: rig.addresses.matching, abi: MATCHING_ABI, functionName: 's_floors', args: [account, version, key] }));
+}
+
+interface BudgetRow {
+  row_version: string;
+  account: string;
+  budget: string;
+  budget_at: Date;
+  refused: string;
+  last_refused_at: Date | null;
+  first_seen_at: Date;
+}
+
+/**
+ * The two budget rows a post for this account could touch, the account's and the courier's, each whole and with its
+ * row version: any write to a row changes the version, even one that sets what the row already held.
+ */
+async function budgetRows(account: Address): Promise<BudgetRow[]> {
+  const { rows } = await pool.query<BudgetRow>(
+    `SELECT a.xmin::text AS row_version, a.account, a.budget, a.budget_at, a.refused, a.last_refused_at, a.first_seen_at
+     FROM accounts a WHERE a.account = ANY($1::text[]) ORDER BY a.account`,
+    [[account.toLowerCase(), 'courier']],
+  );
+  return rows;
+}
+
+/**
+ * Sends one post for an order of `account` and asserts it cost the account nothing and left nothing: both budget
+ * rows as they were, each with a budget it could have been taken from; no line written, of any kind; no row for the
+ * order. Returns the answer, for the caller to judge.
+ */
+async function costsNothing(account: Address, order: Order, send: () => Promise<Answer>): Promise<Answer> {
+  const hash = await contractHash(rig, order);
+  const rowsBefore = await budgetRows(account);
+  assert.equal(rowsBefore.length, 2, 'the account and the courier each hold a budget row before the post');
+  for (const row of rowsBefore) assert.ok(Number(row.budget) >= 1, `${row.account} has a budget to be taken from: ${row.budget}`);
+  const linesBefore = (await lines()).length;
+  const answer = await send();
+  assert.deepEqual(await budgetRows(account), rowsBefore, `both budget rows are as they were: ${JSON.stringify(answer.body)}`);
+  assert.equal((await lines()).length, linesBefore, `no line was written: ${JSON.stringify(answer.body)}`);
+  assert.equal(await orderRow(hash), null, 'the order holds no row');
+  return answer;
+}
+
+/** A bet by the rig's taker against one quote: the other side, the same price, the stake the cap allows. */
+async function betAgainst(quote: Order): Promise<{ order: Order; signature: Hex }> {
+  const taker = rig.accounts.taker;
+  const order: Order = { ...orderOn(rig, taker, { expiry: (await rig.time()) + 20n, oddsTick: quote.oddsTick, riskAmount: 10_000n, scorer: quote.scorer, lineTicks: quote.lineTicks }), positionType: quote.positionType === 0 ? 1 : 0 };
+  return { order, signature: await sign(taker, order, 31337, rig.addresses.matching) };
+}
+
+test("the nonce's three numbers: one word of three literals, a version, a grant number and the top order number, is split by the pinned contract and by the courier into the same three; a plain small nonce is version 0, grant 0 and itself", async () => {
+  // The word as the contract reads it: the version in the top 128 bits, the grant number in the next 32, the order
+  // number in the low 96. Written here whole, and its three parts written beside it, none computed from another.
+  const word = 0x0123456789abcdef0011223344556677_89abcdef_ffffffffffffffffffffffffn;
+  const parts = { version: 0x0123456789abcdef0011223344556677n, grantNumber: 0x89abcdef, orderNumber: 79_228_162_514_264_337_593_543_950_335n };
+  assert.equal(parts.orderNumber, 2n ** 96n - 1n, 'the order number is the top one');
+  const onChain = async (nonce: bigint) => {
+    const [version, grantNumber, orderNumber] = await rig.publicClient.readContract({ address: rig.addresses.matching, abi: MATCHING_ABI, functionName: 'splitNonce', args: [nonce] });
+    return { version, grantNumber, orderNumber };
+  };
+  assert.deepEqual(await onChain(word), parts, "the pinned contract's split of the word");
+  assert.deepEqual(splitNonce(word), parts, "the courier's split of the word");
+  assert.equal(nonceOf(parts.version, parts.grantNumber, parts.orderNumber), word, 'the packing the other cases build their nonces with gives the word back');
+  // The control: a nonce as an account that has cancelled nothing and granted nothing signs it.
+  assert.deepEqual(await onChain(7n), { version: 0n, grantNumber: 0, orderNumber: 7n });
+  assert.deepEqual(splitNonce(7n), { version: 0n, grantNumber: 0, orderNumber: 7n });
+});
+
+test("the version and the floor, as the contract judges them: an order is judged at the version its own nonce names and by its line's floor at that version; one under the floor is CANCELLED and one at it is taken; an order at a version the account has left is CANCELLED though above that version's floor; the floor of a version left decides nothing at the version the account is at; the top order number is taken under the highest floor a line can have", async () => {
+  const who = rig.account(20);
+  await rig.fund(who);
+  const T = await rig.time();
+  const line = { scorer: rig.addresses.spread, lineTicks: -2_015 };
+  const at = (version: bigint, orderNumber: bigint, market: { scorer: Address; lineTicks: number } = line): Order => orderOn(rig, who, { expiry: T + 3_600n, ...market, nonce: nonceOf(version, 0, orderNumber) });
+  const send = (order: Order) => postOrder(url(), rig, who, 'rest', order);
+  const refused: Order[] = [];
+  const cancelled = async (order: Order, what: string) => {
+    const answer = await send(order);
+    assert.equal(answer.status, 422, `${what}: ${JSON.stringify(answer.body)}`);
+    assert.equal(answer.body.code, 'CANCELLED', what);
+    refused.push(order);
+  };
+  const taken = async (order: Order, what: string) => {
+    const answer = await send(order);
+    assert.equal(answer.status, 201, `${what}: ${JSON.stringify(answer.body)}`);
+    assert.equal((await orderRow(answer.body.orderHash as string))?.nonce, order.nonce.toString(), `${what}: the row holds the nonce whole`);
+  };
+
+  // Version 0, where an account begins. The line's floor raised to 50: 49 is under it, 50 is at it.
+  await raiseFloor(rig, who, who.address, at(0n, 0n), 50n);
+  await cancelled(at(0n, 49n), 'one under the floor, at version 0');
+  await taken(at(0n, 50n), 'at the floor, at version 0');
+
+  // The account cancels everything. It is at a new version, which the contract drew, and that version's floors are zero.
+  const version = await cancelAll(rig, who);
+  assert.ok(version > 0n, 'the account is at a version above zero');
+  assert.deepEqual({ left: await floorOnChain(who.address, 0n, line), current: await floorOnChain(who.address, version, line) }, { left: 50n, current: 0n }, 'the floor of the version left stands at 50; the current version has none');
+  // At the version left an order is dead, whatever its number: 60 is above that version's floor, and the version decides.
+  await cancelled(at(0n, 60n), 'an order at the version the account has left, above that version\'s floor');
+  // At the current version an order is judged by the current version's floor: 10 is under the 50 of the version left, and is taken.
+  await taken(at(version, 10n), 'an order at the current version, under the floor of the version left');
+
+  // The floor raised at the current version, to 5: 4 is under it, 5 is at it, and the 10 taken above still stands.
+  await raiseFloor(rig, who, who.address, at(version, 0n), 5n);
+  await cancelled(at(version, 4n), 'one under the floor, at the current version');
+  await taken(at(version, 5n), 'at the floor, at the current version');
+
+  // The highest floor a line can have is the top order number, 2^96 − 1, so that number is always signable: under that
+  // floor the top number is taken and the one before it is not.
+  const top = 2n ** 96n - 1n;
+  const other = { scorer: rig.addresses.total, lineTicks: 2_915 };
+  await raiseFloor(rig, who, who.address, at(version, 0n, other), top);
+  await cancelled(at(version, top - 1n, other), 'one under the top order number, the floor at the top');
+  await taken(at(version, top, other), 'the top order number, the floor at the top');
+
+  // Each refusal here came after admission: a line, and no row.
+  for (const order of refused) {
+    const hash = (await contractHash(rig, order)).toLowerCase();
+    assert.equal((await lines(`WHERE kind = 'order refused' AND reason = 'CANCELLED' AND order_hash = '${hash}'`)).length, 1, 'one line for the refusal');
+    assert.equal(await orderRow(hash), null, 'a refused order holds no row');
+  }
+});
+
+test("a cancel of everything moves the account to a new version: a new order at the version left is CANCELLED; every quote at the version left is marked cancelled at the block read, by the door's count and by the market's page alike; an order signed beforehand for the version the account moved to is taken and listed", async () => {
+  const who = rig.account(21);
+  await rig.fund(who);
+  const T = await rig.time();
+  const counted = { scorer: rig.addresses.spread, lineTicks: -2_025 };
+  const paged = { scorer: rig.addresses.total, lineTicks: 2_925 };
+  const countedHashes: string[] = [];
+  for (let i = 0; i < 16; i++) {
+    const answer = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...counted }));
+    assert.equal(answer.status, 201, `${i}: ${JSON.stringify(answer.body)}`);
+    countedHashes.push(answer.body.orderHash as string);
+  }
+  const pagedHashes: string[] = [];
+  for (let i = 0; i < 3; i++) {
+    const answer = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...paged }));
+    assert.equal(answer.status, 201, `${i}: ${JSON.stringify(answer.body)}`);
+    pagedHashes.push(answer.body.orderHash as string);
+  }
+
+  // The version a cancel of everything moves to is the current one plus one plus the first eight bytes of the hash of
+  // the block before the cancel's own, so it is known once that block is mined. An order for it is signed here,
+  // before the cancel is sent.
+  const before = await rig.publicClient.getBlock();
+  const next = 1n + BigInt(before.hash.slice(0, 18));
+  const ahead = orderOn(rig, who, { expiry: T + 3_600n, ...counted, nonce: nonceOf(next, 0, nextOrderNumber()) });
+  const aheadSignature = await sign(who, ahead, 31337, rig.addresses.matching);
+  assert.equal(await cancelAll(rig, who), next, 'the version the contract drew is the one the order was signed for');
+  assert.equal(await unendedRows(who), 19, 'cancelled on chain, the nineteen stand in the records until a request asks the chain about them');
+
+  // A new order at the version left is refused at the door.
+  const stale = await postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: T + 3_600n, ...paged }));
+  assert.equal(stale.status, 422, JSON.stringify(stale.body));
+  assert.equal(stale.body.code, 'CANCELLED');
+
+  // The door's count: the order signed beforehand finds sixteen standing on its side, asks the chain once about them,
+  // marks the sixteen it shows at the version left, at the block it read, and is taken.
+  const head = await rig.publicClient.getBlock();
+  const callsBefore = stack.proxy.count('eth_call');
+  const taken = await post(url(), '/v1/orders', { role: 'rest', order: wire(ahead), signature: aheadSignature });
+  assert.equal(taken.status, 201, JSON.stringify(taken.body));
+  assert.equal(stack.proxy.count('eth_call') - callsBefore, 2, "the door's own read and one read of the sixteen");
+  const countedMarks = await marks(countedHashes);
+  assert.equal(countedMarks.length, 16);
+  for (const m of countedMarks) assert.deepEqual(m, { ended: 'cancelled', block: head.number.toString(), hash: head.hash.toLowerCase() }, 'marked cancelled at the block the door read');
+
+  // The market's page: the three at the version left are not listed, and the page marks them at the block it read.
+  const page = await sideOf(paged, 'A');
+  assert.deepEqual({ listed: page.quotes.length, live: page.live, ended: page.endedOnChain, cancelled: page.markedCancelled }, { listed: 0, live: 3, ended: 3, cancelled: 3 });
+  const pagedMarks = await marks(pagedHashes);
+  assert.equal(pagedMarks.length, 3);
+  for (const m of pagedMarks) assert.deepEqual(m, { ended: 'cancelled', block: head.number.toString(), hash: head.hash.toLowerCase() }, 'marked cancelled at the block the page read');
+
+  // The order signed beforehand for the new version stands: listed, alone on its side, and nothing more is marked.
+  const stands = await sideOf(counted, 'A');
+  assert.deepEqual(stands.quotes.map((q) => q.orderHash), [taken.body.orderHash]);
+  assert.deepEqual({ ended: stands.endedOnChain, cancelled: stands.markedCancelled }, { ended: 0, cancelled: 0 });
 });
 
 test('a stop on record for the hash is honoured at the door: STOPPED, as a line (the stop build writes the record; the door reads it)', async () => {
