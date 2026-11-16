@@ -1,4 +1,4 @@
-import { encodeFunctionData, getAddress, type Abi, type Address, type Hex } from 'viem';
+import { decodeErrorResult, encodeFunctionData, getAddress, type Abi, type Address, type Hex } from 'viem';
 import type { HDAccount } from 'viem/accounts';
 import type { Rig } from './rig';
 
@@ -110,8 +110,79 @@ export async function cancelOnChain(rig: Rig, who: HDAccount, order: Order): Pro
   await rig.write(who, rig.addresses.matching, rig.abis.OspexMatching as Abi, 'cancelOrder', [order]);
 }
 
-export async function raiseFloor(rig: Rig, who: HDAccount, order: Order, newMinNonce: bigint): Promise<void> {
-  await rig.write(who, rig.addresses.matching, rig.abis.OspexMatching as Abi, 'raiseMinNonce', [order.gameId, order.scorer, order.lineTicks, newMinNonce]);
+/**
+ * Raises `account`'s floor on the order's line, at the account's current version, to `floor`: an order number, the
+ * nonce's low 96 bits. Sent by `who`, the account itself or its live agent.
+ */
+export async function raiseFloor(rig: Rig, who: HDAccount, account: Address, order: Order, floor: bigint): Promise<void> {
+  await rig.write(who, rig.addresses.matching, rig.abis.OspexMatching as Abi, 'raiseFloor', [account, order.gameId, order.scorer, order.lineTicks, floor]);
+}
+
+/** The account cancels everything: the contract moves it to a new version, which is returned as the chain then holds it. */
+export async function cancelAll(rig: Rig, who: HDAccount): Promise<bigint> {
+  await rig.write(who, rig.addresses.matching, rig.abis.OspexMatching as Abi, 'cancelAll', [who.address]);
+  return BigInt(await rig.read<bigint>(rig.addresses.matching, rig.abis.OspexMatching as Abi, 's_version', [who.address]));
+}
+
+/** A line as a grant's list names it. */
+export interface GrantLine {
+  gameId: bigint;
+  scorer: Address;
+  lineTicks: number;
+}
+
+/**
+ * `who` grants `agent`: the most one order the agent signs may stake, the second the grant ends at, and the lines
+ * it may sign on, none for every market. Returns the grant's number, read back as the account's current grant.
+ */
+export async function grantAgent(rig: Rig, who: HDAccount, agent: Address, stakeCap: bigint, endsAt: bigint, lines: GrantLine[] = []): Promise<number> {
+  await rig.write(who, rig.addresses.matching, rig.abis.OspexMatching as Abi, 'grantAgent', [agent, stakeCap, endsAt, lines]);
+  return Number(await rig.read<number>(rig.addresses.matching, rig.abis.OspexMatching as Abi, 's_currentGrant', [who.address]));
+}
+
+/** `who` ends its current grant. */
+export async function revokeAgent(rig: Rig, who: HDAccount): Promise<void> {
+  await rig.write(who, rig.addresses.matching, rig.abis.OspexMatching as Abi, 'revokeAgent', []);
+}
+
+/**
+ * A nonce, packed as the contract's `_split` reads the word: the version above bit 128, the grant number in the
+ * 32 bits above bit 96, the order number in the low 96.
+ */
+export function nonceOf(version: bigint, grantNumber: number, orderNumber: bigint): bigint {
+  return (version << 128n) | (BigInt(grantNumber) << 96n) | orderNumber;
+}
+
+/** An order number no earlier order of this run has used: the counter `orderOn` draws its nonces from. */
+export function nextOrderNumber(): bigint {
+  return nonces++;
+}
+
+/**
+ * Signs an order with `signer`, whoever the order's account is, and posts it under a role: an order its account's
+ * agent signs, or one a stranger does.
+ */
+export async function postOrderAs(courierUrl: string, rig: Rig, signer: HDAccount, role: 'rest' | 'take', order: Order, headers: Record<string, string> = {}): Promise<Answer & { signature: Hex }> {
+  return postOrder(courierUrl, rig, signer, role, order, headers);
+}
+
+/** The order of the curve the signatures are on. */
+const CURVE_ORDER = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+
+/**
+ * A signature of the same signer over the same hash in a form the contract refuses. `v as parity`: the last byte
+ * written 0 or 1, the parity itself, in place of 27 or 28. `upper s`: the other signature the same key and hash
+ * allow, its `s` taken from the curve's order, which puts it in the upper half, and its `v` flipped to match. A
+ * library that recovers leniently reads the signer from either; the contract's check takes neither.
+ */
+export function refusedForm(signature: Hex, how: 'v as parity' | 'upper s'): Hex {
+  const r = signature.slice(2, 66);
+  const s = signature.slice(66, 130);
+  const v = Number.parseInt(signature.slice(130), 16);
+  if (v !== 27 && v !== 28) throw new Error(`a signature to reshape ends in 27 or 28; this one ends in ${v}`);
+  if (how === 'v as parity') return `0x${r}${s}${(v - 27).toString(16).padStart(2, '0')}`;
+  const upper = CURVE_ORDER - BigInt(`0x${s}`);
+  return `0x${r}${upper.toString(16).padStart(64, '0')}${(v === 27 ? 28 : 27).toString(16)}`;
 }
 
 export interface Signed {
@@ -132,6 +203,26 @@ export async function crossFromTheTest(rig: Rig, taking: Signed, resting: Signed
   } catch (err) {
     return { filled: false, reason: err instanceof Error ? err.message : String(err) };
   }
+}
+
+/**
+ * What the contract would answer one Cross with, asked of the chain without sending it: null where it would fill,
+ * else the contract's own error, by name and with its values, read against the matching contract's errors. The
+ * call is made as the relay's sender through the relay, which hands the matching contract's refusal back as it
+ * is. A refusal that is not one of the matching contract's errors is thrown, not named.
+ */
+export async function crossRefusal(rig: Rig, taking: Signed, resting: Signed[]): Promise<{ name: string; args: readonly unknown[] } | null> {
+  const data = encodeFunctionData({ abi: rig.abis.OspexCourierRelay as Abi, functionName: 'cross', args: [taking, resting] } as never);
+  const res = await fetch(rig.url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ from: rig.accounts.sender.address, to: rig.addresses.relay, data }, 'latest'] }),
+  });
+  const body = (await res.json()) as { result?: unknown; error?: { message?: string; data?: unknown } };
+  if (body.error === undefined) return null;
+  if (typeof body.error.data !== 'string') throw new Error(`the Cross was refused with no data to name the refusal by: ${String(body.error.message)}`);
+  const refusal = decodeErrorResult({ abi: rig.abis.OspexMatching as Abi, data: body.error.data as Hex });
+  return { name: refusal.errorName, args: refusal.args ?? [] };
 }
 
 /** The quotes of a page, by hash, in the order served. */

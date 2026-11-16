@@ -17,7 +17,7 @@ const HASH = (seed: string) => `0x${hex(64, seed)}`;
 const ADDRESS = (seed: string) => `0x${hex(40, seed)}`;
 const SIGNATURE = (seed: string) => `0x${hex(130, seed)}`;
 
-async function insertOrder(hash: string, role: 'rest' | 'take', overrides: Record<string, unknown> = {}): Promise<void> {
+async function insertOrder(hash: string, role: 'rest' | 'take', overrides: Record<string, unknown> = {}, on: pg.Pool = pool): Promise<void> {
   const row: Record<string, unknown> = {
     hash,
     role,
@@ -41,7 +41,7 @@ async function insertOrder(hash: string, role: 'rest' | 'take', overrides: Recor
     ...overrides,
   };
   const columns = Object.keys(row);
-  await pool.query(`INSERT INTO orders (${columns.join(', ')}) VALUES (${columns.map((_, i) => `$${i + 1}`).join(', ')})`, Object.values(row));
+  await on.query(`INSERT INTO orders (${columns.join(', ')}) VALUES (${columns.map((_, i) => `$${i + 1}`).join(', ')})`, Object.values(row));
 }
 
 async function refused(work: Promise<unknown>, code: string, what: string): Promise<void> {
@@ -196,6 +196,45 @@ test('one condition of a key is open at a time; a cleared one lets the next open
   await pool.query('UPDATE conditions SET cleared_at = now(), cleared_line = $1 WHERE key = $2 AND cleared_at IS NULL', [await line(), 'chain-unreachable']);
   await pool.query('INSERT INTO conditions (key, opened_line) VALUES ($1, $2)', ['chain-unreachable', await line()]);
   await refused(pool.query('UPDATE conditions SET cleared_at = now() WHERE key = $1 AND cleared_at IS NULL', ['chain-unreachable']), '23514', 'a clearing with no line');
+});
+
+test("a legs table that holds the skip reasons' check as it stood before GrantGone is brought to this schema by applying it: the check read back names the eight reasons, a leg skipped for its grant is taken where it was refused, an unlisted reason is still refused, and a table this schema made by itself holds the same check", async () => {
+  const made = await db.createWithSchema('legs');
+  const legs = openPool(made.url, null);
+  try {
+    const check = async (on: pg.Pool): Promise<string[]> =>
+      (await on.query<{ definition: string }>("SELECT pg_get_constraintdef(c.oid) AS definition FROM pg_constraint c WHERE c.conrelid = 'legs'::regclass AND c.conname = 'legs_skip_reason_check'")).rows.map((r) => r.definition);
+    // The table as the schema before this one left it: the same check under the same name, with seven reasons.
+    await legs.query('ALTER TABLE legs DROP CONSTRAINT legs_skip_reason_check');
+    await legs.query("ALTER TABLE legs ADD CONSTRAINT legs_skip_reason_check CHECK (skip_reason IN ('NoCourier', 'Cancelled', 'Expired', 'NoRoom', 'NothingFits', 'UnderMinFill', 'PullRefused'))");
+    const seven = "CHECK ((skip_reason = ANY (ARRAY['NoCourier'::text, 'Cancelled'::text, 'Expired'::text, 'NoRoom'::text, 'NothingFits'::text, 'UnderMinFill'::text, 'PullRefused'::text])))";
+    assert.deepEqual(await check(legs), [seven], 'the older check, as the database states it');
+
+    // A Cross to hang legs on, and a leg under each kind of reason.
+    const { rows } = await legs.query<{ id: string }>('INSERT INTO runs DEFAULT VALUES RETURNING id');
+    await legs.query('INSERT INTO lanes (sender, epoch, owner_run) VALUES ($1, 1, $2)', [ADDRESS('9'), Number(rows[0]?.id)]);
+    await insertOrder(HASH('b1'), 'take', {}, legs);
+    await insertOrder(HASH('1'), 'rest', {}, legs);
+    await legs.query("INSERT INTO crosses (bet_hash, lane, epoch, reservation, block_number, block_hash, block_time, state) VALUES ($1, $2, 1, 1, 100, $3, 1794268800, 'intent')", [HASH('b1'), ADDRESS('9'), HASH('e')]);
+    const leg = (position: number, reason: string) =>
+      legs.query('INSERT INTO legs (bet_hash, position, order_hash, expected_maker_risk, expected_taker_risk, skip_reason) VALUES ($1, $2, $3, 100, 104, $4)', [HASH('b1'), position, HASH('1'), reason]);
+    await leg(0, 'PullRefused');
+    await refused(leg(1, 'GrantGone'), '23514', 'the older table refuses the eighth reason');
+
+    // This schema applied over it: the check is the eight, and the row that stood still stands under it.
+    await applySchema(legs);
+    const eight = "CHECK ((skip_reason = ANY (ARRAY['NoCourier'::text, 'Cancelled'::text, 'Expired'::text, 'NoRoom'::text, 'NothingFits'::text, 'UnderMinFill'::text, 'PullRefused'::text, 'GrantGone'::text])))";
+    assert.deepEqual(await check(legs), [eight], 'the check after this schema is applied over the older table');
+    await leg(1, 'GrantGone');
+    await refused(leg(2, 'Gone'), '23514', 'a reason the schema does not list');
+    assert.deepEqual((await legs.query<{ skip_reason: string }>('SELECT l.skip_reason FROM legs l ORDER BY l.position')).rows.map((r) => r.skip_reason), ['PullRefused', 'GrantGone']);
+    // Applied again it is the same check; and the table this schema made by itself, with no older one under it, holds it too.
+    await applySchema(legs);
+    assert.deepEqual(await check(legs), [eight]);
+    assert.deepEqual(await check(pool), [eight], 'a table made by this schema alone');
+  } finally {
+    await legs.end();
+  }
 });
 
 test('the courier\'s own budget row and an account\'s both fit the accounts table, and nothing else does', async () => {

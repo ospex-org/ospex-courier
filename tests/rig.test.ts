@@ -53,7 +53,7 @@ test('the courier read the set from the signpost and the status names every addr
   }
   assert.equal(set.chainId, '31337');
   assert.equal(set.entryId, rig.bettingEntryId.toString());
-  assert.equal(lower(set.commit ?? ''), '0x0b0a5d79f36ff2d22e42cf09edbe95dde783678e');
+  assert.equal(lower(set.commit ?? ''), '0xed449dbd8e69ad4fa1e9874635040d1dd6e9ca5e');
   const sender = body.sender as Record<string, string | null>;
   assert.equal(lower(sender.relay ?? ''), lower(rig.accounts.sender.address));
   assert.equal(sender.key, null, 'this build holds no key');
