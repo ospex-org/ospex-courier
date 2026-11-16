@@ -119,26 +119,67 @@ courier's budget refilling all day (86,400 admitted a day) that is about 113 MB 
 defaults (13 games, 3 markets, 2 sides, re-signed every 10 minutes: 11,232 orders a day) about 15 MB a day, 5.4 GB
 a year. The status address computes the same from the database it has, once a table holds a thousand rows or more.
 
-### The three shapes this build does not yet write
+### The two shapes a stop writes
 
-Measured from fixture rows the same test lays in the frozen schema's shape: every column as the schema has it,
-and the free parts (a line's `facts`, a Cross's `node_answer`, both `jsonb`) holding what this fixture puts there,
-small objects of a few fields. These are fixture figures, to be read again from real rows once the stop build and
-the sender build write them; the status address will then serve them under `database.tables` as it serves the
-orders table's.
+A stop writes one row to `stop_messages` a message, which holds the signed payload once, and one row to `stops` a
+hash it stops; a stop ahead's row holds its order's signed original, the second from which that order can fill no
+more, and its grant number besides. Two kinds of figure follow, and they are not the same kind. Both are from one
+run of the suite on this build, on Postgres 17 on Linux.
+
+**Read back from rows the route wrote** (`tests/stops.test.ts`, case 12): a real signer on the local chain posts
+one message stopping a hundred quotes the door had admitted, and one message stopping sixteen orders ahead. The rows
+each message wrote are counted exactly; their bytes are the database's size of each row's data, added up, with no
+index and no page in them:
+
+| what was sent | `stops` rows | their bytes | the one `stop_messages` row | the one line |
+| -- | -- | -- | -- | -- |
+| one stop of 100 carried quotes | 100 | 16,000 (160 a row) | 7,360 | 190 |
+| one stop ahead of 16 originals | 16 | 10,240 (640 a row) | 1,553 | 190 |
+
+Two messages are too few for an average with indexes: a relation grows a page of 8,192 bytes at a time, and the
+relations these rows went into held other cases' rows already. What the two establish is the shape, from real rows:
+which rows a message writes, how many, and that the signed message is kept once a message at both sizes and not
+once a hash. The quotes' own set-up, a hundred orders rows and their hundred lines, is counted apart from the stop
+and is the order's figure above.
+
+**Scaled-fixture estimates** (`tests/cost.test.ts`): rows laid by hand in the same shape, 100 stops of 100 hashes
+and 100 stops ahead of 16 originals, with order hashes that are digests, as real ones are. Each figure is the bytes
+a relation grew by, with its indexes, over the rows or the messages laid, and the divisor is beside it:
+
+| shape | figure | bytes grown | divided by | each |
+| -- | -- | -- | -- | -- |
+| a stop of 100 carried hashes | a `stops` row | 2,957,312 | 10,000 rows | 296 |
+| | its `stop_messages` row | 950,272 | 100 messages | 9,503 |
+| a stop ahead of 16 originals | a `stops` row, with its original | 1,425,408 | 1,600 rows | 891 |
+| | its `stop_messages` row | 163,840 | 100 messages | 1,638 |
+| either | its `stop received` line | 663,552 | 3,000 lines | 221 |
+
+So a stop of 100 carried hashes is about 39,300 bytes at this fixture's scale (a hundred rows, the message, the
+line), about 390 a stopped order; and a stop ahead of 16 originals about 16,100, about 1,000 a hash. The index the
+stops-ahead count reads, `stops_ahead_by_account`, is inside the stops' figure: it holds the stops ahead and no
+carried stop, 122,880 bytes for the 1,600 laid. Before this build the fixture kept the message on every row it
+stopped, as the schema then had it, and measured about 104,000 bytes for a stop of 100 and about 34,000 for a stop
+ahead of 16.
+
+None of these figures is a time or a rate: neither kind measures how long a stop takes to process, or how many a
+minute the service sustains.
+
+At the bounds: an account's 32 stops ahead that still count are 32 rows, about 28,500 bytes at this fixture's 891 a
+row, before their messages and lines; a stop of carried orders is bounded by the orders stopped, one row each,
+about 296 bytes on top of each stopped order's 1,306, and one message row a message, about 9,500 bytes for one of
+a hundred hashes.
+
+### The shape this build does not yet write
+
+A Cross and its legs are written by no build yet. Measured from fixture rows the same test lays in the schema's
+shape: every column as the schema has it, and the free parts (a line's `facts`, a Cross's `node_answer`, both
+`jsonb`) holding what this fixture puts there, small objects of a few fields. These are fixture figures, to be read
+again from real rows once the sender's build writes them.
 
 | shape | rows | bytes with indexes |
 | -- | -- | -- |
-| a stop of 100 carried hashes | 100 `stops` rows, each carrying the message as received (100 hashes, about 7 KB as JSON, stored compressed) and its signature; one `stop received` line | about 104,000 for the rows (1,040 a row) and about 200 for the line |
-| a stop ahead of 16 originals | 16 `stops` rows, each with the message of 16 hashes, the signed original and its expiry; one line | about 34,000 for the rows (2,140 a row) and about 200 for the line |
 | a 40-leg Cross | one `crosses` row, confirmed, with its transaction, receipt and final block; 40 `legs` rows with the stakes expected and recorded; three lines (sent, pending, confirmed). The bet's own row and line are the order's figures above | about 970 for the Cross, 13,200 for the legs (330 a leg), 1,050 for the lines: about 15,200 |
 
-What the first row says about the schema's shape: a stop's message is kept once for every hash it stops, so a
-stop of 100 hashes keeps its message a hundred times over, about 100 KB a stop against about 1.3 KB an order.
-That is the frozen schema measured as it stands, and these notes stop there. At the bounds: an account's 32 stops
-ahead whose orders have not expired are 32 rows (the bound is on stopped hashes, one row each, not on groups of
-sixteen), about 68 KB at this fixture's 2,140 bytes a row, before their lines; a stop of carried orders is bounded
-by the orders stopped, one row each, about 1,040
-bytes on top of each stopped order's 1,306; a 40-leg Cross adds about 15 KB to its bet's 1.3 KB, which at the
-courier's budget refilling all day with every admitted request a 40-leg bet would be about 1.3 GB a day, the
-largest shape at the budget's rate and not a forecast.
+A 40-leg Cross adds about 15 KB to its bet's 1.3 KB, which at the courier's budget refilling all day with every
+admitted request a 40-leg bet would be about 1.3 GB a day, the largest shape at the budget's rate and not a
+forecast.
