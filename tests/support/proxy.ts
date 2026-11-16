@@ -39,8 +39,12 @@ export type Rule =
   | { kind: 'rewrite'; params: (params: unknown[]) => unknown[] }
   /** Pass the request on, and answer with the node's result changed: the chain made to say something else. */
   | { kind: 'rewriteResult'; result: (params: unknown[], result: unknown) => unknown }
-  /** Hold every request of the method until released; `arrived` is told of the first one. Released, a held request is answered under the rule then in force. */
-  | { kind: 'hold'; released: Promise<void>; arrived: () => void };
+  /**
+   * Hold every request of the method until released, or only the ones `when` picks by their params, the others
+   * passing as if no rule stood; `arrived` is told of the first one held. Released, a held request is answered
+   * under the rule then in force.
+   */
+  | { kind: 'hold'; released: Promise<void>; arrived: () => void; when?: (params: unknown[]) => boolean };
 
 export interface ChainProxy {
   url: string;
@@ -58,9 +62,12 @@ export interface ChainProxy {
   /**
    * Hold every request of the method until `release` is called; `arrived` resolves when the first such request has
    * arrived. `release(then)` lets the held requests go on under `then` (a rule left in force for the method), or under
-   * no rule: passed on to the node.
+   * no rule: passed on to the node. With `when`, only the requests it picks by their params are held, and `arrived`
+   * is the arrival of the first of those: every other request of the method passes on as if no rule stood. A held
+   * request is let go by `release` and by nothing else: lifting the rules (`clear`) holds no later request and
+   * lets none go that is held already.
    */
-  hold(method: string): { arrived: Promise<void>; release(then?: Rule | null): void };
+  hold(method: string, when?: (params: unknown[]) => boolean): { arrived: Promise<void>; release(then?: Rule | null): void };
   close(): Promise<void>;
 }
 
@@ -114,7 +121,7 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       if (!('result' in answer)) return { text, how: 'passed' };
       return { text: JSON.stringify({ ...answer, result: rule.result(params, answer.result) }), how: 'answered' };
     }
-    if (rule?.kind === 'hold') {
+    if (rule?.kind === 'hold' && (rule.when === undefined || rule.when(params))) {
       rule.arrived();
       await rule.released;
       // Answered under the rule in force now: the one the release installed, or none.
@@ -189,12 +196,12 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
     setFinal(number) {
       finalNumber = number;
     },
-    hold(method) {
+    hold(method, when) {
       let release = () => undefined as void;
       let arrivedResolve = () => undefined as void;
       const released = new Promise<void>((resolve) => (release = resolve));
       const arrived = new Promise<void>((resolve) => (arrivedResolve = resolve));
-      rules.set(method, { kind: 'hold', released, arrived: () => arrivedResolve() });
+      rules.set(method, { kind: 'hold', released, arrived: () => arrivedResolve(), ...(when === undefined ? {} : { when }) });
       return {
         arrived,
         release: (then = null) => {
