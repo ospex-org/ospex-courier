@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { describeNodeFailure } from '../chain/rpc';
 import { failureCode } from '../records/store';
 import { BOUNDS, type Counters } from './limits';
-import { getBook, getOrder, getReady, getRuns, getStatus, postOrders, type HttpAnswer, type RouteDeps } from './routes';
+import { getBook, getOrder, getReady, getRuns, getStatus, postOrders, postStops, type HttpAnswer, type RouteDeps } from './routes';
 
 // The courier's HTTP service: node:http and routes by hand. JSON under /v1;
 // no sign-in and no shared secret, since a signed order is its own permission
@@ -16,6 +16,7 @@ import { getBook, getOrder, getReady, getRuns, getStatus, postOrders, type HttpA
 //   GET  /v1/book?gameId=      the markets of a game that hold a live quote, at one block
 //   GET  /v1/book?gameId=&scorer=&lineTicks=   one market's quotes, a page a side, at one block
 //   POST /v1/orders            the door: a signed order, under a role
+//   POST /v1/stops             the stop: a signed message that takes orders of its account out of fills
 //   GET  /v1/orders/{hash}     the courier's record of one order
 
 export interface ServiceDeps extends RouteDeps {
@@ -69,6 +70,10 @@ function write(res: ServerResponse, answer: HttpAnswer, extra: Record<string, st
 }
 
 const refusal = (status: number, code: string, error: string): HttpAnswer => ({ status, body: { error, code } });
+
+/** What a stop request over its address's count is answered with: the count is the stop route's own, and the chain's cancels are the other way. */
+export const STOP_MINUTE_REFUSAL =
+  "Too many stop requests from this address in the last minute: the count is this route's own, and nothing else you send counts against it. `retry-after` is when the next slot frees — the next slot's eligibility, not success within a minute, since continued stop traffic from this address can take the next slots too; the on-chain cancel (`cancelOrder`, `raiseFloor`, `cancelAll`) does not go through this courier.";
 
 type Body = { ok: true; text: string } | { ok: false; why: 'too large' | 'cut' };
 
@@ -144,16 +149,19 @@ export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, 
     }
 
     // The door's first two checks for every other route: https, then the caller's minute. A request that fails
-    // either is answered at once, counted, and nothing else happens: no database and no chain.
+    // either is answered at once, counted, and nothing else happens: no database and no chain. The minute is one of
+    // two counts, chosen by the route: a stop takes from the stop route's own count and every other request from the
+    // general one, so a maker's posting and reading never hold up its stop, and its stops hold up nothing else.
     const how = transport(req);
     if (how === 'not-https' || how === 'no-header-from-elsewhere') {
       deps.counters.count('HTTPS_REQUIRED');
       return send(res, refusal(403, 'HTTPS_REQUIRED', 'This service answers only over https.'), { connection: 'close' });
     }
-    const minute = limiter.take(callerAddress(req));
+    const stop = req.method === 'POST' && path === '/v1/stops';
+    const minute = (stop ? deps.stopLimiter : limiter).take(callerAddress(req));
     if (!minute.allowed) {
       deps.counters.count('RATE_LIMIT_EXCEEDED');
-      return send(res, refusal(429, 'RATE_LIMIT_EXCEEDED', 'Too many requests from this address in the last minute.'), { 'retry-after': String(minute.retryAfterSeconds) });
+      return send(res, refusal(429, 'RATE_LIMIT_EXCEEDED', stop ? STOP_MINUTE_REFUSAL : 'Too many requests from this address in the last minute.'), { 'retry-after': String(minute.retryAfterSeconds) });
     }
 
     if (req.method === 'GET' && path === '/readyz') {
@@ -189,6 +197,24 @@ export function createRequestHandler(deps: ServiceDeps): (req: IncomingMessage, 
         return send(res, refusal(400, 'INVALID_PARAM', 'The body is not JSON.'));
       }
       return send(res, await postOrders(deps, parsed));
+    }
+    if (stop) {
+      matched.route = 'POST /v1/stops';
+      const body = await readBody(req, BOUNDS.stopBodyBytes);
+      if (!body.ok) {
+        // A request that did not arrive whole: the connection is gone or going, nothing is answered and nothing counted.
+        if (body.why === 'cut') return;
+        deps.counters.count('BODY_TOO_LARGE');
+        return send(res, refusal(413, 'BODY_TOO_LARGE', `A stop's body is at most ${BOUNDS.stopBodyBytes} bytes.`), { connection: 'close' });
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body.text);
+      } catch {
+        deps.counters.count('INVALID_PARAM');
+        return send(res, refusal(400, 'INVALID_PARAM', 'The body is not JSON.'));
+      }
+      return send(res, await postStops(deps, parsed));
     }
     const order = /^\/v1\/orders\/([^/]+)$/.exec(path);
     if (req.method === 'GET' && order !== null) {

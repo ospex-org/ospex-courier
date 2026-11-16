@@ -1,7 +1,8 @@
 // The bounds on the rows in hand, all settings, published with their values
-// on the status address; and the one limit kept in memory, the requests from
-// one network address, which bounds traffic and nothing durable: the courier
-// keeps no log of addresses.
+// on the status address; and the limit kept in memory, the requests from one
+// network address, which bounds traffic and nothing durable: the courier keeps
+// no log of addresses. It is kept as two counts, one for the stop route and
+// one for every other request, so that neither is the other's.
 
 export const BOUNDS = {
   /** An order post's body, and a stop's, in bytes. */
@@ -12,6 +13,8 @@ export const BOUNDS = {
   originalsInStop: 16,
   /** Requests from one network address, a minute; counted in memory, each process its own. */
   requestsPerAddressPerMinute: 600,
+  /** Stop requests from one network address, a minute: the stop route's own count, which no other request counts against and which counts against no other route; in memory, each process its own. */
+  stopsPerAddressPerMinute: 600,
   /** Admitted requests: one account, and all accounts together. A bucket, and its refill a minute. */
   accountBudget: { atOnce: 240, perMinute: 12 },
   courierBudget: { atOnce: 2400, perMinute: 60 },
