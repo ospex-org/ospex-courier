@@ -1,10 +1,11 @@
 import { encodeAbiParameters, getAddress, hashTypedData, isAddress, keccak256, recoverTypedDataAddress, type Address, type Hex } from 'viem';
 
-// The signed order: the ten fields an account signs under the matching
-// contract's EIP-712 domain, their hash as the contract computes it, the
-// signer recovered from a signature, the market's key, and the contract's own
-// rules on an order (price, lots, minimum fill, market contract, line), each
-// with the refusal code the door answers.
+// The signed order: the ten fields an account signs, or its approved agent
+// signs for it, under the matching contract's EIP-712 domain; their hash as
+// the contract computes it; the three numbers its nonce holds; the signer
+// recovered from a signature of the form the contract takes; the market's
+// key; and the contract's own rules on an order (price, lots, minimum fill,
+// market contract, line), each with the refusal code the door answers.
 
 /** The ten fields, as received: numbers as decimal strings, addresses as given. */
 export interface OrderFields {
@@ -113,8 +114,46 @@ export function orderHash(order: OrderFields, chainId: bigint, matching: Address
   return hashTypedData({ domain: orderDomain(chainId, matching), types: ORDER_TYPES, primaryType: 'OspexOrder', message: order });
 }
 
-/** The signer of the order's hash, or null for a signature that recovers to nothing. */
+/** The three numbers an order's nonce holds, high to low, as the contract's `_split` reads the word. */
+export interface NonceParts {
+  /** The top 128 bits: the account's version the order was signed for. */
+  version: bigint;
+  /** The next 32 bits: 0 for an order its account signs, else the number of the grant whose agent signs it. */
+  grantNumber: number;
+  /** The low 96 bits: what a line's floor is compared with. */
+  orderNumber: bigint;
+}
+
+const UINT32_MAX = 2n ** 32n - 1n;
+const UINT96_MAX = 2n ** 96n - 1n;
+
+/** The nonce split as the contract splits it: the version above bit 128, the grant number the 32 bits above bit 96, the order number below. */
+export function splitNonce(nonce: bigint): NonceParts {
+  return { version: nonce >> 128n, grantNumber: Number((nonce >> 96n) & UINT32_MAX), orderNumber: nonce & UINT96_MAX };
+}
+
+/** Half the curve's order: the largest `s` the contract's signature check takes. */
+const HALF_CURVE_ORDER = 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0n;
+
+/**
+ * Whether a 65-byte signature has the form the contract's check takes: its last byte, `v`, 27 or 28, and its `s`
+ * in the lower half of the curve's order. The contract refuses any other form whatever it would recover to, so an
+ * order so signed could never fill.
+ */
+export function isChainSignature(signature: Hex): boolean {
+  if (!/^0x[0-9a-fA-F]{130}$/.test(signature)) return false;
+  const v = Number.parseInt(signature.slice(130), 16);
+  const s = BigInt(`0x${signature.slice(66, 130)}`);
+  return (v === 27 || v === 28) && s <= HALF_CURVE_ORDER;
+}
+
+/**
+ * The signer of the order's hash, or null for a signature that recovers to nothing the contract would take: one
+ * not in the form above, or one no address recovers from. For an order under a grant the signer is the grant's
+ * agent and not the account, so who it must be is the caller's to decide from the order's nonce.
+ */
 export async function orderSigner(order: OrderFields, signature: Hex, chainId: bigint, matching: Address): Promise<Address | null> {
+  if (!isChainSignature(signature)) return null;
   try {
     return await recoverTypedDataAddress({ domain: orderDomain(chainId, matching), types: ORDER_TYPES, primaryType: 'OspexOrder', message: order, signature });
   } catch {
@@ -122,7 +161,10 @@ export async function orderSigner(order: OrderFields, signature: Hex, chainId: b
   }
 }
 
-/** The market's key, keccak256(abi.encode(gameId, scorer, lineTicks)), as the matching contract computes it. */
+/**
+ * The market's key, keccak256(abi.encode(gameId, scorer, lineTicks)), as the matching contract computes it: the key
+ * it keeps a line's floor under, and a grant's list of lines.
+ */
 export function marketKey(gameId: bigint, scorer: Address, lineTicks: number): Hex {
   return keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'address' }, { type: 'int32' }], [gameId, getAddress(scorer), lineTicks]));
 }
