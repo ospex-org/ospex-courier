@@ -3,7 +3,8 @@ import { readQuotes } from '../chain/reads';
 import type { BettingSet } from '../chain/set';
 import type { ChainReader } from '../chain/snapshot';
 import { BOUNDS } from '../http/limits';
-import { marketKey as keyOf, ORDER_RULES } from '../orders/order';
+import { marketKey as keyOf } from '../orders/order';
+import { quoteEnd } from '../orders/standing';
 import type { Cursor, EndSeen, MarketCursor, ScannedQuote } from '../records/orders';
 import type { Store } from '../records/store';
 
@@ -77,9 +78,9 @@ export interface SidePage {
   scanned: number;
   marked: number;
   live: number;
-  /** Quotes the chain showed ended at the block (cancelled, under a floor, filled, or the relay dropped), among those examined. */
+  /** Quotes the chain showed ended at the block (cancelled, at a version left, under a floor, under a grant that is gone, filled, or the relay dropped), among those examined. */
   endedOnChain: number;
-  /** Of those, the quotes the chain showed cancelled or under their account's floor, which this request marked cancelled in the records at the block: they are asked about no more. */
+  /** Of those, the quotes the chain showed cancelled, at a version their account has left, under their floor at their version, or under a grant that is gone, which this request marked cancelled in the records at the block: they are asked about no more. */
   markedCancelled: number;
   /** Of those, the quotes the chain showed with less than a lot of their stake left, which this request marked filled in the records at the block. */
   markedFilled: number;
@@ -204,19 +205,14 @@ export async function readMarketBook(deps: BookDeps, q: MarketQuery): Promise<Ma
 
   // What only the chain knows about the page's quotes, in one call at the block. A quote it shows ended is marked in
   // the records here, at this block, in this same request, so the courier carries it no further and no request asks
-  // about it again: cancelled, or under its account's floor for the market (the maker's own act), as `cancelled`;
-  // with less than a lot of its stake left (a fill through another courier), as `filled`. A quote whose account
-  // dropped the relay is not listed and not marked: not an end of the quote, and undone by the account itself.
+  // about it again: cancelled, at a version its account has left, under its floor at its version, or under a grant
+  // that is gone (the account's own acts, or its grant's own end), as `cancelled`; with less than a lot of its stake
+  // left (a fill through another courier), as `filled`. The predicate is the door's (orders/standing.ts), each quote
+  // judged at the version and under the grant its own nonce names. A quote whose account dropped the relay is not
+  // listed and not marked: not an end of the quote, and undone by the account itself.
   const examined: ScannedQuote[] = sides.flatMap((s) => scans[s]?.rows ?? []);
-  const state = await readQuotes(deps.chain, deps.set, header, key, examined.map((e) => ({ hash: e.hash, account: e.account })));
-  const endOf = (row: ScannedQuote): EndSeen | null => {
-    const s = state.quotes.get(row.hash.toLowerCase());
-    const a = state.accounts.get(row.account.toLowerCase());
-    if (s === undefined || a === undefined) return null;
-    if (s.cancelled || row.nonce < a.floor) return 'cancelled';
-    if (row.riskAmount - s.filled < ORDER_RULES.lot) return 'filled';
-    return null;
-  };
+  const state = await readQuotes(deps.chain, deps.set, header, key, examined.map((e) => ({ hash: e.hash, account: e.account, nonce: e.nonce })));
+  const endOf = (row: ScannedQuote): EndSeen | null => quoteEnd(row, state, header.timestamp);
   const marks = examined.flatMap((e) => {
     const how = endOf(e);
     return how === null ? [] : [{ hash: e.hash, how }];
@@ -249,7 +245,8 @@ export async function readMarketBook(deps: BookDeps, q: MarketQuery): Promise<Ma
       const mark = marked.get(row.hash.toLowerCase());
       if (mark === 'cancelled') markedCancelled++;
       else if (mark === 'filled') markedFilled++;
-      if (s.cancelled || row.nonce < a.floor || remaining < ORDER_RULES.lot || !a.registered) {
+      // Listed: a quote the read shows standing, by the same predicate that marks, whose account still has the relay.
+      if (endOf(row) !== null || !a.registered) {
         endedOnChain++;
         continue;
       }

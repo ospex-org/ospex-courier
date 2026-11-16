@@ -1,6 +1,6 @@
 import type pg from 'pg';
 import type { Address, Hex } from 'viem';
-import { readForDoor, readQuotes } from '../chain/reads';
+import { readForDoor, readQuotes, type DoorRead } from '../chain/reads';
 import type { BettingSet } from '../chain/set';
 import { ChainUnreachable, type ChainReader } from '../chain/snapshot';
 import { BOUNDS, type Counters } from '../http/limits';
@@ -9,13 +9,16 @@ import type { MarkEnded, OrderRow } from '../records/orders';
 import type { Run } from '../records/runs';
 import type { Store } from '../records/store';
 import { budgetRefusal, takeBudgets } from './budgets';
-import { checkOrderRules, coinAmount, marketKey, ORDER_RULES, orderHash, orderSigner, orderToJson, readOrderShape, type OrderFields } from './order';
+import { checkOrderRules, coinAmount, isChainSignature, marketKey, ORDER_RULES, orderHash, orderSigner, orderToJson, readOrderShape, splitNonce, type NonceParts, type OrderFields } from './order';
 import { isPublishedList } from './published';
+import { grantGone, orderGone, quoteEnd } from './standing';
 
 // The door: POST /v1/orders. Sixteen checks, in the plan's order; the first
 // that fails is the answer. Checks 1 to 8 stand before admission: a request
 // that fails one is answered, counted and logged, and no line is written for
-// it. From check 9 on the request is admitted, and whatever becomes of it is a
+// it. An order signed under a grant has its grant judged between checks 6 and
+// 7, from check 6's read: before admission too, and before any budget is
+// taken. From check 9 on the request is admitted, and whatever becomes of it is a
 // line in the records. Check 5 is looked up first without a lock, so a repeat
 // is answered cheaply; then checks 5 and 8 to 16 are made in one database
 // transaction that first takes the order's hash lock.
@@ -57,6 +60,67 @@ export function orderRecord(row: OrderRow): Record<string, unknown> {
   };
 }
 
+/** A refusal, before it is an answer: counted where it comes before admission, a line where it comes after. */
+interface Refused {
+  status: number;
+  code: string;
+  error: string;
+  extra: Record<string, unknown>;
+}
+
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+/** The refusal of an order whose grant is gone: not its account's current grant, or ending at or before the chain's time plus one. */
+function grantGoneRefusal(grantNumber: number, currentGrant: number, endsAt: bigint, chainTime: bigint): Refused {
+  const why =
+    grantNumber !== currentGrant
+      ? currentGrant === 0
+        ? 'its account has no grant standing now'
+        : `its account's current grant is ${currentGrant}`
+      : `it ends at ${endsAt}, at or under the chain's time plus one, ${chainTime + 1n}`;
+  return {
+    status: 422,
+    code: 'GRANT_GONE',
+    error: `This order is signed under grant ${grantNumber}, and that grant is gone: ${why}. It can fill in no later block.`,
+    extra: { grantNumber, currentGrant, endsAt: endsAt.toString(), chainTime: chainTime.toString() },
+  };
+}
+
+/**
+ * The grant of an order signed under one, judged whole as the contract judges it, from the door's one read: the
+ * signer is the agent of the grant the nonce names (a number the account never made has no agent); the stake is
+ * within that grant's cap; the line is on its list, or the list is empty; and the grant stands, the account's
+ * current one and not ending at or before the chain's time plus one. In that order, the first that fails the
+ * answer. The signer is read from the grant the nonce names, which a revoke or a later grant leaves as it was, so
+ * the signer alone does not say the grant stands: the standing is its own check. Null for an order its account
+ * signs, and for one whose grant passes.
+ */
+function judgeGrant(order: OrderFields, nonce: NonceParts, signer: Address, read: DoorRead, chainTime: bigint, coinDecimals: number): Refused | null {
+  if (nonce.grantNumber === 0) return null;
+  const g = nonce.grantNumber;
+  if (read.grant === null || read.currentGrant === null) throw new Error(`the door's read holds no grant for an order under grant ${g}`);
+  const grant = read.grant;
+  if (grant.agent.toLowerCase() === ZERO_ADDRESS) {
+    return { status: 422, code: 'BAD_SIGNATURE', error: `This order's nonce names grant ${g}, and its account has made no grant of that number: there is no agent whose signature it could carry.`, extra: {} };
+  }
+  if (grant.agent.toLowerCase() !== signer.toLowerCase()) {
+    return { status: 422, code: 'BAD_SIGNATURE', error: `The signature is not the agent's of grant ${g}, the grant this order's nonce names: an order under a grant is signed by that grant's agent, not by its account and not by another key.`, extra: {} };
+  }
+  if (order.riskAmount > grant.stakeCap) {
+    return {
+      status: 422,
+      code: 'AGENT_STAKE_ABOVE_CAP',
+      error: `Grant ${g} lets its agent sign an order for ${coinAmount(grant.stakeCap, coinDecimals)} USDC at most. This order is signed for ${coinAmount(order.riskAmount, coinDecimals)} USDC.`,
+      extra: { grantNumber: g, stakeCap: grant.stakeCap.toString() },
+    };
+  }
+  if (grant.lineCount !== 0 && !grant.lineNamed) {
+    return { status: 422, code: 'LINE_NOT_IN_GRANT', error: `Grant ${g} names the lines its agent may sign on, and this order's line is not one of them.`, extra: { grantNumber: g } };
+  }
+  if (grantGone(nonce, { currentGrant: read.currentGrant, endsAt: grant.endsAt }, chainTime)) return grantGoneRefusal(g, read.currentGrant, grant.endsAt, chainTime);
+  return null;
+}
+
 /** The 64-bit key of an order's hash lock: the hash's first eight bytes, as Postgres's advisory lock takes them. */
 export function lockKey(hash: Hex): string {
   return BigInt.asIntN(64, BigInt(hash.slice(0, 18))).toString();
@@ -89,10 +153,25 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
   const rules = checkOrderRules(order, deps.set);
   if (!rules.ok) return counted(refusal(422, rules.code, rules.error));
 
-  // 4. The signature: the signer of the order's hash under the matching contract's domain is the order's account.
+  // 4. The signature, over the order's hash under the matching contract's domain, in the form the contract takes.
+  // An order its account signs (grant number 0 in its nonce) is the account's, decided here. An order under a grant
+  // is its grant's agent's: who that is the chain says, so the signer is kept and judged with the grant, right after
+  // the read of check 6.
   const hash = orderHash(order, deps.set.chainId, deps.set.matching);
+  const nonce = splitNonce(order.nonce);
   const signer = await orderSigner(order, signature, deps.set.chainId, deps.set.matching);
-  if (signer === null || signer.toLowerCase() !== order.account.toLowerCase()) {
+  if (signer === null) {
+    return counted(
+      refusal(
+        422,
+        'BAD_SIGNATURE',
+        isChainSignature(signature)
+          ? 'No signer recovers from this signature over this order\'s hash under the matching contract\'s domain.'
+          : 'The signature is in a form the matching contract refuses: its last byte, v, must be 27 or 28, and its s must be in the lower half of the curve\'s order. No fill could take an order so signed.',
+      ),
+    );
+  }
+  if (nonce.grantNumber === 0 && signer.toLowerCase() !== order.account.toLowerCase()) {
     return counted(refusal(422, 'BAD_SIGNATURE', 'The signature is not the account\'s over this order\'s hash under the matching contract\'s domain.'));
   }
   const key = marketKey(order.gameId, order.scorer, order.lineTicks);
@@ -114,6 +193,13 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
     throw err;
   }
   const T = read.header.timestamp;
+
+  // The grant, for an order under one, judged whole from that same read, before the registration and before any
+  // budget is taken: its signer, its cap, its list, its standing, in that order. Each is a refusal before admission,
+  // so an order that names a grant it has no right to costs the account it names nothing and leaves no line: not a
+  // stranger's with a grant number it made up, and not a former agent's under a grant that is gone.
+  const grantRefusal = judgeGrant(order, nonce, signer, read, T, deps.coinDecimals);
+  if (grantRefusal !== null) return counted(refusal(grantRefusal.status, grantRefusal.code, grantRefusal.error, grantRefusal.extra));
 
   // 7. The account has registered the relay.
   if (!read.registered) return counted(refusal(422, 'NOT_REGISTERED', `The account has not registered the courier's relay, ${deps.set.relay}, with the matching contract.`));
@@ -182,8 +268,16 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
     const closesAt = game.start + (game.window ?? 0n);
     if (T >= closesAt) return await refuse(422, 'BETS_CLOSED', `Bets on game ${order.gameId} closed at ${closesAt}, the start plus the window; the chain's time is ${T}.`, { closesAt: closesAt.toString(), chainTime: T.toString() });
 
-    // 12. The order's standing on chain.
-    if (read.cancelled || order.nonce < read.floor) return await refuse(422, 'CANCELLED', 'This order is cancelled on chain, or its nonce is under its account\'s floor for the market.');
+    // 12. The order's standing on chain, as the contract judges it (standing.ts): the order's own half, then its
+    // grant's. For a new order the grant's half was judged above, before the budgets, from this same read, so it
+    // does not fire here; it is written here as the one predicate, whole.
+    if (orderGone(nonce, read)) {
+      return await refuse(422, 'CANCELLED', 'This order is cancelled on chain: by its own cancel, by a cancel of everything that moved its account past the version it names, or by a floor raised above its order number on its line at that version.');
+    }
+    if (read.grant !== null && read.currentGrant !== null && grantGone(nonce, { currentGrant: read.currentGrant, endsAt: read.grant.endsAt }, T)) {
+      const gone = grantGoneRefusal(nonce.grantNumber, read.currentGrant, read.grant.endsAt, T);
+      return await refuse(gone.status, gone.code, gone.error, gone.extra);
+    }
     if (order.expiry <= T + 1n) return await refuse(422, 'EXPIRED', `This order's expiry, ${order.expiry}, is at or under the chain's time plus one, ${T + 1n}: it can fill in no later block.`, { chainTime: T.toString() });
     if (order.riskAmount - read.filled < ORDER_RULES.lot) return await refuse(422, 'FILLED', 'This order has less than a lot of its stake left on chain.');
 
@@ -192,8 +286,9 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
       // not marked ended and the block's time has not expired, one page of at most seventeen. Fewer than sixteen
       // standing, the chain is asked nothing. Sixteen or more, the chain is asked once about sixteen of them, and
       // the ones it shows ended are marked here, at the block read, so no later request asks about them again:
-      // cancelled, or under the account's floor (the maker's own acts), as `cancelled`; with less than a lot of the
-      // stake left (a fill through another courier; this courier's own fills are the sender build's), as `filled`.
+      // cancelled, at a version the account has left, under its floor at its version, or under a grant that is gone
+      // (the account's own acts, or its grant's own end), as `cancelled`; with less than a lot of the stake left (a
+      // fill through another courier; this courier's own fills are the sender build's), as `filled`.
       // The count is then read once more from the records. A quote partly filled with a lot or more left stands
       // and is counted. So one post is one page, at most one read of the chain for the quotes, and one more page: a
       // number, whatever the account has posted before.
@@ -204,18 +299,15 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
         const asked = page.slice(0, bound);
         let state;
         try {
-          state = await readQuotes(deps.chain, deps.set, read.header, key, asked.map((q) => ({ hash: q.hash, account: order.account })));
+          state = await readQuotes(deps.chain, deps.set, read.header, key, asked.map((q) => ({ hash: q.hash, account: order.account, nonce: q.nonce })));
         } catch (err) {
           if (err instanceof ChainUnreachable) return await refuse(503, 'CHAIN_UNREACHABLE', "The chain could not be read, twice, for the account's standing quotes.");
           throw err;
         }
-        const floor = state.accounts.get(order.account.toLowerCase())?.floor ?? 0n;
+        // The same predicate as check 12, each quote at the version and under the grant its own nonce names.
         const ended = asked.flatMap((q): MarkEnded[] => {
-          const s = state.quotes.get(q.hash.toLowerCase());
-          if (s === undefined) return [];
-          if (s.cancelled || q.nonce < floor) return [{ hash: q.hash, how: 'cancelled' }];
-          if (q.riskAmount - s.filled < ORDER_RULES.lot) return [{ hash: q.hash, how: 'filled' }];
-          return [];
+          const how = quoteEnd({ hash: q.hash, account: order.account, nonce: q.nonce, riskAmount: q.riskAmount }, state, T);
+          return how === null ? [] : [{ hash: q.hash, how }];
         });
         await deps.store.orders.markEnded(client, ended, read.header);
         standing = (await deps.store.orders.quotesOfAccount(client, order.account, key, order.positionType, T)).length;
