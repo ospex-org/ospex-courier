@@ -204,6 +204,26 @@ test('the small book: ten live quotes; every row returned is live, nothing marke
   }
 });
 
+/**
+ * Scans the book from its start, as a page does, until a scan's own counters see none of the dead entries it
+ * passes: each has been marked dead by an earlier scan. Failed by name when that is not reached in two minutes.
+ */
+async function markedDead(client: pg.PoolClient, n: number): Promise<void> {
+  const started = Date.now();
+  for (;;) {
+    const countersBefore = await indexCounters(client);
+    const r = await run(client, args(0, F_PAST));
+    const countersAfter = await indexCounters(client);
+    assert.equal(r.marked, 0, `${n}: nothing is left to mark`);
+    const dead = countersAfter.read - countersBefore.read - r.scanned;
+    if (dead <= 0) return;
+    if (Date.now() - started > 120_000) {
+      assert.fail(`${n}: ${dead} dead entries are still not marked dead after two minutes of scans: a transaction somewhere on the server is older than the marks that ended them`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+}
+
 test('the book with 50,000 and with 500,000 orders ended by the mark: the counts exact in both states; the scan node\'s shared buffer accesses the same at both sizes after vacuum, within one page a level of the index; before vacuum, reported beside the dead versions planted', async () => {
   const figures: Record<number, { before: Measured; after: Measured; vacuumReport: VacuumReport; level: number; marks: number }> = {};
   for (const n of SIZES) {
@@ -222,6 +242,11 @@ test('the book with 50,000 and with 500,000 orders ended by the mark: the counts
         if (r.marked === 0) break;
       }
       assert.equal(marks, n, 'the whole history was marked, by the statement');
+      // The state the measurement before vacuum is of: every dead entry already passed, and marked dead, by an
+      // earlier scan. That does not follow from the loop above: a scan marks an entry dead only when no transaction
+      // on the whole server, in whatever database, is older than the one that ended its row, and a transaction
+      // another test file holds open on the same server delays it. So the state is reached, and seen reached.
+      await markedDead(client, n);
       const before = await measure(client, args(50, F_PAST));
       plan(before, `${n} before vacuum`);
       const vacuumReport = await vacuum(client);
