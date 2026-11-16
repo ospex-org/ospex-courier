@@ -70,7 +70,11 @@ proves what its node can do, writes its run, and listens.
 ```
 
 The ten fields are the contract's `OspexOrder`, signed under its EIP-712 domain (name `Ospex`, version `3`, the
-chain, the matching contract); the amounts are decimal strings in the coin's smallest unit. `role` is not signed:
+chain, the matching contract); the amounts are decimal strings in the coin's smallest unit. The signature is the
+account's, or, for an order whose nonce names a grant, that grant's agent's (the nonce holds three numbers: the
+account's version in its top 128 bits, the grant number in the next 32, 0 for an order the account signs itself,
+and the order number in the low 96); and it is in the form the contract takes, its last byte 27 or 28 and its `s`
+in the lower half of the curve's order. `role` is not signed:
 `rest` keeps the order on the book until its expiry, its cancel or its stop, and the courier never uses it to take;
 `take` is a bet, to be filled against the book in one Cross and kept no further. An order hash has one role at this
 courier, the first one posted.
@@ -78,18 +82,27 @@ courier, the first one posted.
 Sixteen checks, in order; the first that fails is the answer. Before admission (no row, no line; counted by code
 on the status address): the body's shape and its size (8 KB), the caller's minute, the order's own rules as the
 contract has them (`PRICE_OUT_OF_RANGE`, `STAKE_NOT_IN_LOTS`, `MIN_FILL_ABOVE_STAKE`, `UNKNOWN_MARKET_CONTRACT`,
-`INVALID_LINE`), the signature (`BAD_SIGNATURE`), the hash on record (a repeat is answered from the record, the
+`INVALID_LINE`), the signature (`BAD_SIGNATURE`: not in the form the contract takes, or, for an order the account
+signs itself, not the account's), the hash on record (a repeat is answered from the record, the
 first answer whole, with no chain read; the other role is `ROLE_CONFLICT`), one read of the chain at the latest block named by its hash
-(`CHAIN_UNREACHABLE`), the account's registration of the relay (`NOT_REGISTERED`), and the two budgets
-(`RATE_LIMIT_EXCEEDED`, naming which). From then on the request is admitted, and whatever becomes of it is a line:
+(`CHAIN_UNREACHABLE`), for an order under a grant the grant itself, judged whole from that read as the contract
+judges it (the signer is the agent of the grant the nonce names, else `BAD_SIGNATURE`; the stake is within the
+grant's cap, else `AGENT_STAKE_ABOVE_CAP`; the line is on the grant's list or the list is empty, else
+`LINE_NOT_IN_GRANT`; the grant is the account's current one and does not end at or before the chain's time plus
+one, else `GRANT_GONE`), the account's registration of the relay (`NOT_REGISTERED`), and the two budgets
+(`RATE_LIMIT_EXCEEDED`, naming which). So an order that names a grant it has no right to, a stranger's or a former
+agent's, takes nothing from the account's budget and leaves no line. From then on the request is admitted, and
+whatever becomes of it is a line:
 the contract's own `getOrderHash` must equal the hash computed here (else `INTERNAL_ERROR`, recorded as the
 courier's own fault); a stop on record (`STOPPED`); the game, whose start must be written, whose reporters must
 be exactly the published list, which must not have ended and whose close must not have passed (`UNKNOWN_GAME`,
 `NO_WRITTEN_START`, `REPORTERS_NOT_THE_PUBLISHED_LIST`, `GAME_ENDED`, `BETS_CLOSED`); the order's standing on chain
-(`CANCELLED`, `EXPIRED`, `FILLED`), the expiry exact with no margin; for a quote, fewer than 16 live quotes of the
+(`CANCELLED`: cancelled, at a version the account has left, or under its floor at its version; `EXPIRED`;
+`FILLED`), the expiry exact with no margin; for a quote, fewer than 16 live quotes of the
 account on that side of that market (`TOO_MANY_QUOTES`): one page of the account's unexpired quotes the courier has
 not marked ended, at most seventeen rows; sixteen or more standing, the chain is asked once about sixteen of them,
-the ones it shows cancelled or under the account's floor are marked `cancelled` in the records at the block read,
+the ones it shows cancelled, at a version the account has left, under its floor at its version, or under a grant
+that is gone are marked `cancelled` in the records at the block read,
 and the count is read once more, so one post is one page and at most one read of the chain for the quotes whatever
 the account has posted before (each read of the chain is tried once more when it fails, so a post makes at most six
 requests to the node: the header, its own read and the quotes' read, twice each; a game's page at most four, its two
@@ -111,8 +124,10 @@ not marked ended, `queued` for a bet waiting its turn, else how the order ended 
 
 **The mark of a quote the chain shows ended.** Every request that asks the chain about a quote the courier holds (the
 door's count above; the market's page, below) and is shown it ended marks it in the records in that same request,
-at the block it read, and a marked quote is asked about no more: `cancelled` where the chain shows it cancelled or
-under its account's floor for the market, the maker's own acts; `filled` where it shows less than a lot of its stake
+at the block it read, and a marked quote is asked about no more: `cancelled` where the chain shows it cancelled, at
+a version the account has left, under its floor at its version, or under a grant that is gone (not the account's
+current grant, or ending at or before the block's time plus one), the account's own acts or its grant's own end;
+`filled` where it shows less than a lot of its stake
 left, a fill through another courier the account registered (this courier's own fills are the sender build's, marked
 `filled` too, at their final block). A quote partly filled with a lot or more left stands, counted and listed with
 what remains. The mark is at the block read and not at finality: if a reorganization undoes the cancel or the fill,
@@ -167,7 +182,8 @@ courier waits on; Node's own default is five minutes.
   what the chain shows filled) and `payable` (what the account's balance and allowance cover, this quote alone);
   once per account on the page, its balance and allowance; a page short of its limit says whether the book or the
   bound ended it, and where the next page starts. Listed: quotes not stopped, not expired at the block, not
-  cancelled or under a floor, with a lot or more left, whose account still has the relay registered. A request that
+  cancelled, not at a version the account has left, not under its floor at its version and not under a grant that
+  is gone, with a lot or more left, whose account still has the relay registered. A request that
   is returned an expired quote marks it, where the final block's time plus one has reached its expiry, so the next
   request does not meet it; a backlog the final block has not passed is met again, and the answer names the bound
   and never an empty book. A quote the chain shows ended is marked by the page that read it, at the block read (the

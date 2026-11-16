@@ -67,10 +67,11 @@ CREATE TABLE IF NOT EXISTS orders (
   received_time   numeric(78, 0) NOT NULL,
   -- Empty while the order is live as far as the courier itself knows; else how it ended here: a stop on record;
   -- expired at the final block; or what a read of the chain showed, marked by the request that read it at the block
-  -- it read (ended_block): cancelled, the quote cancelled or under its account's floor for the market (the maker's
-  -- own act), or filled, less than a lot of its stake left (a fill through another courier; this courier's own
-  -- fills are the sender build's, which marks filled too). The relay dropped is read at a block and not stored: not
-  -- an end of the quote, and undone by the account itself.
+  -- it read (ended_block): cancelled, the quote cancelled, at a version the account has left, under its floor at its
+  -- version, or under a grant that is gone (the account's own acts, or its grant's own end), or filled, less than a
+  -- lot of its stake left (a fill through another courier; this courier's own fills are the sender build's, which
+  -- marks filled too). The relay dropped is read at a block and not stored: not an end of the quote, and undone by
+  -- the account itself.
   ended           text CHECK (ended IN ('stopped', 'expired', 'filled', 'cancelled')),
   ended_at        timestamptz,
   -- The block the chain read that marked the quote cancelled or filled was made at: number and hash, so a later
@@ -103,10 +104,10 @@ CREATE INDEX IF NOT EXISTS orders_book
 
 -- The door's count of an account's quotes on one side of one market the courier has not marked ended: one page
 -- of the unexpired ones, at most 17 rows, whatever the account has posted. Sixteen or more standing, the chain is
--- asked once about sixteen and the ones it shows cancelled or under the floor are marked here, so the records
--- never hold more than sixteen unended quotes of an account on a side except where the chain has not yet been
--- asked about them. Again a count of rows returned; what the database passes over to return them is the
--- paragraph above.
+-- asked once about sixteen and the ones it shows cancelled, at a version the account has left, under its floor at
+-- its version, or under a grant that is gone are marked here, so the records never hold more than sixteen unended
+-- quotes of an account on a side except where the chain has not yet been asked about them. Again a count of rows
+-- returned; what the database passes over to return them is the paragraph above.
 CREATE INDEX IF NOT EXISTS orders_live_quotes_per_account
   ON orders (account, market_key, side, expiry DESC)
   WHERE role = 'rest' AND ended IS NULL;

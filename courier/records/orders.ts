@@ -23,7 +23,7 @@ export interface OrderRow {
   receivedHash: Hex;
   /** The receipt block's time: the chain's time the order was taken at, which a repeat is answered from. */
   receivedTime: bigint;
-  /** How the order ended here, if it has: `cancelled` and `filled` are what a read of the chain showed (cancelled or under its account's floor; less than a lot of its stake left), marked at the block read. */
+  /** How the order ended here, if it has: `cancelled` and `filled` are what a read of the chain showed (cancelled, at a version its account has left, under its floor at its version, or under a grant that is gone; less than a lot of its stake left), marked at the block read. */
   ended: 'stopped' | 'expired' | 'filled' | 'cancelled' | null;
   endedAt: Date | null;
   /** The block the chain read that marked a quote cancelled or filled was made at; null for the other marks. */
@@ -75,7 +75,7 @@ export interface BlockRead {
   hash: Hex;
 }
 
-/** An end a read of the chain can show a stored quote: its cancel or its nonce under the floor, or less than a lot of its stake left. */
+/** An end a read of the chain can show a stored quote: `cancelled` (its cancel, a version its account has left, its floor at its version above it, or its grant gone), or `filled` (less than a lot of its stake left). */
 export type EndSeen = 'cancelled' | 'filled';
 
 export interface MarkEnded {
@@ -222,9 +222,10 @@ export interface Orders {
   quotesOfAccount(on: Writer, account: Address, marketKey: Hex, side: 0 | 1, blockTime: bigint): Promise<AccountQuote[]>;
   /**
    * Marks quotes a read of the chain showed ended, at the block the read was
-   * made at: `cancelled` (its cancel, or its nonce under its account's floor
-   * for the market) or `filled` (less than a lot of its stake left); the ones
-   * among `marks` not already marked. Returns what it marked.
+   * made at: `cancelled` (its cancel, a version its account has left, its
+   * floor at its version above it, or its grant gone) or `filled` (less than
+   * a lot of its stake left); the ones among `marks` not already marked.
+   * Returns what it marked.
    */
   markEnded(on: Writer, marks: ReadonlyArray<MarkEnded>, block: BlockRead): Promise<MarkEnded[]>;
   /** The book's scan with the mark, one statement. */
