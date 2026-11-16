@@ -1,5 +1,6 @@
--- The courier's own database: the book and the records. Ten tables: orders,
--- stops, lanes, crosses, legs, events, conditions, accounts, runs, games.
+-- The courier's own database: the book and the records. Eleven tables: orders,
+-- stop_messages, stops, lanes, crosses, legs, events, conditions, accounts,
+-- runs, games.
 --
 -- Applied by the release step on every deploy (scripts/apply-schema.ts), so
 -- every statement here is safe to run again. IF NOT EXISTS matches names only,
@@ -151,22 +152,90 @@ ALTER TABLE orders SET (
   vacuum_index_cleanup = on
 );
 
+-- ──────────────────────────── stop messages ───────────────────────────────
+-- One row per stop message that stopped at least one order hash: the signed
+-- payload exactly, kept once however many hashes it stopped. `message` is
+-- {account, orderHashes} and nothing else, never an order's signed original;
+-- beside it the signature, the signer the signature recovered to (the account,
+-- or its agent), and the block the chain was read at to judge the message,
+-- where it was read: number, hash and time together, or none of the three (a
+-- stop of carried orders signed by the account's own key reads no chain). A
+-- message that stopped nothing has no row.
+CREATE TABLE IF NOT EXISTS stop_messages (
+  id           bigserial PRIMARY KEY,
+  account      text NOT NULL CHECK (account ~ '^0x[0-9a-f]{40}$'),
+  signer       text NOT NULL CHECK (signer ~ '^0x[0-9a-f]{40}$'),
+  message      jsonb NOT NULL,
+  signature    text NOT NULL CHECK (signature ~ '^0x[0-9a-f]{130}$'),
+  received_at  timestamptz NOT NULL DEFAULT now(),
+  block_number numeric(78, 0),
+  block_hash   text CHECK (block_hash ~ '^0x[0-9a-f]{64}$'),
+  block_time   numeric(78, 0),
+  CONSTRAINT stop_messages_block_whole CHECK ((block_number IS NULL) = (block_hash IS NULL) AND (block_number IS NULL) = (block_time IS NULL))
+);
+
 -- ──────────────────────────── stops ───────────────────────────────────────
 -- One row per order hash a stop stopped, keyed by the hash: the account, the
--- stop message as received and its signature, the time; for a stop recorded
--- ahead of its order, the signed original and its expiry. A stop is permanent
--- for its hash.
+-- time, and the message that stopped it (message_id; the message itself is
+-- kept once, above). A stop is permanent for its hash: the row is written once
+-- and never removed. For a stop recorded ahead of its order (`ahead`), three
+-- more, together or not at all: the order's signed original, which is kept
+-- here and nowhere else and is read by nothing that lists or fills; the number
+-- of the grant it was signed under, 0 for one its account signed itself; and
+-- original_expiry, the second from which the original can fill no more: its
+-- own expiry, or its grant's end where that comes first.
 CREATE TABLE IF NOT EXISTS stops (
   hash            text PRIMARY KEY CHECK (hash ~ '^0x[0-9a-f]{64}$'),
   account         text NOT NULL CHECK (account ~ '^0x[0-9a-f]{40}$'),
-  message         jsonb NOT NULL,
-  signature       text NOT NULL CHECK (signature ~ '^0x[0-9a-f]{130}$'),
   received_at     timestamptz NOT NULL DEFAULT now(),
   ahead           boolean NOT NULL DEFAULT false,
+  message_id      bigint NOT NULL REFERENCES stop_messages (id),
   original        jsonb,
   original_expiry numeric(78, 0),
-  CONSTRAINT stops_original_when_ahead CHECK (ahead = (original IS NOT NULL) AND ahead = (original_expiry IS NOT NULL))
+  -- A grant's number is a uint32 on chain, which a four-byte integer here does not hold.
+  grant_number    bigint,
+  CONSTRAINT stops_ahead_whole CHECK (ahead = (original IS NOT NULL) AND ahead = (original_expiry IS NOT NULL) AND ahead = (grant_number IS NOT NULL))
 );
+
+-- A stops table made before the message was kept once held the message and its signature on every row, and had
+-- neither message_id nor grant_number; IF NOT EXISTS above leaves such a table as it stands, so it is brought to
+-- this shape here. No courier had been released when this was written, so the only such tables were empty ones.
+-- On a table that holds a row the second statement fails, since an existing row has no message to point at, and
+-- the release fails with it and changes nothing: that is the right outcome, and no message is made up for a stop
+-- that stands.
+ALTER TABLE stops DROP COLUMN IF EXISTS message, DROP COLUMN IF EXISTS signature;
+ALTER TABLE stops ADD COLUMN IF NOT EXISTS message_id bigint NOT NULL REFERENCES stop_messages (id), ADD COLUMN IF NOT EXISTS grant_number bigint;
+ALTER TABLE stops DROP CONSTRAINT IF EXISTS stops_original_when_ahead;
+
+-- The rule that a stop ahead is whole, on a table that stood before it. The rule is added only where the table does
+-- not hold a constraint of its name: adding it reads every row of the table, and a release that dropped and added it
+-- each time would read the table whole at every release, more with every stop kept. Where a constraint of the name
+-- stands, the catalog alone is read: it must be this check, validated, as the database states it, or the release
+-- fails and changes nothing. A name alone proves no shape, so a constraint of the name that is another rule, or one
+-- not validated, is not adopted, and is not dropped and added again either: it is a state nobody intended, to be
+-- looked at by a person. This block is constant text; nothing of the data is in it.
+DO $$
+DECLARE
+  standing record;
+BEGIN
+  SELECT c.contype, c.convalidated, pg_get_constraintdef(c.oid) AS definition INTO standing
+  FROM pg_constraint c WHERE c.conrelid = 'stops'::regclass AND c.conname = 'stops_ahead_whole';
+  IF NOT FOUND THEN
+    ALTER TABLE stops ADD CONSTRAINT stops_ahead_whole CHECK (ahead = (original IS NOT NULL) AND ahead = (original_expiry IS NOT NULL) AND ahead = (grant_number IS NOT NULL));
+  ELSIF standing.contype <> 'c' OR NOT standing.convalidated
+     OR standing.definition <> 'CHECK (((ahead = (original IS NOT NULL)) AND (ahead = (original_expiry IS NOT NULL)) AND (ahead = (grant_number IS NOT NULL))))' THEN
+    RAISE EXCEPTION 'the stops table holds a constraint named stops_ahead_whole that is not the validated check this schema makes: %', standing.definition
+      USING ERRCODE = 'invalid_table_definition';
+  END IF;
+END
+$$;
+
+-- The stop route's count of an account's stops ahead that still count against its bound of 32: the stops ahead of
+-- one account, the latest original_expiry first, so the count reads the ones whose originals have not expired and
+-- no further, whatever the account stopped ahead before and has since let expire.
+CREATE INDEX IF NOT EXISTS stops_ahead_by_account
+  ON stops (account, original_expiry DESC)
+  WHERE ahead;
 
 -- ──────────────────────────── lanes ───────────────────────────────────────
 -- One row for each sender key the courier has used. Owning a lane is a

@@ -6,6 +6,7 @@ import { createConditions, type Conditions } from './conditions';
 import { createEvents, type Events } from './events';
 import { createGames, createOrders, type Games, type Orders } from './orders';
 import { createRuns, type Runs } from './runs';
+import { createStops, type Stops } from './stops';
 
 // The courier's own Postgres (db/schema.sql): how it is reached, and the
 // records kept in it. The release step and the web process open their
@@ -212,6 +213,22 @@ export const COLUMNS_USED: ReadonlyArray<readonly [table: string, column: string
   ['orders', 'ended_block_hash'],
   ['orders', 'bet_state'],
   ['stops', 'hash'],
+  ['stops', 'account'],
+  ['stops', 'received_at'],
+  ['stops', 'ahead'],
+  ['stops', 'message_id'],
+  ['stops', 'original'],
+  ['stops', 'original_expiry'],
+  ['stops', 'grant_number'],
+  ['stop_messages', 'id'],
+  ['stop_messages', 'account'],
+  ['stop_messages', 'signer'],
+  ['stop_messages', 'message'],
+  ['stop_messages', 'signature'],
+  ['stop_messages', 'received_at'],
+  ['stop_messages', 'block_number'],
+  ['stop_messages', 'block_hash'],
+  ['stop_messages', 'block_time'],
   ['accounts', 'account'],
   ['accounts', 'budget'],
   ['accounts', 'budget_at'],
@@ -224,7 +241,7 @@ export const COLUMNS_USED: ReadonlyArray<readonly [table: string, column: string
 ];
 
 /** The tables the schema makes, all of which must exist. */
-export const TABLES = ['orders', 'stops', 'lanes', 'crosses', 'legs', 'events', 'conditions', 'accounts', 'runs', 'games'] as const;
+export const TABLES = ['orders', 'stops', 'stop_messages', 'lanes', 'crosses', 'legs', 'events', 'conditions', 'accounts', 'runs', 'games'] as const;
 
 /** The tables and columns of COLUMNS_USED and TABLES that the database does not have, as "table" or "table.column". */
 export async function missingSchema(pool: pg.Pool): Promise<string[]> {
@@ -266,6 +283,7 @@ export interface Store {
   events: Events;
   conditions: Conditions;
   orders: Orders;
+  stops: Stops;
   games: Games;
   /** The database's size in bytes, as the database reports it. */
   databaseSize(): Promise<number>;
@@ -292,6 +310,7 @@ export function createStore(pool: pg.Pool, door: pg.Pool, log: (line: string) =>
     events: createEvents(pool),
     conditions: createConditions(pool),
     orders: createOrders(pool),
+    stops: createStops(pool),
     games: createGames(),
     async databaseSize() {
       const { rows } = await pool.query<{ size: string }>('SELECT pg_database_size(current_database())::text AS size');
@@ -318,7 +337,7 @@ export function createStore(pool: pg.Pool, door: pg.Pool, log: (line: string) =>
       const { rows } = await pool.query<{ table: string; rows: string; bytes: string }>(
         `SELECT c.relname AS table, c.reltuples::text AS rows, pg_total_relation_size(c.oid)::text AS bytes
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-         WHERE n.nspname = current_schema() AND c.relkind = 'r' AND c.relname IN ('orders', 'events', 'stops', 'crosses', 'legs', 'accounts')
+         WHERE n.nspname = current_schema() AND c.relkind = 'r' AND c.relname IN ('orders', 'events', 'stops', 'stop_messages', 'crosses', 'legs', 'accounts')
          ORDER BY c.relname`,
       );
       return rows.map((r) => {

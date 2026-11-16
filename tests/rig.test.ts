@@ -253,7 +253,7 @@ test('start-up refuses a set whose code is not the entry\'s, and starts again on
 
 test('start-up refuses a database without the schema, a node that does not answer, and settings with a problem', async () => {
   const empty = await stack.db.createDatabase('bare');
-  assert.match(await refusedToStart({ DATABASE_URL: stack.db.urlFor(empty) }), /^courier did not start: DATABASE_URL: the database answers but does not have the courier's schema \(missing: orders, stops, lanes, crosses, legs, events, conditions, accounts, runs, games\); apply db\/schema\.sql$/);
+  assert.match(await refusedToStart({ DATABASE_URL: stack.db.urlFor(empty) }), /^courier did not start: DATABASE_URL: the database answers but does not have the courier's schema \(missing: orders, stops, stop_messages, lanes, crosses, legs, events, conditions, accounts, runs, games\); apply db\/schema\.sql$/);
   assert.match(await refusedToStart({ POLYGON_RPC_URL: 'http://127.0.0.1:1' }), /^courier did not start: POLYGON_RPC_URL: the node did not answer eth_chainId \(unreachable( [A-Z_]+)?\)$/);
   assert.match(await refusedToStart({ SIGNPOST_ADDRESS: 'not-an-address' }), /^courier did not start: settings: SIGNPOST_ADDRESS is not an address$/);
   assert.match(await refusedToStart({ SIGNPOST_ADDRESS: rig.accounts.stranger.address }), /holds no code on the node's chain \(chain id 31337\)/);
