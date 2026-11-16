@@ -328,39 +328,49 @@ test("the market's page judges each quote as the contract does, at the version a
     return new Map(rows.map((r) => [r.hash, r]));
   };
 
-  // Standing, both: a quote of the mover's at version 0, where an account begins; and one the owner's agent signed
-  // under the owner's first grant.
-  const leftBehind = await posted(mover, mover, nonceOf(0n, 0, nextOrderNumber()), 180);
-  const g1 = await grantAgent(rig, owner, agent.address, 1_000_000n, far);
-  const underOld = await posted(agent, owner, nonceOf(0n, g1, nextOrderNumber()), 183);
+  // The page lists by the tick, lowest first, and the two quotes that will end by an older version and an older
+  // grant are given the highest ticks, so they are the last of their accounts on the page: a read that kept one
+  // floor or one grant's record an account, the last it met, would judge the others by theirs.
+  //
+  // Standing, both: one the owner's agent signed under the owner's first grant, which ends in a few minutes; and a
+  // quote of the mover's at version 0, where an account begins.
+  const firstEnds = T + 200n;
+  const g1 = await grantAgent(rig, owner, agent.address, 1_000_000n, firstEnds);
+  const underOld = await posted(agent, owner, nonceOf(0n, g1, nextOrderNumber()), 186);
+  const leftBehind = await posted(mover, mover, nonceOf(0n, 0, nextOrderNumber()), 187);
   let page = await sideA();
-  assert.deepEqual({ listed: hashesOf(page), ended: page.endedOnChain }, { listed: [leftBehind, underOld], ended: 0 }, 'both stand, and are listed');
+  assert.deepEqual({ listed: hashesOf(page), ended: page.endedOnChain }, { listed: [underOld, leftBehind], ended: 0 }, 'both stand, and are listed');
 
   // The mover cancels everything. At the version it moved to it posts order numbers 7 and 8, then raises its floor on
-  // the line to 8: 7 is under it, 8 is at it. No other account on the page has a floor.
+  // the line to 8: 7 is under it, 8 is at it. At version 0 its floor is none, and no other account on the page has one.
   const version = await cancelAll(rig, mover);
   assert.ok(version > 0n);
   const underFloor = await posted(mover, mover, nonceOf(version, 0, 7n), 181);
   const atFloor = await posted(mover, mover, nonceOf(version, 0, 8n), 182);
   await raiseFloor(rig, mover, mover.address, orderOn(rig, mover, { expiry: far, ...spread }), 8n);
-  // The owner grants the same key again: the first grant is gone, and a quote is posted under the second.
+  // The owner grants the same key again, until far off: the first grant is gone, and a quote is posted under the second.
   const g2 = await grantAgent(rig, owner, agent.address, 1_000_000n, far);
   assert.deepEqual([g1, g2], [1, 2]);
   const underNew = await posted(agent, owner, nonceOf(0n, g2, nextOrderNumber()), 184);
-  // A third account grants the same key until a second not far off, and a quote is posted under that grant: its
-  // current one, with another end than the owner's grants have.
-  const ends = (await rig.time()) + 300n;
+  // A third account grants the same key until a second some minutes off, and a quote is posted under that grant: its
+  // current one, with another end than either of the owner's.
+  const ends = firstEnds + 400n;
   const gEnding = await grantAgent(rig, ender, agent.address, 1_000_000n, ends);
   const underEnding = await posted(agent, ender, nonceOf(0n, gEnding, nextOrderNumber()), 185);
 
+  // The latest block past the end of the owner's first grant. The quote under the owner's second grant stands by its
+  // own grant's end, not by the first's.
+  await rig.setNextBlockTime(firstEnds + 1n);
+  await rig.mine(1);
   let head = await rig.publicClient.getBlock();
-  assert.ok(head.timestamp < ends - 1n);
+  assert.equal(head.timestamp, firstEnds + 1n);
   page = await sideA();
   assert.deepEqual(hashesOf(page), [atFloor, underNew, underEnding], 'listed: the quote at the floor, and the two under grants that stand');
   assert.deepEqual({ live: page.live, ended: page.endedOnChain, cancelled: page.markedCancelled }, { live: 6, ended: 3, cancelled: 3 }, 'the three ended are marked by this request');
   // The records: the three marked cancelled at the block this request read; the three that stand unmarked.
   const gone = [leftBehind, underFloor, underOld];
   let byHash = await records([...gone, atFloor, underNew, underEnding]);
+  assert.equal(byHash.size, 6);
   for (const h of gone) assert.deepEqual(byHash.get(h), { hash: h, ended: 'cancelled', block: head.number.toString(), block_hash: head.hash.toLowerCase() });
   for (const h of [atFloor, underNew, underEnding]) assert.deepEqual(byHash.get(h), { hash: h, ended: null, block: null, block_hash: null });
 
