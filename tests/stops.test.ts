@@ -7,10 +7,11 @@ import pg from 'pg';
 import { decodeFunctionData, getAddress, recoverTypedDataAddress, type Address, type Hex } from 'viem';
 import type { HDAccount } from 'viem/accounts';
 import { MATCHING_ABI, MULTICALL_ABI, MULTICALL_ADDRESS } from '../courier/chain/abi';
-import { AHEAD_COUNT_SQL } from '../courier/records/stops';
+import { MARK_ENDED_SQL, SCAN_SQL, scanParams } from '../courier/records/orders';
+import { AHEAD_COUNT_SQL, MARK_STOPPED_SQL } from '../courier/records/stops';
 import { openPool } from '../courier/records/store';
 import { get, startCourier, type CourierProcess } from './support/courier';
-import { contractHash, grantAgent, nextOrderNumber, nonceOf, orderOn, post, postOrder, postOrderAs, refusedForm, revokeAgent, sign, wire, type Answer, type Order } from './support/orders';
+import { cancelOnChain, contractHash, grantAgent, nextOrderNumber, nonceOf, orderOn, post, postOrder, postOrderAs, refusedForm, revokeAgent, sign, wire, type Answer, type Order } from './support/orders';
 import type { Rig } from './support/rig';
 import { startStack, type Stack } from './support/stack';
 import { hashLockKey, outcomes, postStop, resultsOf, sendStop, signStop, stopBody, stopMessage, STOP_TYPE, type OriginalSent, type StopMessage } from './support/stops';
@@ -51,12 +52,20 @@ const url = () => stack.courier.url;
 
 /**
  * The courier's own log of stop requests since a mark: one line, which names the route and the code of a refusal
- * before admission and nothing else, so nothing of the caller or of the message is in it.
+ * before admission and nothing else, so nothing of the caller or of the message is in it. The log is one stream, in
+ * the order it was written. So a refusal of another route, which another statement logs, is sent after the stop was
+ * answered: once its line is in hand, every line the courier wrote before it is in hand too, and the stop's line is
+ * among them or was never written. Nothing here waits for a line that may not come.
  */
-async function refusalLogged(since: number, code: string): Promise<void> {
-  const ofStops = () => stack.courier.lines.slice(since).filter((line) => line.includes('POST /v1/stops'));
-  await until(`the courier's log line for a stop refused ${code}`, async () => ofStops().length > 0);
-  assert.deepEqual(ofStops(), [`refused before admission: POST /v1/stops ${code}`], 'the log line is the route and the code, with nothing of the caller or of the message');
+async function refusalLogged(since: number, code: string, headers: Record<string, string>): Promise<void> {
+  const later = 'refused before admission: GET /v1/orders/{hash} INVALID_PARAM';
+  assert.equal((await get(url(), '/v1/orders/no-hash', headers)).body.code, 'INVALID_PARAM', 'a later refusal, of another route');
+  const end = await until("the courier's log line for the later refusal, of another route", async () => {
+    const at = stack.courier.lines.indexOf(later, since);
+    return at < 0 ? null : at;
+  });
+  const ofStops = stack.courier.lines.slice(since, end).filter((line) => line.includes('POST /v1/stops'));
+  assert.deepEqual(ofStops, [`refused before admission: POST /v1/stops ${code}`], 'the log line is the route and the code, with nothing of the caller or of the message');
 }
 
 /** Every case sends from a network address of its own, so no case's count on either of the courier's two minutes is another's. */
@@ -630,7 +639,7 @@ test("4b. the bound on stops ahead counts the ones whose orders have not expired
   assert.equal(rows[0]?.n, 48);
 });
 
-test("4c. an agent's stops ahead fill the account's thirty-two slots beside the account's own, while its grant stands: with one stop ahead of the account's own standing, the agent's thirty-second is refused for the bound, and so is the account's own next; a stop ahead the agent sends again is already stopped and takes no budget; the account's revoke frees the agent's slots at the block read, and the account's own stop ahead is taken; the agent's thirty-one stand: each record still says stopped ahead, each row holds its order's own expiry, and a post of one is refused before and after the revoke", async () => {
+test("4c. an agent's stops ahead fill the account's thirty-two slots while its grant stands, and the account's revoke frees them: the agent's thirty-two are taken, its thirty-third is refused for the bound, and so is the account's own; a stop ahead the agent sends again is already stopped and takes no budget; a post of each of the thirty-two is STOPPED at the door. The account revokes: its own stop ahead, refused a moment before, is taken at the block read; the thirty-two stand, each record still says stopped ahead and each row holds its order's own expiry; and a post of each is refused still, now GRANT_GONE, since the door judges an order's grant before it looks for its stop. Then the account's own one counts beside a new grant's: that grant's agent has thirty-one slots, and its thirty-second is refused", async () => {
   const from = at(43);
   const owner = await freshAccount();
   const agent = await freshAccount(false);
@@ -638,45 +647,54 @@ test("4c. an agent's stops ahead fill the account's thirty-two slots beside the 
   const T = await rig.time();
   const g = await grantAgent(rig, owner, agent.address, 5_000_000n, T + 100_000n);
   const far = { expiry: T + 90_000n, oddsTick: 260, ...market };
-  const own = await originals(owner, 3, far);
-  // One stop ahead of the account's own, of an order it signed itself: it counts whatever grant stands.
-  assert.deepEqual(await stopAhead(owner, owner, [own[0] as OriginalSent], from), ['stopped ahead']);
-  const byAgent = await originals(owner, 32, far, agent, () => nonceOf(0n, g, nextOrderNumber()));
+  const [own, ownNext] = (await originals(owner, 2, far)) as [OriginalSent, OriginalSent];
+  const byAgent = await originals(owner, 33, far, agent, () => nonceOf(0n, g, nextOrderNumber()));
+  const thirtyTwo = byAgent.slice(0, 32);
+  const thirtyThird = byAgent[32] as OriginalSent;
   // The agent's own stops ahead of the orders it signed under its grant: sixteen a message.
-  assert.deepEqual(await stopAhead(owner, agent, byAgent.slice(0, 16), from), times(16, 'stopped ahead'));
+  assert.deepEqual(await stopAhead(owner, agent, thirtyTwo.slice(0, 16), from), times(16, 'stopped ahead'));
   // The same sixteen sent again, their originals beside them: every hash of the message is stopped, and that takes no budget.
   const budgets = await budgetRows();
-  assert.deepEqual(await stopAhead(owner, agent, byAgent.slice(0, 16), from), times(16, 'already stopped'));
+  assert.deepEqual(await stopAhead(owner, agent, thirtyTwo.slice(0, 16), from), times(16, 'already stopped'));
   assert.deepEqual(await budgetRows(), budgets, "an agent's stop ahead sent again takes no budget");
-  assert.deepEqual(
-    await stopAhead(owner, agent, byAgent.slice(16), from),
-    [...times(15, 'stopped ahead'), 'TOO_MANY_STOPS_AHEAD'],
-    "the account's own one and the agent's thirty-one fill the slots: the agent's thirty-second is over the bound",
-  );
-  assert.deepEqual(await stopAhead(owner, owner, [own[1] as OriginalSent], from), ['TOO_MANY_STOPS_AHEAD'], "and so is the account's own next, while the grant stands");
-  // While the grant stands, the post of one of the thirty-one is refused for its stop.
-  const stoodAhead = byAgent.slice(0, 31);
-  const sample = byAgent[5] as OriginalSent;
-  const stoppedAtTheDoor = await postOriginal(sample, from);
-  assert.deepEqual({ status: stoppedAtTheDoor.status, code: stoppedAtTheDoor.body.code }, { status: 422, code: 'STOPPED' }, JSON.stringify(stoppedAtTheDoor.body));
+  assert.deepEqual(await stopAhead(owner, agent, thirtyTwo.slice(16), from), times(16, 'stopped ahead'), "the agent's thirty-two fill the account's slots");
+  assert.deepEqual(await stopAhead(owner, agent, [thirtyThird], from), ['TOO_MANY_STOPS_AHEAD'], "the agent's thirty-third is over the bound");
+  assert.deepEqual(await stopAhead(owner, owner, [own], from), ['TOO_MANY_STOPS_AHEAD'], "and so is the account's own, while the grant stands: the agent's stops ahead count against the account's bound");
+  // While the grant stands, the post of each of the thirty-two is refused for its stop.
+  for (const [i, o] of thirtyTwo.entries()) {
+    const posted = await postOriginal(o, from);
+    assert.deepEqual({ status: posted.status, code: posted.body.code }, { status: 422, code: 'STOPPED' }, `the post of the agent's stop ahead ${i + 1}, its grant standing: ${JSON.stringify(posted.body)}`);
+  }
 
   await revokeAgent(rig, owner);
-  assert.deepEqual(await stopAhead(owner, owner, [own[2] as OriginalSent], from), ['stopped ahead'], "the revoke freed the agent's slots: the account's own stop ahead is taken, beside its first");
-  // The thirty-one stand. Their records say so; a post of one is refused still, now for its grant, which the door
-  // judges before it looks for a stop: the order can fill nowhere, and its stop is on record all the same.
-  const stand = await stopRows(stoodAhead.map((o) => o.orderHash));
-  assert.equal(stand.size, 31);
+  assert.deepEqual(await stopAhead(owner, owner, [own], from), ['stopped ahead'], "the revoke freed the agent's slots: the account's own stop ahead, refused before it, is taken");
+  // The thirty-two stand. Their records say so, and a post of each is refused still: now for its grant, which the
+  // door judges before it looks for a stop. The order can fill nowhere, and its stop is on record all the same.
+  const stand = await stopRows(thirtyTwo.map((o) => o.orderHash));
+  assert.equal(stand.size, 32);
   assert.ok(
     [...stand.values()].every((s) => s.ahead && s.grant_number === String(g) && s.original_expiry === far.expiry.toString()),
     "each holds its grant's number, and its order's own expiry, which comes before the grant's end",
   );
-  assert.equal((await stopRows([(byAgent[31] as OriginalSent).orderHash])).size, 0, 'the thirty-second, refused for the bound, holds no stop');
-  for (const o of [byAgent[0], sample, byAgent[30]] as OriginalSent[]) {
-    assert.equal((await get(url(), `/v1/orders/${o.orderHash}`, from)).body.state, 'stopped ahead');
+  assert.equal((await stopRows([thirtyThird.orderHash])).size, 0, 'the thirty-third, refused for the bound, holds no stop');
+  for (const [i, o] of thirtyTwo.entries()) {
+    assert.equal((await get(url(), `/v1/orders/${o.orderHash}`, from)).body.state, 'stopped ahead', `the record of the agent's stop ahead ${i + 1}, its grant revoked`);
+    const posted = await postOriginal(o, from);
+    assert.deepEqual({ status: posted.status, code: posted.body.code }, { status: 422, code: 'GRANT_GONE' }, `the post of the agent's stop ahead ${i + 1}, its grant revoked: ${JSON.stringify(posted.body)}`);
   }
-  const afterRevoke = await postOriginal(sample, from);
-  assert.deepEqual({ status: afterRevoke.status, code: afterRevoke.body.code }, { status: 422, code: 'GRANT_GONE' }, JSON.stringify(afterRevoke.body));
-  assert.equal((await endedOf(byAgent.map((o) => o.orderHash))).size, 0, 'none of the thirty-two ever entered the orders');
+  assert.equal((await endedOf(byAgent.map((o) => o.orderHash))).size, 0, 'none of the thirty-three ever entered the orders');
+
+  // The account's own stop ahead, of an order it signed itself, counts whatever grant stands: under a new grant,
+  // that grant's agent has the thirty-one slots beside it.
+  const g2 = await grantAgent(rig, owner, agent.address, 5_000_000n, T + 100_000n);
+  const underNew = await originals(owner, 32, far, agent, () => nonceOf(0n, g2, nextOrderNumber()));
+  assert.deepEqual(await stopAhead(owner, agent, underNew.slice(0, 16), from), times(16, 'stopped ahead'));
+  assert.deepEqual(
+    await stopAhead(owner, agent, underNew.slice(16), from),
+    [...times(15, 'stopped ahead'), 'TOO_MANY_STOPS_AHEAD'],
+    "the account's own one and the new grant's thirty-one fill the slots: the agent's thirty-second is over the bound",
+  );
+  assert.deepEqual(await stopAhead(owner, owner, [ownNext], from), ['TOO_MANY_STOPS_AHEAD'], "and so is the account's own next, while the new grant stands");
 });
 
 test('4d. two messages of one account for its last slot, one sent to each of two courier processes and both let go together: one is stopped ahead and the other is TOO_MANY_STOPS_AHEAD, and the account holds thirty-two', async () => {
@@ -715,6 +733,9 @@ test('4d. two messages of one account for its last slot, one sent to each of two
 interface PlanNode {
   'Node Type': string;
   'Index Name'?: string;
+  'Relation Name'?: string;
+  'Subplan Name'?: string;
+  'Sort Key'?: string[];
   'Shared Hit Blocks'?: number;
   'Shared Read Blocks'?: number;
   'Actual Rows'?: number;
@@ -1165,7 +1186,7 @@ test("7. the agent's stop: an agent stops the orders signed under its own grant,
   assert.equal(stale.body.results, undefined);
   assert.deepEqual(await everything(), before_, 'nothing written, no budget row touched');
   assert.equal(((await refusedSoFar(from)).AGENT_NOT_LIVE ?? 0) - notLiveBefore, 1, 'counted by its code, before admission');
-  await refusalLogged(logged, 'AGENT_NOT_LIVE');
+  await refusalLogged(logged, 'AGENT_NOT_LIVE', from);
   // Its first message, byte for byte, whose one hash is stopped: refused the same. A former agent is told nothing of
   // the records, not even that a hash is stopped already.
   const staleOfStopped = await sendStop(url(), stopBody(firstMessage, first.signature), from);
@@ -1712,23 +1733,32 @@ async function refusingRows(table: 'stops' | 'orders'): Promise<() => Promise<vo
   };
 }
 
-test("10. the rollback: a stop's message row, its lines, its stops and its marks commit together or not at all. With the database refusing the stops, and then, the stops written, refusing the marks, the stop is answered DATABASE_UNREADABLE and nothing of it stands: no message, no stop, no mark, no line. The refusal lifted, the same message is stopped; sent again, already stopped, with the rows and the lines as they were", async () => {
+test("10. the rollback: a stop's message row, its lines, its stops and its marks commit together or not at all. With the database refusing the stops, and then, the stops written, refusing the marks, the stop is answered DATABASE_UNREADABLE and nothing of it stands: no message, no stop, no mark, no line. The same for a message under the budgets that stops one hash and refuses another: neither of its two lines stands, and neither budget was taken. The refusal lifted, the same messages are taken; the first sent again is already stopped, with the rows and the lines as they were", async () => {
   const from = at(10);
   const { who, market, q1, q2, message } = await threeCarried(from);
+  // A second message, under the budgets: a carried quote on a market of its own, and a hash the courier does not
+  // know. Taken, it writes the two lines a message can write: the one that says what it stopped, and the one that
+  // says what it refused.
+  const beside = await quote(who, { expiry: (await rig.time()) + 3_600n, oddsTick: 230, ...freshMarket() }, from);
+  const unknown = noOrders(0xa001);
+  const mixed = stopMessage(who.address, [beside.hash, unknown]);
   for (const table of ['stops', 'orders'] as const) {
-    const before_ = await everything();
-    const last = await lastLine();
-    const lift = await refusingRows(table);
-    let answer: Answer;
-    try {
-      answer = await postStop(url(), rig, who, message, undefined, from);
-    } finally {
-      await lift();
+    for (const [what, sent] of [['the stop of carried orders', message], ['the message that stops one hash and refuses another', mixed]] as const) {
+      const before_ = await everything();
+      const last = await lastLine();
+      const lift = await refusingRows(table);
+      let answer: Answer;
+      try {
+        answer = await postStop(url(), rig, who, sent, undefined, from);
+      } finally {
+        await lift();
+      }
+      assert.deepEqual({ status: answer.status, code: answer.body.code }, { status: 503, code: 'DATABASE_UNREADABLE' }, `${table} refused, ${what}: ${JSON.stringify(answer.body)}`);
+      assert.deepEqual(await everything(), before_, `${table} refused, ${what}: no message row, no stop, no mark, no line of an order or a stop, and no budget row touched`);
+      assert.equal(await lastLine(), last, `${table} refused, ${what}: no line of any kind was committed`);
     }
-    assert.deepEqual({ status: answer.status, code: answer.body.code }, { status: 503, code: 'DATABASE_UNREADABLE' }, `${table} refused: ${JSON.stringify(answer.body)}`);
-    assert.deepEqual(await everything(), before_, `${table} refused: no message row, no stop, no mark, and no line of an order or a stop`);
-    assert.equal(await lastLine(), last, `${table} refused: no line of any kind was committed`);
     assert.deepEqual(await listed(market, 'A', from), [q1.hash, q2.hash], `${table} refused: the quotes are carried still`);
+    assert.deepEqual([...(await endedOf([beside.hash])).values()], [null], `${table} refused: and so is the second message's quote`);
   }
   // The refusal lifted: the same message is taken, whole.
   const before_ = await written();
@@ -1741,6 +1771,17 @@ test("10. the rollback: a stop's message row, its lines, its stops and its marks
   assert.deepEqual(outcomes(await postStop(url(), rig, who, message, undefined, from)), ['already stopped', 'already stopped', 'already stopped']);
   assert.deepEqual(await everything(), stood);
   assert.equal(await lastLine(), last);
+  // And the second message, taken: its two lines, both of the one message.
+  const takenMixed = await postStop(url(), rig, who, mixed, undefined, from);
+  assert.deepEqual(outcomes(takenMixed), ['stopped', 'UNKNOWN_ORDER'], JSON.stringify(takenMixed.body));
+  const id = Number(((await stopRows([beside.hash])).get(beside.hash) as StopRow).message_id);
+  assert.deepEqual(
+    (await stopLinesSince(last)).map((l) => ({ kind: l.kind, facts: l.facts })),
+    [
+      { kind: 'stop received', facts: { messageId: id, stopped: 1, ahead: 0 } },
+      { kind: 'stop refused', facts: { messageId: id, refused: [{ hash: unknown, code: 'UNKNOWN_ORDER' }] } },
+    ],
+  );
 });
 
 // ──────────────────────────── 11: two processes and a restart ────────────────────────────
@@ -2026,6 +2067,213 @@ test("14a. the first end is kept the other way round too: a quote a page's scan 
   } finally {
     stack.proxy.setFinal(null);
   }
+});
+
+// ──────────────────────────── 14b to 14d: the rows of two orders, locked in one order by every writer of an end ────────────────────────────
+//
+// Three statements write how an order ended: the stop's mark, the page's mark of an expired quote, and the mark of a
+// quote the chain showed ended, which the door makes and the page makes. Each can write several rows at once, and
+// none of them holds the hash locks of the rows it writes but the stop. Two transactions that took the rows of the
+// same two orders in opposite orders would each wait on the other, and the database would end one of them: for a
+// stop, a 503 and the stop to send again. So each takes the locks of its rows in the order of their hashes before it
+// writes any. Each case below watches one of the three write two rows while a transaction of the test's own, which
+// keeps to that order too, holds one of them.
+
+/** Two quotes of one account, by their hashes as the database orders them. */
+interface TwoQuotes {
+  lo: OriginalSent;
+  hi: OriginalSent;
+}
+
+/**
+ * Two quotes of `who`, posted and carried, the one whose hash is the higher posted first: its row lies first in the
+ * table, so a writer that took its rows as the table holds them would take the higher before the lower. With
+ * `expiringLater`, the higher also expires that much later than the lower, so that a list of the account's quotes
+ * by their expiry, latest first, holds the higher before the lower as well.
+ */
+async function twoQuotes(who: HDAccount, fields: Partial<Order> & { expiry: bigint }, headers: Record<string, string>, expiringLater = 0n): Promise<TwoQuotes> {
+  for (let tries = 0; tries < 64; tries++) {
+    const one = await unposted(who, { ...fields, expiry: fields.expiry + expiringLater });
+    const other = await unposted(who, fields);
+    if (expiringLater !== 0n && one.orderHash < other.orderHash) continue;
+    const [hi, lo] = one.orderHash > other.orderHash ? [one, other] : [other, one];
+    assert.equal((await postOriginal(hi, headers)).status, 201, 'the quote of the higher hash, posted first');
+    assert.equal((await postOriginal(lo, headers)).status, 201, 'the quote of the lower hash, posted second');
+    const { rows } = await pool.query<{ hash: string }>('SELECT o.hash FROM orders o WHERE o.hash = ANY($1::text[]) ORDER BY o.hash', [[hi.orderHash, lo.orderHash]]);
+    assert.deepEqual(rows.map((r) => r.hash), [lo.orderHash, hi.orderHash], 'the database orders the two hashes as the test does');
+    return { lo, hi };
+  }
+  return assert.fail('no two orders in 64 pairs whose later-expiring one has the higher hash');
+}
+
+/** The one session of the database that waits on a lock a given session holds: its backend's number, or null while there is none or more than one. */
+async function waitingBehind(pid: number): Promise<number | null> {
+  const { rows } = await pool.query<{ pid: number }>(
+    `SELECT a.pid FROM pg_stat_activity a WHERE a.datname = current_database() AND a.wait_event_type = 'Lock' AND $1::int = ANY(pg_blocking_pids(a.pid))`,
+    [pid],
+  );
+  return rows.length === 1 ? (rows[0]?.pid ?? null) : null;
+}
+
+/** Whether some session holds the lock of an order's row now: asked for from a session of the test's own that waits for nothing, and let go at once. */
+async function rowLocked(hash: Hex): Promise<boolean> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT o.hash FROM orders o WHERE o.hash = $1 FOR NO KEY UPDATE NOWAIT', [hash]);
+    return false;
+  } catch (err) {
+    // 55P03: the lock could not be had at once.
+    if ((err as { code?: string }).code === '55P03') return true;
+    throw err;
+  } finally {
+    await client.query('ROLLBACK').catch(() => undefined);
+    client.release();
+  }
+}
+
+type RowHeld = 'the higher' | 'the lower';
+
+/**
+ * A statement's plan as the stack's database makes it for these values, on one line: each node with the relation,
+ * the index or the sort key it has, and its children in brackets. The statement is planned and not run. Printed
+ * with each of the three cases, so a run says in what order each statement is given its rows; no case rests on it.
+ */
+async function planOf(sql: string, params: unknown[]): Promise<string> {
+  const { rows } = await pool.query<{ 'QUERY PLAN': Array<{ Plan: PlanNode }> }>(`EXPLAIN (COSTS OFF, FORMAT JSON) ${sql}`, params);
+  const line = (n: PlanNode): string => {
+    const what = [n['Relation Name'], n['Index Name'], n['Sort Key'] === undefined ? undefined : `by ${n['Sort Key'].join(', ')}`].filter((x) => x !== undefined).join(' ');
+    const kids = (n.Plans ?? []).map(line).join('; ');
+    return `${n['Subplan Name'] === undefined ? '' : `${n['Subplan Name']}: `}${n['Node Type']}${what === '' ? '' : ` (${what})`}${kids === '' ? '' : ` [${kids}]`}`;
+  };
+  return line((rows[0]?.['QUERY PLAN'][0] as { Plan: PlanNode }).Plan);
+}
+
+/**
+ * One write of the two quotes' rows by the courier, made while a transaction of the test's own holds the lock of
+ * one of the two rows, and what it was answered once the test let go.
+ *
+ * The higher held: the courier, seen waiting behind the test's session, must hold the lower row's lock already. It
+ * took the lower first and waits for the higher.
+ *
+ * The lower held: the courier, seen waiting behind the test's session, must hold nothing of the higher row, so the
+ * test's session, which holds the lower and now asks for the higher, is given it at once. This is the crossing: had
+ * the courier taken the higher first, it would wait for the lower the test holds while the test waited for the
+ * higher it holds, and the database would end one of the two transactions. Where it ends the test's, that is the
+ * fault named here; where it ends the courier's, the courier's answer is not the one the case expects.
+ */
+async function writtenWhileHeld<T>(what: string, two: TwoQuotes, held: RowHeld, write: () => Promise<T>): Promise<T> {
+  const mine = await ownSession();
+  let writing: Promise<T> | null = null;
+  try {
+    await mine.client.query('BEGIN');
+    await mine.client.query('SELECT o.hash FROM orders o WHERE o.hash = $1 FOR NO KEY UPDATE', [held === 'the higher' ? two.hi.orderHash : two.lo.orderHash]);
+    writing = write();
+    writing.catch(() => undefined);
+    await until(`${what}, ${held} hash's row held by the test: the courier's session waiting on that row`, () => waitingBehind(mine.pid));
+    if (held === 'the higher') {
+      assert.equal(await rowLocked(two.lo.orderHash), true, `${what}: waiting for the higher hash's row, the courier holds the lower's already`);
+    } else {
+      const asked = await mine.client.query('SELECT o.hash FROM orders o WHERE o.hash = $1 FOR NO KEY UPDATE', [two.hi.orderHash]).then(
+        () => 'given',
+        (err: unknown) => ((err as { code?: string }).code === '40P01' ? 'ended for a deadlock' : Promise.reject(err)),
+      );
+      assert.equal(
+        asked,
+        'given',
+        `${what}: the test's transaction holds the lower hash's row and asked for the higher's while the courier waited for the lower. The courier had taken the higher first: each waited on the other, and the database ended the test's transaction`,
+      );
+    }
+    // The test's transaction wrote nothing: ended, it lets its rows go.
+    await mine.client.query('ROLLBACK');
+    return await within(`${what}, the test's lock let go`, writing);
+  } finally {
+    // Whatever happened above, the test's rows are let go before the courier's answer is waited for.
+    await mine.client.query('ROLLBACK').catch(() => undefined);
+    mine.client.release();
+    await writing?.catch(() => undefined);
+  }
+}
+
+/** Both schedules run whatever the first shows, so a failing run says what each of the two showed; the faults, by the row held. */
+async function bothSchedules(one: (held: RowHeld) => Promise<void>): Promise<string[]> {
+  const faults: string[] = [];
+  for (const held of ['the higher', 'the lower'] as const) {
+    try {
+      await one(held);
+    } catch (err) {
+      faults.push(`${held} hash's row held: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return faults;
+}
+
+test("14b. the stop's mark takes its rows in the order of their hashes: a stop of two carried quotes, the higher hash named first and its row first in the table. With the test holding the higher hash's row, the courier is seen holding the lower's and waiting; with the test holding the lower's, the courier waits holding nothing of the higher's, the test is given it at once, and no transaction is ended for a deadlock. Each way both quotes are stopped", async () => {
+  const from = at(142);
+  const who = await freshAccount();
+  const market = freshMarket();
+  const far = (await rig.time()) + 100_000n;
+  const faults = await bothSchedules(async (held) => {
+    const two = await twoQuotes(who, { expiry: far, oddsTick: 660, ...market }, from);
+    console.log(`# 14b, ${held} hash's row held: the plan of the stop's mark for the two rows: ${await planOf(MARK_STOPPED_SQL, [[two.hi.orderHash, two.lo.orderHash]])}`);
+    const logged = stack.courier.lines.length;
+    const answer = await writtenWhileHeld("the stop's mark", two, held, () => postStop(url(), rig, who, stopMessage(who.address, [two.hi.orderHash, two.lo.orderHash]), undefined, from));
+    assert.deepEqual({ status: answer.status, results: outcomes(answer) }, { status: 200, results: ['stopped', 'stopped'] }, `${JSON.stringify(answer.body)}; the courier's log since: ${stack.courier.lines.slice(logged).join(' | ')}`);
+    assert.deepEqual([...(await endedOf([two.lo.orderHash, two.hi.orderHash])).values()], ['stopped', 'stopped']);
+  });
+  assert.deepEqual(faults, [], "the stop's mark takes the rows of the orders it stops in the order of their hashes");
+});
+
+test("14c. the page's mark of expired quotes takes its rows in the order of their hashes: a page of a market whose two quotes, the higher hash's row first in the table, both expired at the final block. With the test holding the higher hash's row, the page's scan is seen holding the lower's and waiting; with the test holding the lower's, the scan waits holding nothing of the higher's, the test is given it at once, and no transaction is ended for a deadlock. Each way the page is answered and both quotes are marked expired", async () => {
+  const from = at(143);
+  const who = await freshAccount();
+  const markets = { 'the higher': freshMarket(), 'the lower': freshMarket() };
+  const expiry = (await rig.time()) + 120n;
+  const pairs = {
+    'the higher': await twoQuotes(who, { expiry, oddsTick: 662, ...markets['the higher'] }, from),
+    'the lower': await twoQuotes(who, { expiry, oddsTick: 662, ...markets['the lower'] }, from),
+  };
+  await chainTimeIs(expiry);
+  try {
+    stack.proxy.setFinal((await head()).number);
+    const faults = await bothSchedules(async (held) => {
+      const two = pairs[held];
+      const market = markets[held];
+      const key = (await pool.query<{ market_key: Hex }>('SELECT o.market_key FROM orders o WHERE o.hash = $1', [two.lo.orderHash])).rows[0]?.market_key ?? assert.fail('no market key');
+      console.log(`# 14c, ${held} hash's row held: the plan of the scan with its mark for the market's side: ${await planOf(SCAN_SQL, scanParams({ marketKey: key, side: 0, after: null, blockTime: expiry, finalTime: expiry, page: 50 }))}`);
+      const logged = stack.courier.lines.length;
+      const page = await writtenWhileHeld("the page's mark of expired quotes", two, held, () => get(url(), `/v1/book?gameId=${rig.gameId}&scorer=${market.scorer}&lineTicks=${market.lineTicks}&side=A`, from));
+      assert.equal(page.status, 200, `${JSON.stringify(page.body)}; the courier's log since: ${stack.courier.lines.slice(logged).join(' | ')}`);
+      const side = (page.body.sides as Record<string, { quotes: unknown[]; marked: number; scanned: number }>).A;
+      assert.deepEqual({ quotes: side?.quotes, scanned: side?.scanned, marked: side?.marked }, { quotes: [], scanned: 2, marked: 2 }, 'the scan was returned the two quotes and marked both');
+      assert.deepEqual([...(await endedOf([two.lo.orderHash, two.hi.orderHash])).values()], ['expired', 'expired']);
+    });
+    assert.deepEqual(faults, [], "the page's mark takes the rows of the quotes it marks expired in the order of their hashes");
+  } finally {
+    stack.proxy.setFinal(null);
+  }
+});
+
+test("14d. the mark of quotes the chain shows ended takes its rows in the order of their hashes: a post that finds its account's sixteen quotes standing on the side, two of them cancelled on chain, the higher hash's row first in the table and first in the door's list. With the test holding the higher hash's row, the door is seen holding the lower's and waiting; with the test holding the lower's, the door waits holding nothing of the higher's, the test is given it at once, and no transaction is ended for a deadlock. Each way the post is taken and both quotes are marked cancelled", async () => {
+  const from = at(144);
+  const faults = await bothSchedules(async (held) => {
+    const who = await freshAccount();
+    const market = freshMarket();
+    const far = (await rig.time()) + 100_000n;
+    // The two to be cancelled: the higher hash posted first and expiring last, so the table and the door's list of
+    // the account's quotes, latest expiry first, both hold the higher before the lower. Then fourteen more.
+    const two = await twoQuotes(who, { expiry: far, oddsTick: 664, ...market }, from, 10n);
+    for (let i = 0; i < 14; i++) await quote(who, { expiry: far, oddsTick: 670 + i, ...market }, from);
+    await cancelOnChain(rig, who, two.hi.order);
+    await cancelOnChain(rig, who, two.lo.order);
+    const block = await head();
+    console.log(`# 14d, ${held} hash's row held: the plan of the mark of quotes the chain shows ended for the two rows: ${await planOf(MARK_ENDED_SQL, [[two.hi.orderHash, two.lo.orderHash], ['cancelled', 'cancelled'], block.number.toString(), block.hash.toLowerCase()])}`);
+    const logged = stack.courier.lines.length;
+    const posted = await writtenWhileHeld('the mark of quotes the chain shows ended', two, held, () => postOrder(url(), rig, who, 'rest', orderOn(rig, who, { expiry: far, oddsTick: 690, ...market }), from));
+    assert.equal(posted.status, 201, `the post found two of the sixteen cancelled, marked them, and was taken: ${JSON.stringify(posted.body)}; the courier's log since: ${stack.courier.lines.slice(logged).join(' | ')}`);
+    assert.deepEqual([...(await endedOf([two.lo.orderHash, two.hi.orderHash])).values()], ['cancelled', 'cancelled']);
+  });
+  assert.deepEqual(faults, [], 'the mark of quotes the chain shows ended takes their rows in the order of their hashes');
 });
 
 // ──────────────────────────── 15: the locks a message holds ────────────────────────────

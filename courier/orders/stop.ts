@@ -8,9 +8,10 @@ import { isChainSignature, readOrderShape, type OrderFields } from './order';
 // EIP-712 domain, whose contract is the relay: the one address every account
 // registered, so a stop is tied to this courier and this chain. An order is
 // signed under another domain (the matching contract's) and another type, so
-// an order's signature serves as a stop only on a hash collision. The message
-// carries no nonce and no time: a stop is permanent for its hash, and sent
-// again it changes nothing.
+// an order's signature serves as a stop only on a hash collision. A stop
+// message has no nonce or expiry. A recorded stop is permanent for its hash.
+// Replaying a message is not universally free or without writes: the replay
+// rules are in docs/API.md, part 4.
 
 /** The type: the account, then the order hashes in the message's own order. */
 export const STOP_TYPES = {

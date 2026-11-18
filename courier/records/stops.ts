@@ -51,6 +51,19 @@ export interface NewStop {
 export const AHEAD_COUNT_SQL = `SELECT count(*) AS standing FROM stops s
   WHERE s.account = $1 AND s.ahead AND s.original_expiry > $2::numeric AND (s.grant_number = 0 OR s.grant_number = $3::bigint)`;
 
+/**
+ * The stop's mark of the carried orders among $1, the ones not ended already. The rows' locks are taken first, in
+ * the order of the hashes, and then the rows are written: every statement that writes an order's end takes its rows
+ * in that one order (the scan's mark and the mark of quotes the chain shows ended are the other two, in the orders'
+ * records), so no two of these statements take the same two rows in opposite orders, each then waiting on the
+ * other until the database ends one. The lock is the one the update itself takes, and no stronger; and it chooses
+ * the rows by their hashes alone: whether a row is still unended is the update's to judge.
+ */
+export const MARK_STOPPED_SQL = `WITH held AS (
+  SELECT o.hash FROM orders o WHERE o.hash = ANY($1::text[]) ORDER BY o.hash FOR NO KEY UPDATE
+)
+UPDATE orders SET ended = 'stopped', ended_at = now() WHERE hash IN (SELECT h.hash FROM held h) AND ended IS NULL RETURNING hash`;
+
 export interface Stops {
   /** The orders and the stops on record for these hashes: two statements, each one probe a hash along a primary key. */
   lookup(on: Writer, hashes: readonly Hex[]): Promise<Looked>;
@@ -120,7 +133,7 @@ export function createStops(pool: pg.Pool): Stops {
     },
     async markStopped(on, hashes) {
       if (hashes.length === 0) return [];
-      const { rows } = await on.query<{ hash: Hex }>(`UPDATE orders SET ended = 'stopped', ended_at = now() WHERE hash = ANY($1::text[]) AND ended IS NULL RETURNING hash`, [hashes.map((h) => h.toLowerCase())]);
+      const { rows } = await on.query<{ hash: Hex }>(MARK_STOPPED_SQL, [hashes.map((h) => h.toLowerCase())]);
       return rows.map((r) => r.hash);
     },
     async aheadCount(on, account, afterTime, currentGrant) {

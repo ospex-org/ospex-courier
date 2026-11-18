@@ -244,7 +244,10 @@ budgets' rows locked, through the record's commit, a read of the chain inside it
 process; the posts waiting hold nothing, so a reader and another account are answered while a burst of posts runs,
 and the courier's row serializes the posts across processes anyway. A stop that is under the budgets runs on the
 door's connection too, as a post does; a stop of carried orders, free of them, runs on the reads' pool and locks no
-budget row; and a stop reads the chain before its transaction, not inside it. A request that waits ten seconds for a
+budget row; and a stop reads the chain before its transaction, not inside it. The three statements that write how an
+order ended (the stop's mark, the page's mark of an expired quote, and the mark of a quote the chain shows ended)
+each take the locks of the rows they go to write in the order of the orders' hashes before writing any, so no two of
+those statements take the same two rows in opposite orders. A request that waits ten seconds for a
 connection of either pool and gets none is answered `503 DATABASE_UNREADABLE` with a retry time of one second. The schema's comments say what each bound
 counts: a scan along the book's index is bounded by the rows it is returned, which is what `LIMIT` counts, and not
 by the index entries it visits, the rows it fetches or the pages it reads to return them. That work is measured

@@ -1,8 +1,8 @@
 # The courier's wire contract
 
-What a maker's or a bettor's program sends the courier, what it is answered, and what each answer means. This is
-the contract as of the courier's third build, C3, the stop: orders in (`POST /v1/orders`), stops in
-(`POST /v1/stops`), and the reads. Nothing is sent to the chain by this build: a bet posted is recorded and waits.
+What a maker's or a bettor's program sends the courier, what it is answered, and what each answer means. This wire
+contract covers order submission, signed stops and the read routes. This build records bets but does not send them to
+the chain.
 
 JSON under `/v1`, over https only. No sign-in and no secret: a signed order is its own permission, and the book is
 public. Amounts are decimal strings in the coin's smallest unit; addresses are hex; an order is known by its hash,
@@ -41,7 +41,8 @@ version is the account's current one: a cancel of everything on chain moves the 
 order at any other version is cancelled. The grant number is 0 for an order the account signs itself, and the number
 of the grant for one its approved agent signs. The order number is what a line's floor is compared with.
 
-A stop message has no nonce and no time. A stop is permanent for its hash, and sent again it changes nothing.
+A stop message has no nonce or expiry. A recorded stop is permanent for its hash. Replaying a message is not
+universally free or without writes; see the replay rules below (part 4).
 
 ## Part 2. Who may sign
 
@@ -67,12 +68,16 @@ grant the message's orders name and that grant is no longer the account's curren
 grant's number and end in the sentence; `BAD_SIGNATURE` where the signer is a stranger to the account, which is also
 what an order's own signature offered as a stop's is.
 
-**The chain read a stop may need.** A stop signed by the account's own key that names only orders the courier
-carries for it reads no chain. Every other stop reads the chain once, before anything is written: one block's
-header, then one call at that block, named by its hash, that asks at once whether the signer is the account's live
-agent, the account's current grant, the record of each grant the message's orders name, whether each original's
-line is on its grant's list, and whether the account has the relay registered. Each of the two is tried once more
-when it fails; twice failed is `503 CHAIN_UNREACHABLE` and nothing is decided.
+**The chain read a stop may need.** A stop signed by the account's own key reads no chain in two cases: where
+every hash it names is one the account has stopped already; and where it carries no original and every hash it names
+is an order the courier carries for the account or one the account has stopped already. Every other stop whose
+signature recovers a signer reads the chain once, before anything is written: an agent's always, and the account's
+own where it carries an original or names a hash that is unknown to the courier or another account's. So the stop of
+a carried order sent with an original beside it needs the chain, and the same stop with no original does not. The
+read is one block's header, then one call at that block, named by its hash, that asks at once whether the signer is
+the account's live agent, the account's current grant, the record of each grant the message's orders name, whether
+each original's line is on its grant's list, and whether the account has the relay registered. Each of the two is
+tried once more when it fails; twice failed is `503 CHAIN_UNREACHABLE` and nothing is decided.
 
 **The block is the policy.** A stop is judged at the block the courier named, and the message is recorded with
 that block's number, hash and time. A signer who was the account's live agent at that block has its stop recorded
@@ -108,12 +113,16 @@ first one posted. The body is at most 8,192 bytes.
 
 The record carries `orderHash`, `role`, `state`, `recordNumber`, `receivedAt`, `receivedBlock` (number and hash),
 `chainTime` (the chain's time the order was taken at), the ten fields under `order`, `signature`, `marketKey`,
-`ended`, `endedAt` and `endedBlock`.
+`ended`, `endedAt` and `endedBlock`. A bet's record carries two more: `cross`, which is `null` in this build, and
+`note`, a sentence that says the bet is recorded and waits.
 
-**The sixteen checks, in order.** The first that fails is the answer. Checks 1 to 8, and the grant's four, stand
-before admission: a request that fails one leaves no row and no line, and is counted by its code on the status
-address. From check 9 on the request is admitted, has taken one from each budget, and whatever becomes of it is a
-line in the records.
+**The sixteen checks, in order.** The first that fails is the answer, but for the place of the first two: the
+service makes two checks of its own before it reads a body, https (`403 HTTPS_REQUIRED`) and then check 2, the
+caller's minute, and check 1 comes after them. So a request from an address whose minute is spent is answered `429`
+whatever its body holds, and a request whose body fails check 1 has taken one from its address's minute all the
+same. Checks 1 to 8, and the grant's four, stand before admission: a request that fails one leaves no row and no
+line, and is counted by its code on the status address. From check 9 on the request is admitted, has taken one from
+each budget, and whatever becomes of it is a line in the records.
 
 | | the check | fails as |
 | -- | -- | -- |
@@ -286,11 +295,10 @@ on-chain `cancelAll`, called by the account or its live agent: it moves the acco
 every order signed at the old version fills no more, on every market, an order signed beforehand for the resulting
 version excepted.
 
-What stands behind the number, and what does not: The chain read a stop may need is one header plus one multicall,
-each with its retry (part 2), not one RPC operation; no timing or cost test has been run. C3's planned cost test
-reads back stored bytes for the two stop shapes, including their rows and indexes, alongside the order's storage
-measurement; it does not measure processing time or throughput and does not establish the right stop-request
-allowance.
+What stands behind the number, and what does not: A stop that needs the chain reads one header and one multicall,
+each with one retry. The storage tests measure bytes for the two stop shapes, including their rows and indexes,
+alongside order storage. They do not measure processing time or throughput and do not establish the right
+stop-request allowance.
 
 ### What the acknowledgement means
 
@@ -300,8 +308,10 @@ recorded. From then on this courier lists the order for no bet and sends no bet 
 A maker that re-prices by "stop, confirmation, then post" can rely on that: stop the old quote, wait for its
 `200`, then post the new one.
 
-**The same stop sent twice** writes nothing the second time and is answered from the records: `already stopped`
-for each hash. A hash refused the first time is judged afresh the second.
+**The same stop sent twice.** An account-key message whose every hash is already stopped, or the corresponding
+message from a currently live agent, is answered `already stopped` without a new stop, message, event or budget
+charge. Otherwise the message is judged again: refused or unresolved hashes can make a replay charge budgets and
+append a refusal line.
 
 **A `503` is not proof that nothing was recorded.** A definite failure before the commit rolls the stop back whole:
 no row and no line. But a connection lost around the commit can leave the stop recorded and the request
@@ -371,13 +381,14 @@ All public, and each bounded: no read returns a list without a limit.
   block's and one scan's answer, and it says which block.
 - `GET /v1/orders/{hash}`: the record of one order (parts 3 and 4).
 
-**Which requests read the chain.** A post of an order not yet on record: one header and one read, and one read more
-where the account has sixteen quotes standing on the side. A post of an order on record: none. A stop signed by the
-account's key that names only carried orders, and one whose every hash is stopped: none. Any other stop, an agent's
-included, even an agent's whose every hash is stopped: one header and one read. A game's list of markets: two
-headers. A market's page: two headers, and one read where it has quotes to ask about. A record, the status and the
-runs: none. Each read is tried
-once more when it fails, and twice failed is `503 CHAIN_UNREACHABLE`.
+**Which requests read the chain.** A post of an order not yet on record: one header and one read; a quote's post
+makes one read more where the account has sixteen quotes standing on the side, and a bet's never does. A post of an
+order on record: none. A stop signed by the account's key whose every hash the account has stopped already, or that
+carries no original and names only orders the courier carries for the account and hashes the account has stopped
+already: none. Any other stop whose signature recovers a signer, an agent's included, even an agent's whose every
+hash is stopped: one header and one read. A game's list of markets: two headers. A market's page: two headers, and
+one read where it has quotes to ask about. A record, the status and the runs: none. Each read is tried once more when
+it fails, and twice failed is `503 CHAIN_UNREACHABLE`.
 
 ## Part 6. The bounds
 
@@ -395,6 +406,7 @@ All settings, served with their values on the status address under `bounds`.
 | Bets waiting their turn | two an account, 32 in all | the database; a count and not a clock |
 | Stops ahead that still count, one account | 32 | the database |
 | Rows returned from the book's index for one page | 2,000 | the read |
+| Quotes examined for one bet; quotes listed in one Cross | 200; 40 | nowhere yet: set and served, and used by the build that fills bets, which this one is not |
 | A page of a market's quotes; of markets or runs | 50 a side; 100 | the read |
 
 The address counts are each process's own and start again when a process does; they bound traffic and nothing
@@ -428,7 +440,7 @@ stops at: none is claimed.
 | `ORIGINAL_NOT_THE_HASH` | — | the stop, for one hash | The original's ten fields do not hash to the hash it names. |
 | `TOO_MANY_STOPS_AHEAD` | — | the stop, for one hash | The account's 32 stops ahead that still count. |
 | `CHAIN_UNREACHABLE` | 503 | the door, the stop, the book | The chain could not be read, twice; on the stop route, followed by the recipe. |
-| `DATABASE_UNREADABLE` | 503 | every route that reads the database | The database could not be read; with `retryAfterSeconds` where the courier waited ten seconds for a connection and none came free. |
+| `DATABASE_UNREADABLE` | 503 | every `/v1` route that reads the database | The database could not be read; with `retryAfterSeconds` where the courier waited ten seconds for a connection and none came free. |
 | `NOT_READY` | 503 | `/readyz` | The database did not answer. |
 | `INTERNAL_ERROR` | 500 | any | The courier failed on this request, by a fault of its own. |
 
