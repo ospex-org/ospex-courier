@@ -24,7 +24,6 @@ export class StartupRefused extends Error {
 
 /** What this build does not yet do, published on the status address. */
 export const NOT_YET_BUILT = [
-  'stops (the stop build): a stop on record is honoured at the door, but none can be recorded yet',
   'the lanes and the pre-check (the pre-check build): a bet posted is recorded and waits, and nothing examines it',
   'the sender and the key (the sender build): nothing is signed or sent',
   'incidents and their cursor (the reports build)',
@@ -114,10 +113,12 @@ export async function startService(env: Record<string, string | undefined>, opti
 
   const counters = createCounters(now);
   const limiter = createAddressLimiter(BOUNDS.requestsPerAddressPerMinute);
+  // The stop route's own count: a second limiter, so a stop is held up by no other request from its address, and holds none up.
+  const stopLimiter = createAddressLimiter(BOUNDS.stopsPerAddressPerMinute);
   // The reads of the chain. Each applies its outcome to the records at once; this process keeps nothing of the
   // chain-unreachable condition, since another process may open or clear it at any moment while this one runs.
   const chain = createChainReader({ rpc, conditions: store.conditions, run: run.id, now, log });
-  const handler = createRequestHandler({ store, chain, set, node, run, counters, limiter, settings: { lowPol: config.lowPol }, published, notYetBuilt: NOT_YET_BUILT, log });
+  const handler = createRequestHandler({ store, chain, set, node, run, counters, limiter, stopLimiter, settings: { lowPol: config.lowPol }, published, notYetBuilt: NOT_YET_BUILT, log });
   // The server's own timeout on a request arriving: a stated number (http/limits.ts), not Node's five minutes; and
   // how often it looks, so the close comes within a second of the number and not within Node's thirty.
   const server: Server = createServer({ requestTimeout: TIMEOUTS.requestMs, connectionsCheckingInterval: TIMEOUTS.checkEveryMs }, handler);
@@ -147,6 +148,7 @@ export async function startService(env: Record<string, string | undefined>, opti
         await new Promise<void>((resolve) => server.close(() => resolve()));
         server.closeAllConnections();
         limiter.close();
+        stopLimiter.close();
         try {
           await store.events.write({ run: run.id, kind: 'run stopped', reason });
           await store.runs.stop(run.id, reason);

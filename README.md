@@ -10,17 +10,24 @@ contract checks every signed value, and the relay passes the call through unread
 
 ## This build
 
-The second build: orders in. The door (`POST /v1/orders`) takes a signed order under a role, runs the sixteen
+The third build: the stop. An account, or the agent of its current grant, signs one message that names orders of
+the account by hash and posts it (`POST /v1/stops`); from the moment the courier writes it down those orders are
+carried for no fill: a quote is listed for no bet, and a bet waiting its turn is not sent. With an order's signed
+original beside its hash, the message stops an order the courier has never seen, so a post still on its way is
+refused when it arrives. A stop is permanent for its hash. The wire contract, the door's and the stop's, is
+`docs/API.md`.
+
+On the second build's, orders in: the door (`POST /v1/orders`) takes a signed order under a role, runs the sixteen
 checks in order, and records what it admits, each outcome a line; the book's quotes are served, a page a side, in
 the fill-priority order (`docs/FILL_PRIORITY.md`); the two budgets of admitted requests; the game rule against the
 published list; the hash lock; the mark of expired quotes against the final block; and the cost of the book's scan
 measured against the plan's three books in both maintenance states (`docs/COST.md`), with the table's maintenance
-settings set from the measurement. On the first build's: the repository, the settings, the schema, the start-up
-against the set read from a signpost, the local chain rig and the proxy, the runs and the status address, what a
-node does with a block's hash and with an override, and the store's TLS check. It holds no key, signs nothing and
-sends nothing: a bet posted is recorded and waits. What it does not yet do is listed on its own status address
-under `notYetBuilt`: stops, the lanes and the pre-check, the sender and the key, the incidents and their cursor,
-and the netted pull's `payable`.
+settings set from the measurement. And on the first build's: the repository, the settings, the schema, the
+start-up against the set read from a signpost, the local chain rig and the proxy, the runs and the status address,
+what a node does with a block's hash and with an override, and the store's TLS check. It holds no key, signs
+nothing and sends nothing: a bet posted is recorded and waits, and a stop recovers a signer and makes none. What it
+does not yet do is listed on its own status address under `notYetBuilt`: the lanes and the pre-check, the sender
+and the key, the incidents and their cursor, and the netted pull's `payable`.
 
 ## Running it
 
@@ -94,7 +101,8 @@ one, else `GRANT_GONE`), the account's registration of the relay (`NOT_REGISTERE
 agent's, takes nothing from the account's budget and leaves no line. From then on the request is admitted, and
 whatever becomes of it is a line:
 the contract's own `getOrderHash` must equal the hash computed here (else `INTERNAL_ERROR`, recorded as the
-courier's own fault); a stop on record (`STOPPED`); the game, whose start must be written, whose reporters must
+courier's own fault); a stop on record for the hash, which a stop recorded ahead of the order is (`STOPPED`); the
+game, whose start must be written, whose reporters must
 be exactly the published list, which must not have ended and whose close must not have passed (`UNKNOWN_GAME`,
 `NO_WRITTEN_START`, `REPORTERS_NOT_THE_PUBLISHED_LIST`, `GAME_ENDED`, `BETS_CLOSED`); the order's standing on chain
 (`CANCELLED`: cancelled, at a version the account has left, or under its floor at its version; an order signed for
@@ -121,7 +129,10 @@ not admitted, and the row counts how many and when last.
 
 `GET /v1/orders/{hash}` is the courier's record of one order. Its `state` is `resting` for a quote the courier has
 not marked ended, `queued` for a bet waiting its turn, else how the order ended here: `stopped`, `expired`,
-`filled`, or `cancelled`, with `endedAt` and, for `cancelled`, `endedBlock`, the block the chain was read at.
+`filled`, or `cancelled`, with `endedAt` and, for `cancelled`, `endedBlock`, the block the chain was read at. An
+order that ended twice keeps the first end. For a hash stopped ahead of its order, which holds no order here, the
+answer is `state: "stopped ahead"` with `stoppedAt` and no field of the order: the signed original a stop ahead
+was recorded with is served on no route.
 
 **The mark of a quote the chain shows ended.** Every request that asks the chain about a quote the courier holds (the
 door's count above; the market's page, below) and is shown it ended marks it in the records in that same request,
@@ -144,10 +155,12 @@ said as one.
 
 JSON, under `/v1`, over https only (behind Heroku's router; plain http is served only from this machine). No sign-in
 and no secret: the book is public. Every refusal is `{error, code}`, a plain sentence and an UPPER_SNAKE code.
-Reads from one network address are limited to 600 a minute, counted in memory; the courier keeps no log of
+Requests from one network address are limited to 600 a minute, counted in memory; the courier keeps no log of
 addresses, and an address whose minute has passed leaves the count on a clock, whether or not it is seen again, so
 what is held is a minute's addresses and no more; the status address says how many stand (`addressMinute`), never
-which. The address is the last value of `X-Forwarded-For`, the one the router appended, so the courier runs behind
+which. The stop route has a count of its own, 600 stop requests a minute an address (`stopsMinute`), which no other
+request from the address counts against and which counts against no other route: a maker's posting and reading do
+not hold up its stop. The address is the last value of `X-Forwarded-For`, the one the router appended, so the courier runs behind
 one router that appends the caller's address, Heroku's, and is reachable no other way: anywhere else the last
 forwarded value is the caller's own choice, and with it the count. The server waits ten seconds for a request to
 arrive whole, headers and body (`timeouts` on the status address), then answers 408 and closes the connection: an
@@ -169,6 +182,8 @@ courier waits on; Node's own default is five minutes.
   read and its statement, loses that one outcome, and a later read applies its own outcome, with no promised time
   by which the listing catches up. What is on the status address is what the courier wrote down, in the order it
   wrote it down, and no more.
+- `POST /v1/orders` and `POST /v1/stops`: the door and the stop. Their bodies, their answers and every code are
+  in `docs/API.md`.
 - `GET /v1/runs?after=&limit=`: the runs, 100 to a page: each start of the process, and each stop the process
   wrote itself. A process that dies writes nothing, and no later start writes it for it. This is the courier's own
   account of when it was running, not a measure of whether a caller could reach it.
@@ -221,12 +236,18 @@ lines are the writing transaction's, diagnostics: neither is proof of the order 
 
 ## The database
 
-The courier's own Postgres, `db/schema.sql`: ten tables (orders, stops, lanes, crosses, legs, events, conditions,
-accounts, runs, games) and the indexes the book and the door read along. The process holds two pools on it: four
+The courier's own Postgres, `db/schema.sql`: eleven tables (orders, stop_messages, stops, lanes, crosses, legs,
+events, conditions, accounts, runs, games) and the indexes the book, the door and the stop read along. The process
+holds two pools on it: four
 connections for the reads and the records, and one for the door, on which a post's admission transaction (the
 budgets' rows locked, through the record's commit, a read of the chain inside it) runs one post at a time in the
 process; the posts waiting hold nothing, so a reader and another account are answered while a burst of posts runs,
-and the courier's row serializes the posts across processes anyway. A request that waits ten seconds for a
+and the courier's row serializes the posts across processes anyway. A stop that is under the budgets runs on the
+door's connection too, as a post does; a stop of carried orders, free of them, runs on the reads' pool and locks no
+budget row; and a stop reads the chain before its transaction, not inside it. The three statements that write how an
+order ended (the stop's mark, the page's mark of an expired quote, and the mark of a quote the chain shows ended)
+each take the locks of the rows they go to write in the order of the orders' hashes before writing any, so no two of
+those statements take the same two rows in opposite orders. A request that waits ten seconds for a
 connection of either pool and gets none is answered `503 DATABASE_UNREADABLE` with a retry time of one second. The schema's comments say what each bound
 counts: a scan along the book's index is bounded by the rows it is returned, which is what `LIMIT` counts, and not
 by the index entries it visits, the rows it fetches or the pages it reads to return them. That work is measured
@@ -255,8 +276,11 @@ databases there; the cost test lays 500,000 rows and needs the `pgstattuple` ext
 modules provide); `anvil` and `forge` on the PATH, with the contracts built once by `yarn build:contracts`; and
 `openssl` on the PATH, for the TLS test's authorities. CI (`.github/workflows/ci.yml`) provides all three.
 
-The orders, the book and the budgets are tested from a user's side: orders signed with real keys, posted over HTTP
-to the courier running as its own process, and judged by the answer, the rows and the lines. The rig's final block
+The orders, the stops, the book and the budgets are tested from a user's side: orders and stop messages signed
+with real keys, posted over HTTP to the courier running as its own process, and judged by the answer, the rows
+and the lines. The stop's cases are `tests/stops.test.ts`, numbered as its plan numbers them; several start a
+second courier process on the same chain and database, and the ones that need two requests in a known order hold
+a lock of the test's own in the database, or one request at the proxy, and watch the other arrive. The rig's final block
 is named by the test through the proxy where a test needs it: anvil's own answer for the `finalized` tag is the
 block 64 behind the head.
 
@@ -283,12 +307,12 @@ courier/
   server.ts  config.ts  startup.ts
   http/      service.ts  routes.ts  limits.ts
   chain/     abi.ts  set.ts  snapshot.ts  rpc.ts  node.ts  reads.ts
-  orders/    order.ts  door.ts  budgets.ts  published.ts
-  records/   store.ts  orders.ts  events.ts  runs.ts  conditions.ts
+  orders/    order.ts  door.ts  standing.ts  budgets.ts  published.ts  stop.ts  stops.ts
+  records/   store.ts  orders.ts  stops.ts  events.ts  runs.ts  conditions.ts
   status/    status.ts
   book/      read.ts
 scripts/     apply-schema.ts  check-node.ts
-docs/        INCIDENT_NOTES.md  FILL_PRIORITY.md  COST.md
+docs/        API.md  INCIDENT_NOTES.md  FILL_PRIORITY.md  COST.md
 tests/       the suite, its support (the rig, the proxy, the TLS front) and fixtures
 contracts/   a submodule: the contracts repository at the pinned commit, for the tests only
 ```

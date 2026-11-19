@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import pg from 'pg';
 import { getAddress } from 'viem';
@@ -203,6 +204,26 @@ test('the small book: ten live quotes; every row returned is live, nothing marke
   }
 });
 
+/**
+ * Scans the book from its start, as a page does, until a scan's own counters see none of the dead entries it
+ * passes: each has been marked dead by an earlier scan. Failed by name when that is not reached in two minutes.
+ */
+async function markedDead(client: pg.PoolClient, n: number): Promise<void> {
+  const started = Date.now();
+  for (;;) {
+    const countersBefore = await indexCounters(client);
+    const r = await run(client, args(0, F_PAST));
+    const countersAfter = await indexCounters(client);
+    assert.equal(r.marked, 0, `${n}: nothing is left to mark`);
+    const dead = countersAfter.read - countersBefore.read - r.scanned;
+    if (dead <= 0) return;
+    if (Date.now() - started > 120_000) {
+      assert.fail(`${n}: ${dead} dead entries are still not marked dead after two minutes of scans: a transaction somewhere on the server is older than the marks that ended them`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+}
+
 test('the book with 50,000 and with 500,000 orders ended by the mark: the counts exact in both states; the scan node\'s shared buffer accesses the same at both sizes after vacuum, within one page a level of the index; before vacuum, reported beside the dead versions planted', async () => {
   const figures: Record<number, { before: Measured; after: Measured; vacuumReport: VacuumReport; level: number; marks: number }> = {};
   for (const n of SIZES) {
@@ -221,6 +242,11 @@ test('the book with 50,000 and with 500,000 orders ended by the mark: the counts
         if (r.marked === 0) break;
       }
       assert.equal(marks, n, 'the whole history was marked, by the statement');
+      // The state the measurement before vacuum is of: every dead entry already passed, and marked dead, by an
+      // earlier scan. That does not follow from the loop above: a scan marks an entry dead only when no transaction
+      // on the whole server, in whatever database, is older than the one that ended its row, and a transaction
+      // another test file holds open on the same server delays it. So the state is reached, and seen reached.
+      await markedDead(client, n);
       const before = await measure(client, args(50, F_PAST));
       plan(before, `${n} before vacuum`);
       const vacuumReport = await vacuum(client);
@@ -326,14 +352,16 @@ test('the book with 50,000 and with 500,000 expired quotes not yet marked, at be
 });
 
 /**
- * The fixture rows of the three shapes the orders build does not yet write, in the frozen schema's shape, so that
- * the bytes they take can be measured now; the figures are to be read again from real rows once the stop build
- * and the sender build write them. How many of each are laid: enough rows that a table's size is many pages.
+ * Fixture rows, laid by hand at a scale where a relation is many pages, so that the bytes a row and a message take
+ * with their indexes can be said as an average: the two shapes a stop writes, in the shape the stop route writes
+ * them (the route's own rows are read back by the stops test, two messages of them; a relation grows a page at a
+ * time, so two messages give no average), and a Cross with its legs, which no build writes yet and which is to be
+ * read again from real rows once the sender's build writes them.
  */
 const FIXTURE = {
-  /** Stops of 100 carried hashes: 100 rows each, every row carrying the message as received, 100 hashes, and its signature. */
-  stopsOf100: 20,
-  /** Stops ahead of 16 originals: 16 rows each, with the signed original and its expiry beside the message. */
+  /** Stops of 100 carried hashes: one message row each, holding the signed payload once, and 100 stops pointing at it. */
+  stopsOf100: 100,
+  /** Stops ahead of 16 originals: one message row each, and 16 stops, each with its signed original, the original's expiry and its grant number. */
   stopsAheadOf16: 100,
   /** Crosses confirmed with 40 legs each, and their bets. */
   crosses: 1_000,
@@ -342,7 +370,8 @@ const FIXTURE = {
 } as const;
 const SIGNATURE = '0x' + 'ab'.repeat(65);
 const SENDER = '0x' + '0b'.repeat(20);
-const hashes = (from: number, n: number): string[] => Array.from({ length: n }, (_, i) => `0x${(from + i).toString(16).padStart(64, '0')}`);
+/** `n` order hashes that look like order hashes: digests, which do not compress, where a run of counted numbers padded with zeroes would. */
+const hashes = (from: number, n: number): string[] => Array.from({ length: n }, (_, i) => `0x${createHash('sha256').update(`an order hash ${from + i}`).digest('hex')}`);
 
 async function totalSize(client: pg.PoolClient, table: string): Promise<number> {
   await client.query(`VACUUM ANALYZE ${table}`);
@@ -366,22 +395,26 @@ test('the growth: the bytes an order row and an event line take with their index
     assert.ok(bytes.orders > 0 && bytes.events > 0);
     report.bytesPerRow = bytes;
 
-    // Stops of 100 carried hashes: a row for each hash stopped, each carrying the whole message and its signature.
+    // Stops of 100 carried hashes, as the stop writes them: the message once, in its own row, and a row for each hash
+    // stopped, pointing at it.
     const account = getAddress(ACCOUNT);
+    const message = async (stopped: string[]): Promise<string> => {
+      const { rows } = await client.query<{ id: string }>(`INSERT INTO stop_messages (account, signer, message, signature) VALUES ($1, $1, $2::jsonb, $3) RETURNING id`, [ACCOUNT, JSON.stringify({ account, orderHashes: stopped }), SIGNATURE]);
+      return rows[0]?.id ?? assert.fail('the message was given no number');
+    };
     for (let s = 0; s < FIXTURE.stopsOf100; s++) {
       const stopped = hashes(1 + s * 100, 100);
-      await client.query(
-        `INSERT INTO stops (hash, account, message, signature) SELECT h, $1, $2::jsonb, $3 FROM unnest($4::text[]) AS h`,
-        [ACCOUNT, JSON.stringify({ account, orderHashes: stopped }), SIGNATURE, stopped],
-      );
+      await client.query(`INSERT INTO stops (hash, account, message_id) SELECT h, $1, $2::bigint FROM unnest($3::text[]) AS h`, [ACCOUNT, await message(stopped), stopped]);
     }
     const carriedRows = Number((await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM stops WHERE NOT ahead`)).rows[0]?.n);
     assert.equal(carriedRows, FIXTURE.stopsOf100 * 100, 'the rows of the carried stops');
-    const short = Number((await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM stops WHERE NOT ahead AND jsonb_array_length(message -> 'orderHashes') <> 100`)).rows[0]?.n);
-    assert.equal(short, 0, 'every row of a carried stop carries the message of 100 hashes');
+    const carriedMessages = await client.query<{ n: string; hashes: string }>(`SELECT count(*)::text AS n, coalesce(sum(jsonb_array_length(m.message -> 'orderHashes')), 0)::text AS hashes FROM stop_messages m`);
+    assert.deepEqual({ messages: Number(carriedMessages.rows[0]?.n), hashes: Number(carriedMessages.rows[0]?.hashes) }, { messages: FIXTURE.stopsOf100, hashes: FIXTURE.stopsOf100 * 100 }, 'the signed message is kept once a message, not once a hash');
     const stopsCarriedBytes = await totalSize(client, 'stops');
+    const messagesCarriedBytes = await totalSize(client, 'stop_messages');
 
-    // Stops ahead of 16 originals: a row for each, the signed original and its expiry beside the message.
+    // Stops ahead of 16 originals: the message once, and a row for each hash with its signed original, the original's
+    // expiry and its grant number. Half are the account's own signature, grant 0, and half under a grant.
     for (let s = 0; s < FIXTURE.stopsAheadOf16; s++) {
       const ahead = hashes(10_000_000 + s * 16, 16);
       const original = {
@@ -389,13 +422,15 @@ test('the growth: the bytes an order row and an event line take with their index
         signature: SIGNATURE,
       };
       await client.query(
-        `INSERT INTO stops (hash, account, message, signature, ahead, original, original_expiry) SELECT h, $1, $2::jsonb, $3, true, $5::jsonb, $6 FROM unnest($4::text[]) AS h`,
-        [ACCOUNT, JSON.stringify({ account, orderHashes: ahead }), SIGNATURE, ahead, JSON.stringify(original), (T + 3_600n).toString()],
+        `INSERT INTO stops (hash, account, ahead, message_id, original, original_expiry, grant_number) SELECT h, $1, true, $2::bigint, $4::jsonb, $5::numeric, $6::bigint FROM unnest($3::text[]) AS h`,
+        [ACCOUNT, await message(ahead), ahead, JSON.stringify(original), (T + 3_600n).toString(), s % 2],
       );
     }
-    const aheadRows = Number((await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM stops WHERE ahead AND original IS NOT NULL`)).rows[0]?.n);
+    const aheadRows = Number((await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM stops WHERE ahead AND original IS NOT NULL AND grant_number IS NOT NULL`)).rows[0]?.n);
     assert.equal(aheadRows, FIXTURE.stopsAheadOf16 * 16, 'the rows of the stops ahead, each with its original');
     const stopsAheadBytes = (await totalSize(client, 'stops')) - stopsCarriedBytes;
+    const messagesAheadBytes = (await totalSize(client, 'stop_messages')) - messagesCarriedBytes;
+    const aheadIndex = Number((await client.query<{ bytes: string }>(`SELECT pg_relation_size('stops_ahead_by_account'::regclass)::text AS bytes`)).rows[0]?.bytes);
 
     // Crosses: a bet each, confirmed, with 40 legs recorded against the quotes laid above.
     await client.query(
@@ -430,7 +465,7 @@ test('the growth: the bytes an order row and an event line take with their index
     const eventsBefore = await totalSize(client, 'events');
     await client.query(
       `INSERT INTO events (run, kind, account, facts)
-       SELECT 1, 'stop received', $1, jsonb_build_object('hashes', 100, 'ahead', false, 'block', (1000 + i)::text) FROM generate_series(1, ${FIXTURE.lines}) AS i`,
+       SELECT 1, 'stop received', $1, jsonb_build_object('messageId', 1000 + i, 'stopped', 100, 'ahead', 0) FROM generate_series(1, ${FIXTURE.lines}) AS i`,
       [ACCOUNT],
     );
     const eventsWithStopLines = await totalSize(client, 'events');
@@ -444,15 +479,25 @@ test('the growth: the bytes an order row and an event line take with their index
     const eventsWithCrossLines = await totalSize(client, 'events');
     const stopLine = Math.round((eventsWithStopLines - eventsBefore) / FIXTURE.lines);
     const crossLine = Math.round((eventsWithCrossLines - eventsWithStopLines) / FIXTURE.lines);
-    const stopOf100 = { rows: 100, bytesRows: Math.round(stopsCarriedBytes / FIXTURE.stopsOf100), lines: 1, bytesLine: stopLine };
-    const stopAheadOf16 = { rows: 16, bytesRows: Math.round(stopsAheadBytes / FIXTURE.stopsAheadOf16), lines: 1, bytesLine: stopLine };
+    // The two stop shapes, as averages over what was laid: each figure with the bytes it divides and what it divides
+    // them by, so that it is a figure of this fixture's scale and of nothing else. Storage, with the indexes; no
+    // figure here is a time or a rate.
+    const per = (bytes: number, divisor: number) => ({ bytes, divisor, each: Math.round(bytes / divisor) });
+    const carried = { messages: FIXTURE.stopsOf100, stops: FIXTURE.stopsOf100 * 100, stopRow: per(stopsCarriedBytes, FIXTURE.stopsOf100 * 100), message: per(messagesCarriedBytes, FIXTURE.stopsOf100) };
+    const aheadShape = { messages: FIXTURE.stopsAheadOf16, stops: FIXTURE.stopsAheadOf16 * 16, stopRow: per(stopsAheadBytes, FIXTURE.stopsAheadOf16 * 16), message: per(messagesAheadBytes, FIXTURE.stopsAheadOf16), aheadIndexBytes: aheadIndex };
+    const line = per(eventsWithStopLines - eventsBefore, FIXTURE.lines);
     const cross40 = { crossRow: Math.round(crossesBytes / FIXTURE.crosses), legs: 40, bytesLegs: Math.round((legsBytes / FIXTURE.crosses)), lines: 3, bytesLines: 3 * crossLine };
     report.fixtureShapes = {
-      stopOf100Hashes: { ...stopOf100, bytes: stopOf100.bytesRows + stopOf100.bytesLine },
-      stopAheadOf16Originals: { ...stopAheadOf16, bytes: stopAheadOf16.bytesRows + stopAheadOf16.bytesLine },
+      note: 'scaled-fixture estimates: rows laid by hand in the shape the stop writes; each figure is the bytes a relation grew by, with its indexes, over the rows or the messages laid',
+      stopOf100Hashes: { ...carried, line, bytes: 100 * carried.stopRow.each + carried.message.each + line.each },
+      stopAheadOf16Originals: { ...aheadShape, line, bytes: 16 * aheadShape.stopRow.each + aheadShape.message.each + line.each },
       cross40Legs: { ...cross40, bytes: cross40.crossRow + cross40.bytesLegs + cross40.bytesLines, note: 'the bet\'s own row and line are the order\'s figures above' },
     };
-    assert.ok(stopOf100.bytesRows > 0 && stopAheadOf16.bytesRows > 0 && cross40.crossRow > 0 && cross40.bytesLegs > 0 && stopLine > 0 && crossLine > 0);
+    assert.ok(carried.stopRow.each > 0 && carried.message.each > 0 && aheadShape.stopRow.each > 0 && aheadShape.message.each > 0 && aheadIndex > 0 && cross40.crossRow > 0 && cross40.bytesLegs > 0 && stopLine > 0 && crossLine > 0);
+    // What the shape buys: a carried stop's row holds no message, so a stop of a hundred hashes keeps its hundred
+    // hashes once. A hundred hashes are 6,600 bytes as text; a row that carried them could not be this small.
+    assert.ok(carried.stopRow.each < 1_000, `a carried stop's row, with its indexes: ${carried.stopRow.each} bytes`);
+    assert.ok(carried.message.each > 100 * 32, `the one message row of a hundred hashes: ${carried.message.each} bytes`);
   } finally {
     client.release();
     await pool.end();

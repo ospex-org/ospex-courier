@@ -3,12 +3,13 @@ import { readFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { after, before, test } from 'node:test';
 import pg from 'pg';
-import { decodeFunctionData, decodeFunctionResult, encodeAbiParameters, encodeFunctionData, encodeFunctionResult, keccak256, recoverTypedDataAddress, toBytes, type Abi, type Address, type Hex } from 'viem';
+import { decodeFunctionData, decodeFunctionResult, encodeAbiParameters, encodeFunctionData, encodeFunctionResult, hashTypedData, keccak256, recoverTypedDataAddress, toBytes, type Abi, type Address, type Hex } from 'viem';
 import type { HDAccount } from 'viem/accounts';
 import { MATCHING_ABI, MULTICALL_ABI, MULTICALL_ADDRESS } from '../courier/chain/abi';
 import { floorKey, grantKey, type QuotesRead } from '../courier/chain/reads';
 import { isChainSignature, orderHash, orderSigner, splitNonce } from '../courier/orders/order';
 import { quoteEnd } from '../courier/orders/standing';
+import { stopHash, stopSigner, STOP_TYPES } from '../courier/orders/stop';
 import { openPool } from '../courier/records/store';
 import { get, startCourier } from './support/courier';
 import {
@@ -160,6 +161,47 @@ test("the courier's hash equals the contract's getOrderHash for forty orders acr
     };
     assert.equal(orderHash(order, 31337n, rig.addresses.matching), await contractHash(rig, order), `order ${i}`);
   }
+});
+
+/**
+ * The stop's vector, beside the order's: one message of the frozen account naming two hashes, under the courier's
+ * domain on chain 137 with a literal relay. The type hash, the digest, the signature and the three other digests
+ * were derived outside this repository, with another toolchain's keccak256 and signer, from the type string and the
+ * domain written out; the key is the public fixture key the frozen account is the address of. Inert test data.
+ */
+const FROZEN_STOP = {
+  relay: '0x00000000000000000000000000000000C0550003' as Address,
+  message: {
+    account: '0xe05fcC23807536bEe418f142D19fa0d21BB0cfF7' as Address,
+    orderHashes: ['0x9af8958f00563f5d9c4bd30f85953c0d0a67df62efffbccdfa9b4a7cbc3aaae0', '0x00000000000000000000000000000000000000000000000000000000c0550004'] as Hex[],
+  },
+  typehash: '0xe8387a8d87d95608f191b3aa03821158d5c2ff4cc2f81a78a82ccd80993c6cc4' as Hex,
+  digest: '0x87113a6336fa483a775793135563268f89e0253589be67a13665a147ad0cf361' as Hex,
+  signature: '0xe9053f0bd2dc91e05efd6476e35478548d318fb0a23ce61331700a96d747f05a5780266696107820ee05869e5068a884a321ea7b78716cc7ff7060b62032d7fc1b' as Hex,
+  /** The same message under the courier's domain on chain 31337. */
+  onAnotherChain: '0x83f1325c1f7ab4a90521f834eac77794c1a0cd0d586a2b18891da3acac97833f' as Hex,
+  /** The same two fields under the order's domain: name "Ospex", version "3", chain 137, the frozen matching contract. */
+  underTheOrdersDomain: '0xcc1ca41ae6450c4df889927d42ef51decfb8e8b9fdb57b6ca25d586a18db2bfd' as Hex,
+  /** The message with its second hash's last digit changed, 4 to 5. */
+  withAHashChanged: '0xd9f695f9a20d4af79b328389657ba34c3fd4a6b58b6aa122107d087cac9830e0' as Hex,
+};
+
+test("the courier's digest of the frozen stop message is the frozen digest, whose signature, made outside, recovers to the frozen account; another chain is another domain, the order's domain is not the stop's, and a hash changed changes the digest", async () => {
+  assert.equal(stopHash(FROZEN_STOP.message, 137n, FROZEN_STOP.relay), FROZEN_STOP.digest);
+  assert.equal((await stopSigner(FROZEN_STOP.message, FROZEN_STOP.signature, 137n, FROZEN_STOP.relay))?.toLowerCase(), FROZEN_STOP.message.account.toLowerCase());
+  assert.equal(FROZEN_STOP.message.account, FROZEN.account, "the signer is the order vector's own");
+  assert.equal(keccak256(toBytes('OspexStop(address account,bytes32[] orderHashes)')), FROZEN_STOP.typehash, "the type string is the stop's");
+  assert.equal(stopHash(FROZEN_STOP.message, 31337n, FROZEN_STOP.relay), FROZEN_STOP.onAnotherChain, 'another chain is another domain');
+  const underTheOrdersDomain = hashTypedData({ domain: { name: 'Ospex', version: '3', chainId: 137, verifyingContract: FROZEN.matching }, types: STOP_TYPES, primaryType: 'OspexStop', message: FROZEN_STOP.message });
+  assert.equal(underTheOrdersDomain, FROZEN_STOP.underTheOrdersDomain, "the order's domain is another digest of the same two fields");
+  assert.notEqual(underTheOrdersDomain, FROZEN_STOP.digest, "the order's domain is not the stop's");
+  const changed = { ...FROZEN_STOP.message, orderHashes: [FROZEN_STOP.message.orderHashes[0] as Hex, '0x00000000000000000000000000000000000000000000000000000000c0550005' as Hex] };
+  assert.equal(stopHash(changed, 137n, FROZEN_STOP.relay), FROZEN_STOP.withAHashChanged, 'a hash changed changes the digest');
+  // The signature is the message's and no other's: over the changed message, and on the other chain, it recovers to another address.
+  assert.notEqual((await stopSigner(changed, FROZEN_STOP.signature, 137n, FROZEN_STOP.relay))?.toLowerCase(), FROZEN.account.toLowerCase());
+  assert.notEqual((await stopSigner(FROZEN_STOP.message, FROZEN_STOP.signature, 31337n, FROZEN_STOP.relay))?.toLowerCase(), FROZEN.account.toLowerCase());
+  // The frozen order's own signature, offered as the stop's, is not the account's signature of the stop.
+  assert.notEqual((await stopSigner(FROZEN_STOP.message, FROZEN.signature, 137n, FROZEN_STOP.relay))?.toLowerCase(), FROZEN.account.toLowerCase(), "an order's signature is not a stop's");
 });
 
 // ──────────────────────────── a quote in ──────────────────────────────────
@@ -1693,10 +1735,11 @@ test('a stop on record for the hash is honoured at the door: STOPPED, as a line 
   const T = await rig.time();
   const order = orderOn(rig, maker, { expiry: T + 600n, oddsTick: 333 });
   const hash = await contractHash(rig, order);
-  await pool.query(
-    `INSERT INTO stops (hash, account, message, signature) VALUES ($1, $2, $3, $4)`,
-    [hash.toLowerCase(), maker.address.toLowerCase(), JSON.stringify({ account: maker.address, orderHashes: [hash] }), `0x${'ab'.repeat(65)}`],
+  const message = await pool.query<{ id: string }>(
+    `INSERT INTO stop_messages (account, signer, message, signature) VALUES ($1, $1, $2, $3) RETURNING id`,
+    [maker.address.toLowerCase(), JSON.stringify({ account: maker.address, orderHashes: [hash] }), `0x${'ab'.repeat(65)}`],
   );
+  await pool.query(`INSERT INTO stops (hash, account, message_id) VALUES ($1, $2, $3)`, [hash.toLowerCase(), maker.address.toLowerCase(), message.rows[0]?.id]);
   const refused = await postOrder(url(), rig, maker, 'rest', order);
   assert.equal(refused.status, 422, JSON.stringify(refused.body));
   assert.equal(refused.body.code, 'STOPPED');

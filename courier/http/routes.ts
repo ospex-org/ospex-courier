@@ -2,6 +2,7 @@ import { getAddress, isAddress, type Address, type Hex } from 'viem';
 import { readGameBook, readMarketBook } from '../book/read';
 import { ChainUnreachable } from '../chain/snapshot';
 import { orderRecord, postOrder } from '../orders/door';
+import { postStop } from '../orders/stops';
 import { failureCode, POOL_WAIT_EXHAUSTED, POOL_WAIT_MS } from '../records/store';
 import { DatabaseUnreadable, status, type StatusDeps } from '../status/status';
 import { BOUNDS } from './limits';
@@ -175,12 +176,41 @@ export async function postOrders(deps: RouteDeps, body: unknown): Promise<HttpAn
   }
 }
 
-/** GET /v1/orders/{hash}: the courier's record of one order. */
+/**
+ * POST /v1/stops: the stop. A database that fails under it is 503, and the stop's transaction was rolled back whole;
+ * the one failure not known to have recorded nothing is a connection lost as the transaction was committing, and
+ * the sentence says how to learn which.
+ */
+export async function postStops(deps: RouteDeps, body: unknown): Promise<HttpAnswer> {
+  try {
+    return await postStop({ store: deps.store, chain: deps.chain, set: deps.set, run: deps.run, counters: deps.counters, coinDecimals: deps.set.coinDecimals, log: deps.log }, body);
+  } catch (err) {
+    if (isDatabaseFailure(err)) {
+      return databaseUnreadable(
+        deps,
+        'POST /v1/stops',
+        err,
+        'The database could not be read or written for this stop. A stop is recorded whole or not at all; where the connection was lost as it was being recorded, read one of its orders by hash, or send the same message again, to learn which.',
+      );
+    }
+    throw err;
+  }
+}
+
+/**
+ * GET /v1/orders/{hash}: the courier's record of one order. A hash stopped ahead of its order holds no order here:
+ * the stop is said, and when, and nothing of the order, since the signed original it was recorded with is served on
+ * no route.
+ */
 export async function getOrder(deps: RouteDeps, hash: string): Promise<HttpAnswer> {
   if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) return before(deps, 'GET /v1/orders/{hash}', 400, 'INVALID_PARAM', 'An order is read by its hash: 0x and 64 hex characters.');
   try {
     const row = await deps.store.orders.get(hash.toLowerCase() as Hex);
-    if (row === null) return refusal(404, 'UNKNOWN_ORDER', 'The courier holds no order of this hash.');
+    if (row === null) {
+      const stoppedAt = await deps.store.stops.aheadOf(hash.toLowerCase() as Hex);
+      if (stoppedAt !== null) return { status: 200, body: { orderHash: hash.toLowerCase(), state: 'stopped ahead', stoppedAt: stoppedAt.toISOString() } };
+      return refusal(404, 'UNKNOWN_ORDER', 'The courier holds no order of this hash.');
+    }
     return { status: 200, body: orderRecord(row) };
   } catch (err) {
     return databaseUnreadable(deps, 'GET /v1/orders/{hash}', err, 'The database could not be read.');

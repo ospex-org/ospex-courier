@@ -12,6 +12,7 @@ test('the bounds are the plan\'s numbers', () => {
     hashesInStop: 100,
     originalsInStop: 16,
     requestsPerAddressPerMinute: 600,
+    stopsPerAddressPerMinute: 600,
     accountBudget: { atOnce: 240, perMinute: 12 },
     courierBudget: { atOnce: 2400, perMinute: 60 },
     liveQuotesPerAccountSideMarket: 16,

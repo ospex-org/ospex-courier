@@ -25,8 +25,10 @@ export interface StatusDeps {
   node: NodeCheck;
   run: Run;
   counters: Counters;
-  /** The one limit kept in memory: each address's minute. */
+  /** The limit kept in memory: each address's minute, for every request but a stop. */
   limiter: AddressLimiter;
+  /** The stop route's own count of each address's minute. */
+  stopLimiter: AddressLimiter;
   settings: { lowPol: number };
   /** The published list of reporters, read at start. */
   published: readonly Address[];
@@ -104,6 +106,8 @@ export async function status(deps: StatusDeps): Promise<Record<string, unknown>>
     refusedBeforeAdmission: { since: deps.counters.since.toISOString(), byCode: deps.counters.snapshot() },
     /** The addresses holding a request in the last minute, this process: a count, never an address. */
     addressMinute: { addresses: deps.limiter.addresses(), perMinute: BOUNDS.requestsPerAddressPerMinute },
+    /** The same for the stop route's own count: the addresses holding a stop request in the last minute, this process. */
+    stopsMinute: { addresses: deps.stopLimiter.addresses(), perMinute: BOUNDS.stopsPerAddressPerMinute },
     database: {
       sizeBytes: databaseSize,
       /** The orders table's maintenance settings, as the database holds them. */

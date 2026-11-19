@@ -5,9 +5,10 @@ import { decoded, NodeFailure, type Header, type MulticallResult } from './rpc';
 import type { BettingSet } from './set';
 import type { ChainReader } from './snapshot';
 
-// The reads of state the door and the book make, each one call to the
-// multicall contract at a block named by its hash (snapshot.ts): what the door
-// asks about one order, and what the book asks about a page of quotes. Each is
+// The reads of state the door, the book and the stop make, each one call to
+// the multicall contract at a block named by its hash (snapshot.ts): what the
+// door asks about one order, what the book asks about a page of quotes, and
+// what a stop asks about its account and the grants it names. Each is
 // decoded inside the read: a required value whose bytes do not decode is an
 // answer the read cannot use, the node's `malformed` failure, tried once more
 // and then the chain unreachable; a call that allowed failure and failed is an
@@ -232,5 +233,66 @@ export async function readQuotes(chain: ChainReader, set: BettingSet, header: He
     const grantsAt = floorsAt + floorsAsked.size;
     [...grantsAsked.keys()].forEach((key, i) => out.grants.set(key, grantOf(at(grantsAt + i))));
     return out;
+  });
+}
+
+/** What a stop asks of the chain about its account, in one call at the header. */
+export interface StopAsk {
+  account: Address;
+  /** The message's signer where it is not the account: asked whether it is the account's live agent. Null for a message the account's own key signed. */
+  signer: Address | null;
+  /** The grant numbers above zero the message's carried orders and its originals name in their nonces. */
+  grantNumbers: readonly number[];
+  /** The originals signed under a grant: each asked whether its grant's list names its line. */
+  originals: ReadonlyArray<{ hash: Hex; order: OrderFields }>;
+  /** Whether the account's registration of the relay is asked: for a message under the budgets. */
+  registration: boolean;
+}
+
+export interface StopRead {
+  header: Header;
+  /** Whether the signer is the account's live agent at the block, as the contract's own rule has it: the agent of the account's current grant, the block's time before the grant's end. Null where no signer was asked about. */
+  liveAgent: boolean | null;
+  /** The number of the account's current grant, 0 for none. */
+  currentGrant: number;
+  /** The record of each grant asked about, by its number. */
+  grants: Map<number, GrantRead>;
+  /** For each original under a grant, by its hash, whether that grant's list names its line. */
+  lineNamed: Map<string, boolean>;
+  /** Whether the account has the relay registered. Null where it was not asked. */
+  registered: boolean | null;
+}
+
+/**
+ * What a stop asks, in one call at the header, in the shape of the door's read: every call is encoded first, from
+ * the message alone, and no call's argument is another call's answer. Whether the signer is the account's live
+ * agent, where the account's own key did not sign; the account's current grant; the record of each grant the
+ * message's carried orders and originals name; for each original under a grant, whether that grant's list names
+ * its line (asked whether or not the list is empty, and used only where it is not); and the account's registration
+ * of the relay, for a message under the budgets.
+ */
+export async function readForStop(chain: ChainReader, set: BettingSet, header: Header, ask: StopAsk): Promise<StopRead> {
+  const account = getAddress(ask.account);
+  const grantNumbers = [...new Set(ask.grantNumbers.filter((n) => n !== 0))].sort((a, b) => a - b);
+  const underGrant = ask.originals.filter((o) => splitNonce(o.order.nonce).grantNumber !== 0);
+  const calls = [
+    { target: set.matching, callData: m('s_currentGrant', [account]) },
+    ...(ask.signer === null ? [] : [{ target: set.matching, callData: m('isLiveAgent', [account, getAddress(ask.signer)]) }]),
+    ...(ask.registration ? [{ target: set.matching, callData: m('isCourier', [account, set.relay]) }] : []),
+    ...grantNumbers.map((n) => ({ target: set.matching, callData: m('getGrant', [account, n]) })),
+    ...underGrant.map((o) => ({ target: set.matching, callData: m('isGrantLine', [account, splitNonce(o.order.nonce).grantNumber, o.order.gameId, o.order.scorer, o.order.lineTicks]) })),
+  ];
+  return chain.read(header, calls, (answered) => {
+    const results = exactly(answered, calls.length);
+    const at = (i: number) => (results[i] as MulticallResult).returnData;
+    let next = 0;
+    const currentGrant = Number(dm<number>('s_currentGrant', at(next++)));
+    const liveAgent = ask.signer === null ? null : dm<boolean>('isLiveAgent', at(next++));
+    const registered = ask.registration ? dm<boolean>('isCourier', at(next++)) : null;
+    const grants = new Map<number, GrantRead>();
+    for (const n of grantNumbers) grants.set(n, grantOf(at(next++)));
+    const lineNamed = new Map<string, boolean>();
+    for (const o of underGrant) lineNamed.set(o.hash.toLowerCase(), dm<boolean>('isGrantLine', at(next++)));
+    return { header, liveAgent, currentGrant, grants, lineNamed, registered };
   });
 }

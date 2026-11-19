@@ -4,7 +4,7 @@ import type pg from 'pg';
 import { applySchema, missingSchema, openPool, TABLES } from '../courier/records/store';
 import { testServer } from './support/database';
 
-// db/schema.sql against a real Postgres: applied twice, the ten tables, the
+// db/schema.sql against a real Postgres: applied twice, the eleven tables, the
 // indexes the plan names with their conditions, and the rules the tables keep
 // by themselves, each proved by a row written by hand.
 
@@ -101,6 +101,7 @@ test('the indexes the plan names are there, with their conditions', async () => 
   assert.match(def('orders_bets_waiting'), /\(record_number\) WHERE \(\(role = 'take'::text\) AND \(bet_state = ANY \(ARRAY\['waiting'::text, 'held'::text\]\)\) AND \(ended IS NULL\)\)$/);
   assert.match(def('orders_record_number_key'), /UNIQUE INDEX .* \(record_number\)/);
   assert.match(def('crosses_tx_hash_key'), /UNIQUE INDEX .* \(tx_hash\)/);
+  assert.match(def('stops_ahead_by_account'), /^CREATE INDEX stops_ahead_by_account ON \S*stops USING btree \(account, original_expiry DESC\) WHERE ahead$/);
 });
 
 test('record numbers rise and are never reused', async () => {
@@ -234,6 +235,225 @@ test("a legs table that holds the skip reasons' check as it stood before GrantGo
     assert.deepEqual(await check(pool), [eight], 'a table made by this schema alone');
   } finally {
     await legs.end();
+  }
+});
+
+// ──────────────────────────── the stops and their messages ────────────────────────────
+
+const ORIGINAL = JSON.stringify({ order: { account: ADDRESS('a'), nonce: '1' }, signature: SIGNATURE('c') });
+
+async function insertMessage(on: pg.Pool, overrides: Record<string, unknown> = {}): Promise<string> {
+  const row: Record<string, unknown> = {
+    account: ADDRESS('a'),
+    signer: ADDRESS('a'),
+    message: JSON.stringify({ account: ADDRESS('a'), orderHashes: [HASH('5')] }),
+    signature: SIGNATURE('c'),
+    ...overrides,
+  };
+  const columns = Object.keys(row);
+  const { rows } = await on.query<{ id: string }>(`INSERT INTO stop_messages (${columns.join(', ')}) VALUES (${columns.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING id`, Object.values(row));
+  return rows[0]?.id ?? assert.fail('the message was given no id');
+}
+
+async function insertStop(on: pg.Pool, hash: string, overrides: Record<string, unknown> = {}): Promise<void> {
+  const row: Record<string, unknown> = { hash, account: ADDRESS('a'), ...overrides };
+  const columns = Object.keys(row);
+  await on.query(`INSERT INTO stops (${columns.join(', ')}) VALUES (${columns.map((_, i) => `$${i + 1}`).join(', ')})`, Object.values(row));
+}
+
+/** The stops table as the catalog states it: its columns by name, and every constraint with its definition. */
+async function stopsShape(on: pg.Pool): Promise<{ columns: string[]; constraints: string[] }> {
+  const columns = await on.query<{ column_name: string; data_type: string; is_nullable: string }>(
+    "SELECT c.column_name, c.data_type, c.is_nullable FROM information_schema.columns c WHERE c.table_schema = current_schema() AND c.table_name = 'stops' ORDER BY c.column_name",
+  );
+  const constraints = await on.query<{ conname: string; contype: string; convalidated: boolean; definition: string }>(
+    "SELECT c.conname, c.contype, c.convalidated, pg_get_constraintdef(c.oid) AS definition FROM pg_constraint c WHERE c.conrelid = 'stops'::regclass ORDER BY c.conname",
+  );
+  return {
+    columns: columns.rows.map((r) => `${r.column_name} ${r.data_type} ${r.is_nullable === 'YES' ? 'null' : 'not null'}`),
+    constraints: constraints.rows.map((r) => `${r.conname} ${r.contype} ${r.convalidated ? 'validated' : 'NOT VALIDATED'} ${r.definition}`),
+  };
+}
+
+/** The rule that a stop ahead is whole, as the database states it; and the oid of the constraint that holds it. */
+const AHEAD_WHOLE = 'CHECK (((ahead = (original IS NOT NULL)) AND (ahead = (original_expiry IS NOT NULL)) AND (ahead = (grant_number IS NOT NULL))))';
+async function aheadWhole(on: pg.Pool): Promise<Array<{ oid: string; validated: boolean; definition: string }>> {
+  const { rows } = await on.query<{ oid: string; validated: boolean; definition: string }>(
+    "SELECT c.oid::text AS oid, c.convalidated AS validated, pg_get_constraintdef(c.oid) AS definition FROM pg_constraint c WHERE c.conrelid = 'stops'::regclass AND c.conname = 'stops_ahead_whole'",
+  );
+  return rows;
+}
+
+/** The stops table as the schema before this one made it: the message and its signature on every row, no message_id, no grant_number, the older rule under its older name. */
+const STOPS_BEFORE = `CREATE TABLE stops (
+  hash            text PRIMARY KEY CHECK (hash ~ '^0x[0-9a-f]{64}$'),
+  account         text NOT NULL CHECK (account ~ '^0x[0-9a-f]{40}$'),
+  message         jsonb NOT NULL,
+  signature       text NOT NULL CHECK (signature ~ '^0x[0-9a-f]{130}$'),
+  received_at     timestamptz NOT NULL DEFAULT now(),
+  ahead           boolean NOT NULL DEFAULT false,
+  original        jsonb,
+  original_expiry numeric(78, 0),
+  CONSTRAINT stops_original_when_ahead CHECK (ahead = (original IS NOT NULL) AND ahead = (original_expiry IS NOT NULL))
+)`;
+
+/**
+ * Applies the schema on a connection of its own and ends it. The schema is one transaction; an apply the database
+ * refuses leaves its connection inside that failed transaction, holding its locks, until the connection closes. The
+ * release step is a process that ends; here the pool is ended, so what is read afterwards is read after the rollback.
+ */
+async function applyOnce(databaseUrl: string): Promise<void> {
+  const on = openPool(databaseUrl, null, 1);
+  try {
+    await applySchema(on);
+  } finally {
+    await on.end();
+  }
+}
+
+test("a stop's rows keep their own rules: a stop points at a message that is there; a stop ahead holds its original, the original's expiry and its grant number together, and a carried stop none of the three; a message's block is number, hash and time together or none; one stop a hash", async () => {
+  const id = await insertMessage(pool);
+  const ahead = { ahead: true, original: ORIGINAL, original_expiry: '1794268800', grant_number: 0 };
+  // The controls: a carried stop; a stop ahead, whole; one under a grant whose number is the top of a uint32.
+  await insertStop(pool, HASH('51'), { message_id: id });
+  await insertStop(pool, HASH('52'), { message_id: id, ...ahead });
+  await insertStop(pool, HASH('53'), { message_id: id, ...ahead, grant_number: '4294967295' });
+  // A stop ahead short of one of its three.
+  await refused(insertStop(pool, HASH('54'), { message_id: id, ahead: true, original: ORIGINAL, original_expiry: '1794268800' }), '23514', 'a stop ahead without its grant number');
+  await refused(insertStop(pool, HASH('55'), { message_id: id, ahead: true, original: ORIGINAL, grant_number: 0 }), '23514', "a stop ahead without its original's expiry");
+  await refused(insertStop(pool, HASH('56'), { message_id: id, ahead: true, original_expiry: '1794268800', grant_number: 0 }), '23514', 'a stop ahead without its original');
+  // A carried stop with one of them.
+  await refused(insertStop(pool, HASH('57'), { message_id: id, original: ORIGINAL }), '23514', 'a carried stop with an original');
+  await refused(insertStop(pool, HASH('58'), { message_id: id, original_expiry: '1794268800' }), '23514', "a carried stop with an original's expiry");
+  await refused(insertStop(pool, HASH('59'), { message_id: id, grant_number: 0 }), '23514', 'a carried stop with a grant number');
+  // The message a stop points at.
+  await refused(insertStop(pool, HASH('5a'), { message_id: '987654321' }), '23503', 'a stop pointing at a message that is not there');
+  await refused(insertStop(pool, HASH('5b')), '23502', 'a stop with no message');
+  await refused(insertStop(pool, HASH('51'), { message_id: id }), '23505', 'a second stop of one hash');
+  // A message's block: whole or absent.
+  await refused(insertMessage(pool, { block_number: '5' }), '23514', 'a message with a block number and no hash');
+  await refused(insertMessage(pool, { block_number: '5', block_hash: HASH('b') }), '23514', 'a message with a block and no time');
+  await refused(insertMessage(pool, { block_time: '1794268800' }), '23514', 'a message with a time and no block');
+  await refused(insertMessage(pool, { signer: ADDRESS('A') }), '23514', 'a signer in upper case');
+  await insertMessage(pool, { block_number: '5', block_hash: HASH('b'), block_time: '1794268800' });
+  const { rows } = await pool.query<{ hash: string; ahead: boolean; grant_number: string | null }>('SELECT s.hash, s.ahead, s.grant_number FROM stops s ORDER BY s.hash');
+  assert.deepEqual(rows, [
+    { hash: HASH('51'), ahead: false, grant_number: null },
+    { hash: HASH('52'), ahead: true, grant_number: '0' },
+    { hash: HASH('53'), ahead: true, grant_number: '4294967295' },
+  ]);
+});
+
+test("a stops table that holds the message on every row, as the schema before this one made it, is brought to this schema by applying it: the columns and every constraint read back from the catalog are those of a table this schema made by itself; applied again nothing changes, and the rule that a stop ahead is whole is the same constraint, not one dropped and added again", async () => {
+  const fresh = await stopsShape(pool);
+  assert.deepEqual(fresh.columns, [
+    'account text not null',
+    'ahead boolean not null',
+    'grant_number bigint null',
+    'hash text not null',
+    'message_id bigint not null',
+    'original jsonb null',
+    'original_expiry numeric null',
+    'received_at timestamp with time zone not null',
+  ], 'the table this schema makes by itself');
+  assert.ok(fresh.constraints.includes(`stops_ahead_whole c validated ${AHEAD_WHOLE}`), fresh.constraints.join(' | '));
+  assert.ok(fresh.constraints.includes('stops_message_id_fkey f validated FOREIGN KEY (message_id) REFERENCES stop_messages(id)'), fresh.constraints.join(' | '));
+  assert.ok(!fresh.constraints.some((c) => c.startsWith('stops_original_when_ahead')), 'the older rule is not on a table this schema made');
+
+  const name = await db.createDatabase('stops_before');
+  const before = openPool(db.urlFor(name), null);
+  try {
+    await before.query(STOPS_BEFORE);
+    const older = await stopsShape(before);
+    assert.ok(older.columns.includes('message jsonb not null') && older.columns.includes('signature text not null') && !older.columns.some((c) => c.startsWith('message_id') || c.startsWith('grant_number')), older.columns.join(' | '));
+    assert.ok(older.constraints.some((c) => c.startsWith('stops_original_when_ahead c validated')), older.constraints.join(' | '));
+    assert.deepEqual(await aheadWhole(before), [], 'the older table has no rule of the new name');
+
+    // Applied over it: the same shape as the table this schema makes by itself, column for column and constraint for constraint.
+    await applySchema(before);
+    assert.deepEqual(await stopsShape(before), fresh, 'the older table, brought to this shape');
+    const first = await aheadWhole(before);
+    assert.deepEqual(first.map((c) => ({ validated: c.validated, definition: c.definition })), [{ validated: true, definition: AHEAD_WHOLE }]);
+    // It keeps the rules: a stop ahead short of its grant number is refused, and a whole one is taken.
+    const id = await insertMessage(before);
+    await refused(insertStop(before, HASH('61'), { message_id: id, ahead: true, original: ORIGINAL, original_expiry: '1794268800' }), '23514', 'the converged table refuses a stop ahead without its grant number');
+    await insertStop(before, HASH('62'), { message_id: id, ahead: true, original: ORIGINAL, original_expiry: '1794268800', grant_number: 2 });
+    await insertStop(before, HASH('63'), { message_id: id });
+
+    // Applied a second and a third time: the same shape, and the same constraint. Its oid is the catalog's identity
+    // of the constraint, so one dropped and added again, which reads every row of the table, would show another.
+    await applySchema(before);
+    const second = await aheadWhole(before);
+    await applySchema(before);
+    const third = await aheadWhole(before);
+    assert.deepEqual(await stopsShape(before), fresh);
+    assert.deepEqual(second, first, 'the second apply left the constraint as the first made it');
+    assert.deepEqual(third, second, 'and the third: nothing dropped, nothing added again');
+    assert.equal((await before.query<{ n: number }>('SELECT count(*)::int AS n FROM stops')).rows[0]?.n, 2, 'the rows stand through the applies');
+    // The table this schema made by itself is left alone by a further apply too.
+    const own = await aheadWhole(pool);
+    await applySchema(pool);
+    assert.deepEqual(await aheadWhole(pool), own);
+  } finally {
+    await before.end();
+  }
+});
+
+test('a constraint that stands under the name of the rule and is not the rule is not adopted: with another rule under the name, or the right rule not validated, applying the schema fails and changes nothing; with the name free it is added, and the schema applies', async () => {
+  const made = await db.createWithSchema('stops_named');
+  const named = openPool(made.url, null);
+  try {
+    const cases: Array<{ what: string; add: string; stands: string }> = [
+      { what: 'another rule under the name', add: 'ALTER TABLE stops ADD CONSTRAINT stops_ahead_whole CHECK (ahead = (original IS NOT NULL))', stands: 'CHECK ((ahead = (original IS NOT NULL)))' },
+      {
+        what: 'the right rule, not validated',
+        add: 'ALTER TABLE stops ADD CONSTRAINT stops_ahead_whole CHECK (ahead = (original IS NOT NULL) AND ahead = (original_expiry IS NOT NULL) AND ahead = (grant_number IS NOT NULL)) NOT VALID',
+        stands: `${AHEAD_WHOLE} NOT VALID`,
+      },
+    ];
+    for (const c of cases) {
+      await named.query('ALTER TABLE stops DROP CONSTRAINT stops_ahead_whole');
+      await named.query(c.add);
+      const standing = await aheadWhole(named);
+      assert.equal(standing[0]?.definition, c.stands, c.what);
+      await assert.rejects(applyOnce(made.url), (err: unknown) => {
+        assert.equal((err as { code?: string }).code, '42P16', `${c.what}: ${(err as Error).message}`);
+        assert.match((err as Error).message, /stops_ahead_whole that is not the validated check this schema makes/, c.what);
+        return true;
+      });
+      assert.deepEqual(await aheadWhole(named), standing, `${c.what}: left as it stood, the same constraint, neither adopted as the rule nor dropped`);
+    }
+    // The name free again: the rule is added, validated, and the schema applies.
+    await named.query('ALTER TABLE stops DROP CONSTRAINT stops_ahead_whole');
+    await applyOnce(made.url);
+    assert.deepEqual((await aheadWhole(named)).map((c) => ({ validated: c.validated, definition: c.definition })), [{ validated: true, definition: AHEAD_WHOLE }]);
+  } finally {
+    await named.end();
+  }
+});
+
+test('a stops table of the older shape that holds a row is not brought to this schema: applying it fails, since the row has no message to point at, and changes nothing; the row stands whole, with its message, and no message is made for it', async () => {
+  const name = await db.createDatabase('stops_held');
+  const url_ = db.urlFor(name);
+  const held = openPool(url_, null);
+  try {
+    await held.query(STOPS_BEFORE);
+    await held.query('INSERT INTO stops (hash, account, message, signature) VALUES ($1, $2, $3, $4)', [HASH('71'), ADDRESS('a'), JSON.stringify({ account: ADDRESS('a'), orderHashes: [HASH('71')] }), SIGNATURE('c')]);
+    const whole = async () => (await held.query('SELECT s.xmin::text AS row_version, s.* FROM stops s')).rows;
+    const rowBefore = await whole();
+    const shapeBefore = await stopsShape(held);
+    assert.equal(rowBefore.length, 1);
+    await assert.rejects(applyOnce(url_), (err: unknown) => {
+      assert.equal((err as { code?: string }).code, '23502', (err as Error).message);
+      assert.match((err as Error).message, /message_id/);
+      return true;
+    });
+    assert.deepEqual(await whole(), rowBefore, 'the row as it was, its message and its signature with it, and its row version unchanged');
+    assert.deepEqual(await stopsShape(held), shapeBefore, 'the table as it was: the columns that would have gone are there, the ones that would have come are not');
+    const tables = (await held.query<{ table_name: string }>("SELECT t.table_name FROM information_schema.tables t WHERE t.table_schema = current_schema() ORDER BY t.table_name")).rows.map((r) => r.table_name);
+    assert.deepEqual(tables, ['stops'], 'nothing else of the schema stands either: no table of messages, and so no message made up for the row');
+  } finally {
+    await held.end();
   }
 });
 

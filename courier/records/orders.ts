@@ -144,6 +144,17 @@ function toRow(r: Record<string, unknown>): OrderRow {
  * returned, the request marks ended every quote whose expiry is at or under
  * the final block's time plus one (it can fill in no block after F), and
  * passes to the caller those whose expiry is above the block's time plus one.
+ * The mark is of a quote not ended already, judged on the row as it stands when
+ * the mark reaches it: a quote another writer ended while this scan held it (a
+ * stop, or a read of the chain that showed it cancelled or filled) keeps that
+ * end, the first one, and is not relabelled expired. Before it writes any, the
+ * mark takes the locks of the rows it goes to write, in the order of their
+ * hashes: the one order in which every statement that writes an order's end
+ * takes its rows (MARK_ENDED_SQL below, and the stop's mark in the stops'
+ * records), so no two of these statements take the same two rows in opposite
+ * orders, each then waiting on the other until the database ends one. The
+ * lock is the one the update itself takes, and it chooses the rows by their
+ * hashes alone: whether a row is still unended is the update's to judge.
  * $1 market key, $2 side, $3 $4 the cursor, $5 the bound, $6 F + 1, $7 T + 1,
  * $8 the page. The order and the cursor are both on the table's columns as
  * numbers (`odds_tick`, `record_number`); the text casts are inside the JSON
@@ -157,9 +168,12 @@ export const SCAN_SQL = `WITH scanned AS (
   ORDER BY odds_tick, record_number
   LIMIT $5::integer
 ),
+held AS (
+  SELECT o.hash FROM orders o WHERE o.hash IN (SELECT s.hash FROM scanned s WHERE s.expiry <= $6::numeric) ORDER BY o.hash FOR NO KEY UPDATE
+),
 marked AS (
   UPDATE orders SET ended = 'expired', ended_at = now()
-  WHERE hash IN (SELECT hash FROM scanned WHERE expiry <= $6::numeric)
+  WHERE hash IN (SELECT h.hash FROM held h) AND ended IS NULL
   RETURNING hash
 ),
 live AS (
@@ -281,6 +295,19 @@ export function marketsOfGameParams(gameId: bigint, after: MarketCursor | null, 
   return [gameId.toString(), after === null ? null : after.scorer.toLowerCase(), after === null ? null : after.lineTicks, bound];
 }
 
+/**
+ * The mark of quotes a read of the chain showed ended: $1 the hashes, $2 how each ended, $3 and $4 the block read.
+ * The rows' locks are taken first, in the order of the hashes, and then the rows are written, the ones not ended
+ * already: the same one order as the scan's mark above and the stop's mark, whatever order the caller lists the
+ * quotes in. The lock is the one the update itself takes.
+ */
+export const MARK_ENDED_SQL = `WITH held AS (
+  SELECT o.hash FROM orders o WHERE o.hash = ANY($1::text[]) ORDER BY o.hash FOR NO KEY UPDATE
+)
+UPDATE orders AS o SET ended = m.how, ended_at = now(), ended_block = $3::numeric, ended_block_hash = $4
+FROM unnest($1::text[], $2::text[]) AS m(hash, how)
+WHERE o.hash = m.hash AND o.hash IN (SELECT h.hash FROM held h) AND o.ended IS NULL RETURNING o.hash, o.ended`;
+
 export function createOrders(pool: pg.Pool): Orders {
   return {
     async insert(on, o) {
@@ -339,12 +366,7 @@ export function createOrders(pool: pg.Pool): Orders {
     },
     async markEnded(on, marks, block) {
       if (marks.length === 0) return [];
-      const { rows } = await on.query<{ hash: Hex; ended: EndSeen }>(
-        `UPDATE orders AS o SET ended = m.how, ended_at = now(), ended_block = $3::numeric, ended_block_hash = $4
-         FROM unnest($1::text[], $2::text[]) AS m(hash, how)
-         WHERE o.hash = m.hash AND o.ended IS NULL RETURNING o.hash, o.ended`,
-        [marks.map((m) => m.hash.toLowerCase()), marks.map((m) => m.how), block.number.toString(), block.hash.toLowerCase()],
-      );
+      const { rows } = await on.query<{ hash: Hex; ended: EndSeen }>(MARK_ENDED_SQL, [marks.map((m) => m.hash.toLowerCase()), marks.map((m) => m.how), block.number.toString(), block.hash.toLowerCase()]);
       return rows.map((r) => ({ hash: r.hash, how: r.ended }));
     },
     async scan(on, args) {
