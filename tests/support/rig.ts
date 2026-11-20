@@ -29,7 +29,7 @@ import { MULTICALL_ADDRESS } from '../../courier/chain/abi';
 const ARTIFACTS = new URL('../../contracts/out/', import.meta.url);
 
 /** The pinned commit of the contracts repository: what the entry's commit field carries. */
-export const CONTRACTS_COMMIT: Hex = '0xed449dbd8e69ad4fa1e9874635040d1dd6e9ca5e';
+export const CONTRACTS_COMMIT: Hex = '0xbaa1fc566cf13552d968fb738ccb8ca3d859666f';
 
 /** anvil's own test mnemonic; its accounts hold the local chain's coin and nothing else, anywhere. */
 const TEST_MNEMONIC = 'test test test test test test test test test test test junk';

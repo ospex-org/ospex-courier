@@ -1788,6 +1788,56 @@ test('a live quote after kickoff on a game with a written start is taken; a scor
   assert.equal(closed.body.closesAt, closesAt.toString());
 });
 
+test("a game whose start is not written, at the pinned contracts: the chain holds it not verified; the door answers an own-key bet on it NO_WRITTEN_START, with the game's line and the refusal's and no order kept; and the markets contract refuses a fill on it by name, where the same two orders on a game whose start is written would fill", async () => {
+  const maker = rig.accounts.maker;
+  const taker = rig.accounts.taker;
+  const gamesAbi = rig.abis.OspexGames as Abi;
+  /** One Cross's two orders on a game, each signed by its own account's key and neither posted: the maker's quote, and the taker's bet against it. */
+  const pairOn = async (gameId: bigint) => {
+    const T = await rig.time();
+    const quote = orderOn(rig, maker, { expiry: T + 600n, riskAmount: 10_000n, gameId });
+    const bet: Order = { ...orderOn(rig, taker, { expiry: T + 20n, riskAmount: 10_000n, gameId }), positionType: 1 };
+    return {
+      quote: { order: quote, signature: await sign(maker, quote, 31337, rig.addresses.matching) },
+      bet: { order: bet, signature: await sign(taker, bet, 31337, rig.addresses.matching) },
+    };
+  };
+
+  // The game: created, and its start not written. The games set numbers that status 1, and a written start 2.
+  const unwritten = await rig.createGame({ startWritten: false });
+  assert.equal(await rig.read<number>(rig.addresses.games, gamesAbi, 'getGameStatus', [unwritten]), 1, 'created, and not verified: its start is not written');
+  const on = await pairOn(unwritten);
+
+  // The door: the bet is admitted and refused for its game, as a quote on it is. The game's one line, the
+  // refusal's line, and no order.
+  const answer = await post(url(), '/v1/orders', { role: 'take', order: wire(on.bet.order), signature: on.bet.signature });
+  assert.deepEqual(
+    { status: answer.status, code: answer.body.code, error: answer.body.error },
+    { status: 422, code: 'NO_WRITTEN_START', error: `Game ${unwritten} has no written start yet; the courier carries a game once its start is written.` },
+    JSON.stringify(answer.body),
+  );
+  assert.equal(await orderRow(await contractHash(rig, on.bet.order)), null, 'a refused order holds no place');
+  assert.deepEqual(
+    (await lines(`WHERE game_id = ${unwritten}`)).map((l) => [l.kind, l.reason]),
+    [
+      ['start unreadable', null],
+      ['order refused', 'NO_WRITTEN_START'],
+    ],
+    "the lines of the game: its start could not be read, once; and the bet's refusal",
+  );
+
+  // The contracts: the same bet in a Cross against the quote, asked of the chain as the relay's sender and not
+  // sent. The markets contract draws no market on a game that is not verified, and says so by name.
+  const marketsAbi = rig.abis.OspexMarkets as Abi;
+  assert.deepEqual(await crossRefusal(rig, on.bet, [on.quote], marketsAbi), { name: 'OspexMarkets__GameNotVerified', args: [unwritten, 1] }, "the contracts' own refusal of a fill on the game, with the game and its status");
+
+  // The control: the same two orders on a game whose start is written. Nothing refuses them: they would fill.
+  const written = await rig.createGame();
+  assert.equal(await rig.read<number>(rig.addresses.games, gamesAbi, 'getGameStatus', [written]), 2, 'verified: its start is written');
+  const control = await pairOn(written);
+  assert.equal(await crossRefusal(rig, control.bet, [control.quote], marketsAbi), null, 'the same two orders on a game whose start is written: the contracts refuse nothing');
+});
+
 test('every refusal line is of an admitted request: no line carries a code of the checks before admission', async () => {
   // The grant's three refusals and GRANT_GONE are of the checks before admission too: a grant is judged before the budgets.
   const before = new Set([
