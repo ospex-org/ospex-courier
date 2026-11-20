@@ -381,6 +381,13 @@ All public, and each bounded: no read returns a list without a limit.
   block's and one scan's answer, and it says which block.
 - `GET /v1/orders/{hash}`: the record of one order (parts 3 and 4).
 
+**The two reads of the book are made one statement at a time.** Each side scanned is one statement, and it commits
+on its own. So a read is its statements' observations of the records, one after another, and not one snapshot
+across a market's two sides or a game's markets: an order posted or stopped while a read runs can be in one scan's
+answer and not in another's. A scan marks the expired quotes it is returned, and a mark a finished scan made stays
+if a later scan, or a later stage of the same read, fails: a `503` on a read of the book does not say that nothing
+was marked.
+
 **Which requests read the chain.** A post of an order not yet on record: one header and one read; a quote's post
 makes one read more where the account has sixteen quotes standing on the side, and a bet's never does. A post of an
 order on record: none. A stop signed by the account's key whose every hash the account has stopped already, or that

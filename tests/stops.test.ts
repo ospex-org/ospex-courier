@@ -2276,6 +2276,254 @@ test("14d. the mark of quotes the chain shows ended takes its rows in the order 
   assert.deepEqual(faults, [], 'the mark of quotes the chain shows ended takes their rows in the order of their hashes');
 });
 
+// ──────────────────────────── 14e to 14g: a read's scans, each one statement on its own ────────────────────────────
+//
+// A market's page scans its sides one after another, and a game's list scans the sides of its markets one after
+// another. Each scan marks the expired quotes it was returned, and holds their rows while it does. A read that kept
+// one scan's rows while it made the next could cross with a stop: the stop of a quote of each scan takes the lower
+// hash's row first, the later scan's, and waits for the earlier scan's, which the read holds; the read's later scan
+// waits for the row the stop holds; and the database ends one of the two. Where it ends the stop, every order that
+// stop named is carried on until its maker sends it again. So each scan is one statement that commits on its own:
+// its rows are let go before the next scan begins, and its marks stand whatever comes after. 14e and 14f watch a
+// read at that boundary, across a market's two sides and across a game's two markets. 14g is the other face of it:
+// a read that fails part-way keeps the marks its finished scans made, and its answer does not say otherwise.
+
+/** The courier's log from a mark to now, whole. A later refusal of another route is sent and its line waited for: the log is one stream, so every line the courier wrote before that one is in hand with it. */
+async function logSince(since: number, headers: Record<string, string>): Promise<string[]> {
+  const later = 'refused before admission: GET /v1/orders/{hash} INVALID_PARAM';
+  assert.equal((await get(url(), '/v1/orders/no-hash', headers)).body.code, 'INVALID_PARAM', 'a later refusal, of another route');
+  const end = await until("the courier's log line for the later refusal, of another route", async () => {
+    const at = stack.courier.lines.indexOf(later, since);
+    return at < 0 ? null : at;
+  });
+  return stack.courier.lines.slice(since, end);
+}
+
+/** Three expired quotes of one account. By their hashes, z is under y and y is under x. */
+interface Crossing {
+  who: HDAccount;
+  /** Met by the read's first scan. */
+  x: OriginalSent;
+  /** Met by a later scan of the same read, with z. The stop names x and y. */
+  y: OriginalSent;
+  /** Met by that later scan too, and the lowest hash: the row the test holds, so that the scan waits where the test can see it. */
+  z: OriginalSent;
+}
+
+/**
+ * Three quotes of a fresh account, posted and carried: x where `first` puts it, y and z where `later` puts them,
+ * signed again until their hashes stand z, y, x from the lowest.
+ */
+async function crossingQuotes(first: Partial<Order> & { expiry: bigint }, later: Partial<Order> & { expiry: bigint }, headers: Record<string, string>): Promise<Crossing> {
+  const who = await freshAccount();
+  for (let tries = 0; tries < 64; tries++) {
+    const x = await unposted(who, { ...first, oddsTick: 700 });
+    const one = await unposted(who, { ...later, oddsTick: 700 });
+    const other = await unposted(who, { ...later, oddsTick: 701 });
+    const [z, y] = one.orderHash < other.orderHash ? [one, other] : [other, one];
+    if (y.orderHash >= x.orderHash) continue;
+    for (const o of [x, y, z]) assert.equal((await postOriginal(o, headers)).status, 201, 'each of the three is posted and carried');
+    const { rows } = await pool.query<{ hash: string }>('SELECT o.hash FROM orders o WHERE o.hash = ANY($1::text[]) ORDER BY o.hash', [[x.orderHash, y.orderHash, z.orderHash]]);
+    assert.deepEqual(rows.map((r) => r.hash), [z.orderHash, y.orderHash, x.orderHash], 'the database orders the three hashes as the test does');
+    return { who, x, y, z };
+  }
+  return assert.fail('no three orders in 64 tries whose hashes stand in the wanted order');
+}
+
+/** What a read and a stop were seen to do at the boundary between two of the read's scans. */
+interface CrossingSeen {
+  /** How the first scan's quote had ended, as another session read it while the later scan waited. */
+  firstScanMarked: string | null;
+  /** Whether the row of the first scan's quote was still held while the later scan waited. */
+  firstScanRowHeld: boolean;
+  /** Whether the stop was seen waiting on a row the read's session held. */
+  stopWaitedOnTheRead: boolean;
+  stop: { status: number; results: string[] };
+  read: number;
+  /** The courier's log lines that carry the database's code for a transaction it ended for a deadlock. */
+  endedForADeadlock: string[];
+}
+
+const NOT_CROSSED: CrossingSeen = { firstScanMarked: 'expired', firstScanRowHeld: false, stopWaitedOnTheRead: false, stop: { status: 200, results: ['stopped', 'stopped'] }, read: 200, endedForADeadlock: [] };
+
+/**
+ * One read made while a stop names a quote of its first scan and a quote of a later one. The test holds z's row, so
+ * the read's later scan, which takes its rows from the lowest hash, waits on it at once: the read stands between
+ * two of its scans. There the test looks at the first scan's quote, sends the stop of x and y, and waits until the
+ * stop is answered or is seen waiting on the read. Then it lets z go and takes both answers. Every step is one the
+ * database or the courier is seen to reach; none is a time waited out. A read that kept its first scan's row would
+ * be seen holding it; the stop would be seen waiting on the read; and once z was let go the two would wait on each
+ * other until the database ended one, which that request's answer and the courier's log both say.
+ */
+async function readWhileStopped(what: string, c: Crossing, read: () => Promise<Awaited<ReturnType<typeof get>>>, headers: Record<string, string>): Promise<{ seen: CrossingSeen; answer: Awaited<ReturnType<typeof get>> }> {
+  const mine = await ownSession();
+  const logged = stack.courier.lines.length;
+  let reading: Promise<Awaited<ReturnType<typeof get>>> | null = null;
+  let stopping: Promise<Answer> | null = null;
+  try {
+    await mine.client.query('BEGIN');
+    await mine.client.query('SELECT o.hash FROM orders o WHERE o.hash = $1 FOR NO KEY UPDATE', [c.z.orderHash]);
+    reading = read();
+    reading.catch(() => undefined);
+    const reader = await until(`${what}: the read's later scan waiting on the row the test holds`, () => waitingBehind(mine.pid));
+    const firstScanMarked = (await endedOf([c.x.orderHash])).get(c.x.orderHash) ?? null;
+    const firstScanRowHeld = await rowLocked(c.x.orderHash);
+    let answered = false;
+    stopping = postStop(url(), rig, c.who, stopMessage(c.who.address, [c.x.orderHash, c.y.orderHash]), undefined, headers);
+    stopping.then(
+      () => (answered = true),
+      () => (answered = true),
+    );
+    const how = await until(`${what}: the stop answered, or waiting on a row the read holds`, async () => (answered ? 'answered' : (await waitingBehind(reader)) !== null ? 'waiting' : null));
+    // The test's transaction wrote nothing: ended, it lets z's row go.
+    await mine.client.query('ROLLBACK');
+    const stop = await within(`${what}: the stop, the test's row let go`, stopping, 30_000);
+    const answer = await within(`${what}: the read, the test's row let go`, reading, 30_000);
+    const endedForADeadlock = (await logSince(logged, headers)).filter((line) => line.includes('40P01'));
+    return { seen: { firstScanMarked, firstScanRowHeld, stopWaitedOnTheRead: how === 'waiting', stop: { status: stop.status, results: outcomes(stop) }, read: answer.status, endedForADeadlock }, answer };
+  } finally {
+    // Whatever happened above, the test's row is let go before either answer is waited for.
+    await mine.client.query('ROLLBACK').catch(() => undefined);
+    mine.client.release();
+    await reading?.catch(() => undefined);
+    await stopping?.catch(() => undefined);
+  }
+}
+
+/** How the three orders of a crossing ended, by name. */
+async function endsOfCrossing(c: Crossing): Promise<{ x: string | null; y: string | null; z: string | null }> {
+  const ended = await endedOf([c.x.orderHash, c.y.orderHash, c.z.orderHash]);
+  return { x: ended.get(c.x.orderHash) ?? null, y: ended.get(c.y.orderHash) ?? null, z: ended.get(c.z.orderHash) ?? null };
+}
+
+test("14e. a market's page lets go of one side's rows before it scans the other: an expired quote on the side scanned first, two on the side scanned second with lower hashes, and a stop of the first and one of the others sent while the page stands between its two scans. The first side's quote is seen marked and its row free, the stop is answered without waiting on the page, the page is answered, and the database ends neither for a deadlock. The scan's mark and the stop's each stand, the first end of its order", async () => {
+  const from = at(145);
+  const market = freshMarket();
+  const expiry = (await rig.time()) + 120n;
+  const c = await crossingQuotes({ expiry, positionType: 0, ...market }, { expiry, positionType: 1, ...market }, from);
+  await chainTimeIs(expiry);
+  try {
+    stack.proxy.setFinal((await head()).number);
+    const { seen, answer } = await readWhileStopped("the market's page", c, () => get(url(), `/v1/book?gameId=${rig.gameId}&scorer=${market.scorer}&lineTicks=${market.lineTicks}`, from), from);
+    assert.deepEqual(seen, NOT_CROSSED, `the page carries no row of its first scan into its second; the page's answer: ${JSON.stringify(answer.body)}`);
+    const sides = answer.body.sides as Record<string, { quotes: unknown[]; scanned: number; marked: number }>;
+    assert.deepEqual(
+      { A: { quotes: sides.A?.quotes, scanned: sides.A?.scanned, marked: sides.A?.marked }, B: { quotes: sides.B?.quotes, scanned: sides.B?.scanned, marked: sides.B?.marked } },
+      { A: { quotes: [], scanned: 1, marked: 1 }, B: { quotes: [], scanned: 2, marked: 1 } },
+      'each side is its own scan: the first was returned its quote and marked it; the second, begun before the stop, was returned its two and marked the one the stop had not ended',
+    );
+    assert.deepEqual(await endsOfCrossing(c), { x: 'expired', y: 'stopped', z: 'expired' }, "each order's first end stands: the scans' marks of x and z, and the stop's of y");
+    assert.equal((await stopRows([c.x.orderHash, c.y.orderHash])).size, 2, 'and the stop is on record for both hashes it named');
+  } finally {
+    stack.proxy.setFinal(null);
+  }
+});
+
+test("14f. a game's list lets go of one market's rows before it scans the next: an expired quote in the market scanned first, two in the market scanned second with lower hashes, and a stop of the first and one of the others sent while the list stands between the two markets. The first market's quote is seen marked and its row free, the stop is answered without waiting on the list, the list is answered, and the database ends neither for a deadlock. The scan's mark and the stop's each stand, the first end of its order", async () => {
+  const from = at(146);
+  // A game of its own, so the list scans these two markets and no other: the lower line's market is scanned first.
+  const game = await rig.createGame();
+  const first = { scorer: rig.addresses.spread, lineTicks: -45 };
+  const second = { scorer: rig.addresses.spread, lineTicks: -35 };
+  const expiry = (await rig.time()) + 120n;
+  const c = await crossingQuotes({ expiry, gameId: game, ...first }, { expiry, gameId: game, ...second }, from);
+  await chainTimeIs(expiry);
+  try {
+    stack.proxy.setFinal((await head()).number);
+    const { seen, answer } = await readWhileStopped("the game's list", c, () => get(url(), `/v1/book?gameId=${game}`, from), from);
+    assert.deepEqual(seen, NOT_CROSSED, `the list carries no row of its first market's scan into its second's; the list's answer: ${JSON.stringify(answer.body)}`);
+    assert.deepEqual({ markets: answer.body.markets, more: answer.body.more }, { markets: [], more: false }, 'no market of the game holds a live quote: every quote had expired, and the list leaves such a market out');
+    assert.deepEqual(await endsOfCrossing(c), { x: 'expired', y: 'stopped', z: 'expired' }, "each order's first end stands: the scans' marks of x and z, and the stop's of y");
+    assert.equal((await stopRows([c.x.orderHash, c.y.orderHash])).size, 2, 'and the stop is on record for both hashes it named');
+  } finally {
+    stack.proxy.setFinal(null);
+  }
+});
+
+/** The sentence a read of the book answers with where the database fails under it, in the test's own words. */
+const BOOK_NOT_SERVED = 'The database could not be read, so the book was not served. Expired quotes a scan had already marked stay marked.';
+
+/**
+ * While it stands, the database refuses to write the end of one order: a check that order's row cannot pass once it
+ * is ended, added with no scan of the rows that stand. Every other row is written as before.
+ */
+async function refusingTheEndOf(hash: Hex): Promise<() => Promise<void>> {
+  assert.match(hash, /^0x[0-9a-f]{64}$/);
+  await pool.query(`ALTER TABLE orders ADD CONSTRAINT orders_one_end_refused_by_the_test CHECK (hash <> '${hash}' OR ended IS NULL) NOT VALID`);
+  return async () => {
+    await pool.query('ALTER TABLE orders DROP CONSTRAINT orders_one_end_refused_by_the_test');
+  };
+}
+
+/** The database's own clock now, in microseconds. */
+async function databaseClock(): Promise<bigint> {
+  const { rows } = await pool.query<{ at: string }>('SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint::text AS at');
+  return BigInt(rows[0]?.at ?? assert.fail('no clock'));
+}
+
+/** How each of these orders ended and when, the time in the database's microseconds; null and null for one not ended. In the order asked. */
+async function endsAndTimesOf(hashes: string[]): Promise<Array<{ ended: string | null; at: bigint | null }>> {
+  const { rows } = await pool.query<{ hash: string; ended: string | null; at: string | null }>(
+    'SELECT o.hash, o.ended, (extract(epoch FROM o.ended_at) * 1000000)::bigint::text AS at FROM orders o WHERE o.hash = ANY($1::text[])',
+    [hashes],
+  );
+  const by = new Map(rows.map((r) => [r.hash, { ended: r.ended, at: r.at === null ? null : BigInt(r.at) }]));
+  return hashes.map((h) => by.get(h) ?? assert.fail(`no order ${h}`));
+}
+
+test("14g. a read that fails part-way keeps the marks its finished scans made, and does not say otherwise: with the database refusing the mark of one expired quote, a market's page whose first side holds another, and a game's list whose first market holds two more, are each answered DATABASE_UNREADABLE with the book's own sentence. The quotes of the scans that had finished are marked expired, each at its own scan's time and all inside the request; the refused one is not. The refusal lifted, the same read is answered: it marks the one left, and the others keep their end and its time", async () => {
+  const from = at(147);
+  const who = await freshAccount();
+  const market = freshMarket();
+  // A game of its own for the list, so its scans are these and no others: the lower line's market first, and in it side A before side B.
+  const game = await rig.createGame();
+  const first = { scorer: rig.addresses.spread, lineTicks: -45 };
+  const second = { scorer: rig.addresses.spread, lineTicks: -35 };
+  const expiry = (await rig.time()) + 120n;
+  // The page: one quote a side. The list: one on each side of its first market, and one in its second.
+  const pageA = await quote(who, { expiry, oddsTick: 720, positionType: 0, ...market }, from);
+  const pageB = await quote(who, { expiry, oddsTick: 720, positionType: 1, ...market }, from);
+  const listA = await quote(who, { expiry, oddsTick: 720, positionType: 0, gameId: game, ...first }, from);
+  const listB = await quote(who, { expiry, oddsTick: 720, positionType: 1, gameId: game, ...first }, from);
+  const listLast = await quote(who, { expiry, oddsTick: 720, positionType: 0, gameId: game, ...second }, from);
+  await chainTimeIs(expiry);
+  const reads = [
+    { what: "the market's page", path: `/v1/book?gameId=${rig.gameId}&scorer=${market.scorer}&lineTicks=${market.lineTicks}`, finished: [pageA.hash], refused: pageB.hash },
+    { what: "the game's list", path: `/v1/book?gameId=${game}`, finished: [listA.hash, listB.hash], refused: listLast.hash },
+  ];
+  try {
+    stack.proxy.setFinal((await head()).number);
+    for (const r of reads) {
+      const lift = await refusingTheEndOf(r.refused);
+      const asked = await databaseClock();
+      let failed: Awaited<ReturnType<typeof get>>;
+      try {
+        failed = await get(url(), r.path, from);
+      } finally {
+        await lift();
+      }
+      const answered = await databaseClock();
+      assert.deepEqual({ status: failed.status, code: failed.body.code, error: failed.body.error }, { status: 503, code: 'DATABASE_UNREADABLE', error: BOOK_NOT_SERVED }, `${r.what}: ${JSON.stringify(failed.body)}`);
+      // The scans that had finished: their marks are committed, each with its own statement's time.
+      const kept = await endsAndTimesOf(r.finished);
+      assert.deepEqual(kept.map((k) => k.ended), r.finished.map(() => 'expired'), `${r.what}: the marks of the scans that finished before the failure stand`);
+      const times = kept.map((k) => k.at ?? assert.fail('a mark with no time'));
+      assert.ok(times.every((t) => t >= asked && t <= answered), `${r.what}: each mark carries a time inside the request: ${asked} <= ${times.join(', ')} <= ${answered}`);
+      assert.ok(times.every((t, i) => i === 0 || t > (times[i - 1] as bigint)), `${r.what}: each scan's mark carries its own statement's time, a later scan's a later one: ${times.join(', ')}`);
+      assert.deepEqual(await endsAndTimesOf([r.refused]), [{ ended: null, at: null }], `${r.what}: the scan the database refused wrote nothing`);
+      // The same read again, the refusal lifted: it finishes, marks the one left, and relabels nothing.
+      const again = await get(url(), r.path, from);
+      assert.equal(again.status, 200, `${r.what}, read again: ${JSON.stringify(again.body)}`);
+      assert.deepEqual(await endsAndTimesOf(r.finished), kept, `${r.what}, read again: an order ended already keeps its end and its time`);
+      const last = (await endsAndTimesOf([r.refused]))[0];
+      assert.equal(last?.ended, 'expired', `${r.what}, read again: the quote left is marked`);
+      assert.ok((last?.at ?? 0n) > answered, `${r.what}, read again: at the second read's own time, after the first was answered`);
+    }
+  } finally {
+    stack.proxy.setFinal(null);
+  }
+});
+
 // ──────────────────────────── 15: the locks a message holds ────────────────────────────
 
 /** These unposted orders by their hash locks' keys, ascending as numbers. */

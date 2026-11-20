@@ -33,7 +33,11 @@ function before(deps: RouteDeps, route: string, status: number, code: string, er
   return refusal(status, code, error);
 }
 
-const DATABASE_UNREADABLE = refusal(503, 'DATABASE_UNREADABLE', 'The database could not be read; nothing was recorded.');
+/**
+ * What a read of the book says where the database fails under it. It does not say that nothing was written: a read's
+ * scans each commit on their own, so a quote a finished scan marked expired stays marked where a later scan fails.
+ */
+const BOOK_NOT_SERVED = 'The database could not be read, so the book was not served. Expired quotes a scan had already marked stay marked.';
 
 /**
  * The driver's connection failures that carry no code: a socket closed under
@@ -140,7 +144,7 @@ export async function getBook(deps: RouteDeps, query: URLSearchParams): Promise<
       return { status: 200, body: { ...(await readGameBook(deps, gameId, after, Number(limit))) } };
     } catch (err) {
       if (err instanceof ChainUnreachable) return CHAIN_UNREACHABLE;
-      if (isDatabaseFailure(err)) return databaseUnreadable(deps, route, err, DATABASE_UNREADABLE.body.error as string);
+      if (isDatabaseFailure(err)) return databaseUnreadable(deps, route, err, BOOK_NOT_SERVED);
       throw err;
     }
   }
@@ -161,7 +165,7 @@ export async function getBook(deps: RouteDeps, query: URLSearchParams): Promise<
     return { status: 200, body: { ...(await readMarketBook(deps, { gameId, scorer: getAddress(scorer), lineTicks: Number(lineText), side: sideText, after, limit: Number(limit) })) } };
   } catch (err) {
     if (err instanceof ChainUnreachable) return CHAIN_UNREACHABLE;
-    if (isDatabaseFailure(err)) return databaseUnreadable(deps, route, err, DATABASE_UNREADABLE.body.error as string);
+    if (isDatabaseFailure(err)) return databaseUnreadable(deps, route, err, BOOK_NOT_SERVED);
     throw err;
   }
 }
