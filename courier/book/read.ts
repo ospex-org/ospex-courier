@@ -18,6 +18,17 @@ import type { Store } from '../records/store';
 // chain about the quotes it lists and marks the ones shown cancelled; the
 // game's list asks the chain nothing, so its counts are the courier's records
 // as they stand, right once any request has asked the chain about the quotes.
+//
+// A read scans one side of one market at a time, and each scan is one
+// statement that commits on its own: no transaction encloses two of them. A
+// scan holds the rows of the expired quotes it marks only until its own
+// statement ends, so a read has let them go before its next scan begins, and
+// before the mark of quotes the chain showed ended. A read that kept one
+// scan's rows into the next could wait on a stop that was waiting on it. So a
+// read is its statements' observations of the records, one after another, and
+// not one snapshot across a market's sides or a game's markets; and a mark a
+// finished scan made stays where a later scan, or a later stage of the same
+// read, fails.
 
 export interface BookDeps {
   store: Store;
@@ -131,7 +142,6 @@ export async function readGameBook(deps: BookDeps, gameId: bigint, after: Market
   const { header, final } = await blocks(deps);
   const client = await deps.store.pool.connect();
   try {
-    await client.query('BEGIN');
     // The pairs past the cursor, in the list's order: two a market at most, and one market more than the page, to
     // know whether markets follow.
     const pairs = await deps.store.orders.marketsOfGame(client, gameId, after, 2 * (limit + 1));
@@ -154,7 +164,6 @@ export async function readGameBook(deps: BookDeps, gameId: bigint, after: Market
       }
       if (entry.live.A.live > 0 || entry.live.B.live > 0 || entry.live.A.boundReached || entry.live.B.boundReached) page.push(entry);
     }
-    await client.query('COMMIT');
     const lastTaken = taken[taken.length - 1];
     return {
       gameId: gameId.toString(),
@@ -166,9 +175,6 @@ export async function readGameBook(deps: BookDeps, gameId: bigint, after: Market
       next: more && lastTaken !== undefined ? { scorer: lastTaken.scorer, lineTicks: lastTaken.lineTicks } : null,
       limit,
     };
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => undefined);
-    throw err;
   } finally {
     client.release();
   }
@@ -191,14 +197,9 @@ export async function readMarketBook(deps: BookDeps, q: MarketQuery): Promise<Ma
   const client = await deps.store.pool.connect();
   const scans: Partial<Record<'A' | 'B', Awaited<ReturnType<Store['orders']['scan']>>>> = {};
   try {
-    await client.query('BEGIN');
     for (const side of sides) {
       scans[side] = await deps.store.orders.scan(client, { marketKey: key, side: side === 'A' ? 0 : 1, after: q.after, blockTime: header.timestamp, finalTime: final.timestamp, page: q.limit });
     }
-    await client.query('COMMIT');
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => undefined);
-    throw err;
   } finally {
     client.release();
   }
