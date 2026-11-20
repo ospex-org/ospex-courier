@@ -209,9 +209,11 @@ export async function crossFromTheTest(rig: Rig, taking: Signed, resting: Signed
  * What the contract would answer one Cross with, asked of the chain without sending it: null where it would fill,
  * else the contract's own error, by name and with its values, read against the matching contract's errors. The
  * call is made as the relay's sender through the relay, which hands the matching contract's refusal back as it
- * is. A refusal that is not one of the matching contract's errors is thrown, not named.
+ * is. A refusal that is not one of the matching contract's errors is thrown, not named. Where the refusal looked
+ * for is another contract's of the set, which the matching contract hands up as it is, `errorsOf` is that
+ * contract's interface, and the refusal is read against its errors in place of the matching contract's.
  */
-export async function crossRefusal(rig: Rig, taking: Signed, resting: Signed[]): Promise<{ name: string; args: readonly unknown[] } | null> {
+export async function crossRefusal(rig: Rig, taking: Signed, resting: Signed[], errorsOf: Abi = rig.abis.OspexMatching as Abi): Promise<{ name: string; args: readonly unknown[] } | null> {
   const data = encodeFunctionData({ abi: rig.abis.OspexCourierRelay as Abi, functionName: 'cross', args: [taking, resting] } as never);
   const res = await fetch(rig.url, {
     method: 'POST',
@@ -221,7 +223,7 @@ export async function crossRefusal(rig: Rig, taking: Signed, resting: Signed[]):
   const body = (await res.json()) as { result?: unknown; error?: { message?: string; data?: unknown } };
   if (body.error === undefined) return null;
   if (typeof body.error.data !== 'string') throw new Error(`the Cross was refused with no data to name the refusal by: ${String(body.error.message)}`);
-  const refusal = decodeErrorResult({ abi: rig.abis.OspexMatching as Abi, data: body.error.data as Hex });
+  const refusal = decodeErrorResult({ abi: errorsOf, data: body.error.data as Hex });
   return { name: refusal.errorName, args: refusal.args ?? [] };
 }
 
