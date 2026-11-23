@@ -88,14 +88,62 @@ export const MATCHING_ABI = parseAbi([
   'function revokeAgent()',
   'function liftTakingStakeCap()',
   `function cross((${ORDER_STRUCT} order, bytes signature) taking, (${ORDER_STRUCT} order, bytes signature)[] resting)`,
+  // The refusals of a Cross the bet's check decodes: the two of the whole Cross, the courier test, the taking order's
+  // thirteen, and the up-front checks every listed order meets. Enums are their uint8.
+  'error OspexMatching__NothingFilled(uint8[] reasons)',
+  'error OspexMatching__TakingOrderUnderMinFill(bytes32 takingHash, uint256 filledThisCross, uint256 minFill, uint256 roomLeft, (bytes32 orderHash, bool filled, uint8 reason, uint256 makerRisk, uint256 takerRisk)[] legs)',
+  'error OspexMatching__SenderNotCourier(address account, address sender)',
+  'error OspexMatching__BadSignature(bytes32 orderHash)',
+  'error OspexMatching__NoSuchGrant(bytes32 orderHash, address account, uint32 grantNumber)',
+  'error OspexMatching__PriceOutOfRange(bytes32 orderHash)',
+  'error OspexMatching__StakeNotInLots(bytes32 orderHash)',
+  'error OspexMatching__MinFillAboveStake(bytes32 orderHash, uint256 minFill, uint256 riskAmount)',
+  'error OspexMatching__AgentStakeAboveCap(bytes32 orderHash, uint256 riskAmount, uint256 stakeCap)',
+  'error OspexMatching__LineNotInGrant(bytes32 orderHash)',
+  'error OspexMatching__TakingStakeAboveCap(bytes32 orderHash)',
+  'error OspexMatching__TakingOrderCancelled(bytes32 orderHash)',
+  'error OspexMatching__TakingOrderGrantGone(bytes32 orderHash, uint32 grantNumber, uint32 currentGrant, uint64 endsAt)',
+  'error OspexMatching__TakingOrderExpired(bytes32 orderHash)',
+  'error OspexMatching__TakingOrderTooLong(bytes32 orderHash)',
+  'error OspexMatching__TakingOrderFilled(bytes32 orderHash)',
+  'error OspexMatching__OtherGame(bytes32 orderHash)',
+  'error OspexMatching__OtherScorer(bytes32 orderHash)',
+  'error OspexMatching__OtherLine(bytes32 orderHash)',
+  'error OspexMatching__SameSide(bytes32 orderHash)',
+  'error OspexMatching__PricesDoNotMeet(bytes32 orderHash)',
 ]);
 
-/** The relay: the courier's address on chain. */
+/** The relay: the courier's address on chain. Its sender is its first storage variable, slot 0. */
 export const RELAY_ABI = parseAbi([
   'function i_matching() view returns (address)',
   'function i_timelock() view returns (address)',
   'function s_sender() view returns (address)',
   `function cross((${ORDER_STRUCT} order, bytes signature) taking, (${ORDER_STRUCT} order, bytes signature)[] resting)`,
+  'error OspexCourierRelay__NotTheSender(address caller)',
+]);
+
+/** The relay's storage slot that holds its sender. */
+export const RELAY_SENDER_SLOT = 0n;
+
+/** The positions contract: an account's two records on a market, what is held for it, the preview of a fill, and its refusals of a Cross. */
+export const POSITIONS_ABI = parseAbi([
+  'function getPosition(uint256 marketId, address user, uint8 side) view returns ((uint256 risk, uint256 profit, uint8 side, bool claimed) position)',
+  'function s_held(uint256 marketId, address account) view returns (uint256)',
+  'function previewFill(uint256 marketId, address account, uint8 side, uint256 risk, uint256 profit) view returns (uint256 pull, uint256 payBack)',
+  'error OspexPositions__TakerPullRefused(address taker, uint256 pull)',
+  'error OspexPositions__ShortReceipt(uint256 owed, uint256 held)',
+  'error OspexPositions__MarketShort(uint256 marketId, uint256 asked, uint256 total)',
+]);
+
+/** The markets contract: a market's id by its three fields (0 where none is drawn), the count of markets drawn, a market's record, and the close gate's four refusals. */
+export const MARKETS_ABI = parseAbi([
+  'function getMarketId(uint256 gameId, address scorer, int32 lineTicks) view returns (uint256)',
+  'function s_marketCount() view returns (uint256)',
+  'function getMarket(uint256 marketId) view returns ((uint256 gameId, address scorer, int32 lineTicks, uint8 status, uint8 outcome))',
+  'error OspexMarkets__MarketSettled(uint256 marketId)',
+  'error OspexMarkets__GameEnded(uint256 gameId, uint8 status)',
+  'error OspexMarkets__GameNotVerified(uint256 gameId, uint8 status)',
+  'error OspexMarkets__BetsClosed(uint256 gameId, uint256 closesAt)',
 ]);
 
 /** The games set, for the reads the courier makes of a game. */
