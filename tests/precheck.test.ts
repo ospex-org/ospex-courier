@@ -736,7 +736,10 @@ test('the gas: no reason at a step. One step\'s estimate answered with the node\
   for (const m of makers) await quoteOn(m, market, { oddsTick: 200, riskAmount: 100n });
   const whole = await judged((await betOn(await freshAccount(), market, { oddsTick: 200, riskAmount: 300n })).hash);
   assert.equal(legsOf(whole).length, 3, JSON.stringify(whole));
-  await hooks().fault({ transactionGasCap: BigInt((whole.cross as { gas: { limit: string } }).gas.limit) - 1n });
+  // The ceiling a twelfth under the three legs' limit, not one gas: another bet's calldata has other zero bytes, so its
+  // three-leg estimate can be a little lower, and one gas under let it fit. One leg's limit is far under either.
+  const wholeLimit = BigInt((whole.cross as { gas: { limit: string } }).gas.limit);
+  await hooks().fault({ transactionGasCap: wholeLimit - wholeLimit / 12n });
   try {
     const B = await freshAccount();
     const { record } = await countedCheck(
@@ -1465,18 +1468,27 @@ test("the cap: on a branch where the cap is lifted, a bet of 10,100 is admitted 
 });
 
 test('a lapse in the queue: a bet behind a held check, its expiry two seconds past the chain\'s time, reaches its turn after the chain has moved past it, and is lapsed, BET_LAPSED, with no Cross', async () => {
+  // Both accounts funded first: a funding mines blocks, and on some nodes each block moves the chain's time on.
+  const [A1, A2] = [await freshAccount(), await freshAccount()];
   await hooks().arm('after-reservation');
-  const first = await betOn(await freshAccount(), ownMarket());
+  const first = await betOn(A1, ownMarket());
   const held = await hooks().reached('after-reservation');
-  const T = await rig.time();
-  const second = await betOn(await freshAccount(), ownMarket(), { expiry: T + 3n });
-  await rig.setNextBlockTime(T + 2n);
-  await rig.mine(1);
-  await hooks().go(held);
-  assert.equal((await judged(first.hash)).state, 'refused');
-  const record = await judged(second.hash);
-  const v = verdictOf(record);
-  assert.deepEqual({ state: record.state, code: v.code, cross: record.cross }, { state: 'lapsed', code: 'BET_LAPSED', cross: null });
+  let letGo = false;
+  try {
+    const T = await rig.time();
+    const second = await betOn(A2, ownMarket(), { expiry: T + 3n });
+    await rig.setNextBlockTime(T + 2n);
+    await rig.mine(1);
+    await hooks().go(held);
+    letGo = true;
+    assert.equal((await judged(first.hash)).state, 'refused');
+    const record = await judged(second.hash);
+    const v = verdictOf(record);
+    assert.deepEqual({ state: record.state, code: v.code, cross: record.cross }, { state: 'lapsed', code: 'BET_LAPSED', cross: null });
+  } finally {
+    // A failure before the hold is let go would leave the lane held for every case after this one.
+    if (!letGo) await hooks().go(held);
+  }
 });
 
 test('a cancel on chain between a quote\'s post and the bet: the quote is not listed, it is marked cancelled at the check\'s block, and the next page of its market does not list it', async () => {
