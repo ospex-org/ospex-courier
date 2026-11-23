@@ -240,7 +240,9 @@ is closed `not sent`.
   refusal of a maker's coin among them. A reason the courier does not know is `COURIER_FAULT`, with an incident line.
 - `CROSS_TOO_LARGE`'s second form claims no maximum: the search tries at most six prefixes, and gas is not proved to
   grow with legs.
-- `stopped` with no verdict is a stop that came while the bet waited: `ended` says so (part 4).
+- `stopped` with no verdict is a stop that came while the bet waited, or one that came while it was held and whose
+  check has not ended yet: `ended` says so (part 4).
+- A bet stopped while it is held is `stopped` with no verdict until its check ends; then its verdict is `STOPPED`.
 - `SENDER_NOT_BUILT` is the reason of this build only; the sender's build removes it.
 - Where the node takes no state override, the comparison of the courier's own working with the contract is skipped,
   and the Cross's figures say so.
