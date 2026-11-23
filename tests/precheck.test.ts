@@ -704,7 +704,12 @@ test('the gas: a fit found. With the ceiling set so forty legs do not fit and a 
   const whole = await judged((await betOn(await freshAccount(), market, { oddsTick: 200, riskAmount: 4_000n })).hash);
   assert.equal(legsOf(whole).length, 40, JSON.stringify(whole));
   const wholeLimit = BigInt((whole.cross as { gas: { limit: string } }).gas.limit);
-  await hooks().fault({ transactionGasCap: wholeLimit - 1n });
+  // The ceiling half a leg's gas under the forty legs' limit: another bet's calldata (its signature, its fields) has
+  // other zero bytes, so its forty-leg estimate is not this one's to the unit, and a ceiling one gas under would let
+  // a slightly cheaper forty legs fit. An eightieth of the limit, about half a leg's share of it, keeps forty over the
+  // ceiling and a shorter prefix under it.
+  const cap = wholeLimit - wholeLimit / 80n;
+  await hooks().fault({ transactionGasCap: cap });
   try {
     const B = await freshAccount();
     const { record, requests } = await countedCheck(() => betOn(B, market, { oddsTick: 200, riskAmount: 4_000n }));
@@ -713,7 +718,7 @@ test('the gas: a fit found. With the ceiling set so forty legs do not fit and a 
     assert.ok(legs >= 1 && legs < 40, `a shorter prefix: ${legs}`);
     const gas = (record.cross as { gas: { estimate: string; limit: string } }).gas;
     assert.equal(BigInt(gas.limit), BigInt(gas.estimate) + BigInt(gas.estimate) / 5n, 'the limit is the estimate and a fifth: never cut');
-    assert.ok(BigInt(gas.limit) <= wholeLimit - 1n);
+    assert.ok(BigInt(gas.limit) <= cap);
     const { rows } = await pool.query<{ checked: { gas: { trim: { estimates: number; steps: unknown[] } } } }>('SELECT checked FROM crosses WHERE bet_hash = $1', [String(record.orderHash).toLowerCase()]);
     const trim = rows[0]?.checked.gas.trim;
     assert.ok(trim !== undefined && trim.estimates >= 1 && trim.estimates <= 6 && trim.steps.length === trim.estimates, JSON.stringify(trim));

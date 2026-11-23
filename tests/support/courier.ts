@@ -72,7 +72,8 @@ async function launch(entry: string, env: CourierEnv & { COURIER_TEST_HOLDS?: st
     env: { PATH: process.env.PATH, SYSTEMROOT: process.env.SYSTEMROOT, PORT: '0', ...env },
     stdio: ipc ? ['ignore', 'pipe', 'pipe', 'ipc'] : ['ignore', 'pipe', 'pipe'],
   });
-  const hooks = ipc ? control(child) : null;
+  const lines: string[] = [];
+  const hooks = ipc ? control(child, () => lines) : null;
   // The courier never outlives the test process; the listener leaves with the child, so a file that starts many
   // couriers does not pile listeners on the process.
   const onExit = () => {
@@ -80,7 +81,6 @@ async function launch(entry: string, env: CourierEnv & { COURIER_TEST_HOLDS?: st
   };
   process.once('exit', onExit);
   child.once('exit', () => process.off('exit', onExit));
-  const lines: string[] = [];
   let buffer = '';
   const onData = (chunk: Buffer) => {
     buffer += chunk.toString('utf8');
@@ -125,16 +125,26 @@ async function launch(entry: string, env: CourierEnv & { COURIER_TEST_HOLDS?: st
 }
 
 /** The test's end of the hooks' channel. */
-function control(child: ChildProcess): HookControl {
+function control(child: ChildProcess, lines: () => readonly string[]): HookControl {
   let id = 0;
-  const acks = new Map<number, () => void>();
+  const acks = new Map<number, { resolve: () => void; reject: (err: Error) => void }>();
   const helds: Held[] = [];
-  const waiters: Array<{ point: HoldPoint | undefined; resolve: (h: Held) => void }> = [];
+  const waiters: Array<{ point: HoldPoint | undefined; resolve: (h: Held) => void; reject: (err: Error) => void }> = [];
   const observed: HookControl['observed'] = [];
+  // A courier that exits while the test waits on it fails the wait at once, saying how it exited and its last lines:
+  // a hold it can no longer reach, or an acknowledgement it can no longer send, is never waited for.
+  let gone: Error | null = null;
+  child.once('exit', (code, signal) => {
+    const err = new Error(`the courier exited (${signal ?? code}) while the test waited on it; its last lines: ${lines().slice(-8).join(' | ')}`);
+    gone = err;
+    for (const w of waiters.splice(0)) w.reject(err);
+    for (const a of acks.values()) a.reject(err);
+    acks.clear();
+  });
   child.on('message', (raw: unknown) => {
     const m = raw as { type: string; id?: number; held?: number; point?: HoldPoint; bet?: Hex | null; what?: 'candidates' | 'walk input'; hashes?: string[] };
     if (m.type === 'ack' && m.id !== undefined) {
-      acks.get(m.id)?.();
+      acks.get(m.id)?.resolve();
       acks.delete(m.id);
     } else if (m.type === 'held') {
       const h: Held = { held: m.held as number, point: m.point as HoldPoint, bet: m.bet ?? null };
@@ -147,10 +157,14 @@ function control(child: ChildProcess): HookControl {
   });
   const ask = (m: Record<string, unknown>) =>
     new Promise<void>((resolve, reject) => {
+      if (gone !== null) return reject(gone);
       const n = ++id;
-      acks.set(n, resolve);
+      acks.set(n, { resolve, reject });
       child.send({ ...m, id: n }, (err) => {
-        if (err !== null) reject(err);
+        if (err !== null) {
+          acks.delete(n);
+          reject(err);
+        }
       });
     });
   return {
@@ -159,7 +173,8 @@ function control(child: ChildProcess): HookControl {
     reached(point) {
       const i = helds.findIndex((h) => point === undefined || h.point === point);
       if (i >= 0) return Promise.resolve(helds.splice(i, 1)[0] as Held);
-      return new Promise<Held>((resolve) => waiters.push({ point, resolve }));
+      if (gone !== null) return Promise.reject(gone);
+      return new Promise<Held>((resolve, reject) => waiters.push({ point, resolve, reject }));
     },
     go: (held) => ask({ type: 'go', held: held.held }),
     fault: (f) =>
