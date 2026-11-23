@@ -4,6 +4,7 @@ import type { Lane } from '../check/lane';
 import type { BettingSet } from '../chain/set';
 import type { ChainReader } from '../chain/snapshot';
 import { BOUNDS, CHAIN_LIMITS, TIMEOUTS, type AddressLimiter, type Counters } from '../http/limits';
+import { laneNow } from '../records/lanes';
 import type { Store } from '../records/store';
 import type { Run } from '../records/runs';
 
@@ -24,7 +25,7 @@ export interface StatusDeps {
   chain: ChainReader;
   set: BettingSet;
   node: NodeCheck;
-  /** The lane this process owns: the key's address, its epoch, and whether this process still takes bets. */
+  /** This process's lane: the key's address, the epoch it took, and whether it has stopped taking bets. */
   lane: Lane;
   run: Run;
   counters: Counters;
@@ -54,14 +55,16 @@ export async function status(deps: StatusDeps): Promise<Record<string, unknown>>
   let run;
   let maintenance;
   let growth;
+  let lane;
   try {
-    [conditions, newestReportLine, databaseSize, run, maintenance, growth] = await Promise.all([
+    [conditions, newestReportLine, databaseSize, run, maintenance, growth, lane] = await Promise.all([
       deps.store.conditions.open_(),
       deps.store.newestReportLine(),
       deps.store.databaseSize(),
       deps.store.runs.get(deps.run.id),
       deps.store.maintenance(),
       deps.store.growth(),
+      laneNow(deps.store.pool, deps.lane.key),
     ]);
   } catch (err) {
     throw new DatabaseUnreadable(err);
@@ -102,7 +105,13 @@ export async function status(deps: StatusDeps): Promise<Record<string, unknown>>
     sender: {
       relay: set.sender,
       key: deps.lane.key,
-      lane: { ownerRun: deps.run.id, epoch: deps.lane.epoch()?.toString() ?? null, takingBets: deps.lane.takingBets() },
+      // The lane as its row stands, not as this process last knew it: a later start's take makes another run the
+      // owner. This process takes bets where the lane's epoch is the one it took and it has not stopped: check 17's rule.
+      lane: {
+        ownerRun: lane?.ownerRun ?? null,
+        epoch: lane?.epoch.toString() ?? null,
+        takingBets: lane !== null && deps.lane.epoch() === lane.epoch && deps.lane.takingBets(),
+      },
     },
     node: deps.node,
     bounds: BOUNDS,

@@ -66,6 +66,27 @@ interface Reserved {
   reservation: bigint;
 }
 
+/** What the guard below does with a lane connection's error: nothing; the step's own statement fails with it. */
+const heardByTheStep = () => undefined;
+
+/**
+ * A lane connection, checked out for one transaction. While a connection is out of its pool nothing listens to it,
+ * and one the database drops raises its error on nobody, which would end the process, quotes and all. So it is
+ * listened to while it is out. The statement in flight fails with the same error, as does the next one sent, and
+ * that failure is what stops this process taking bets. `done` gives it back; the pool drops it if it is broken.
+ */
+async function laneClient(pool: pg.Pool): Promise<{ client: pg.PoolClient; done: () => void }> {
+  const client = await pool.connect();
+  client.on('error', heardByTheStep);
+  return {
+    client,
+    done: () => {
+      client.removeListener('error', heardByTheStep);
+      client.release();
+    },
+  };
+}
+
 export function createLane(deps: LaneDeps): Lane {
   const { store, key, run, hooks } = deps;
   let epoch: bigint | null = null;
@@ -84,7 +105,7 @@ export function createLane(deps: LaneDeps): Lane {
   /** One reservation: the bet it took and the reservation, null where the queue is empty, or 'stop' where this process no longer owns the lane. At most 33 attempts. */
   async function reserveOne(): Promise<Reserved | null | 'stop'> {
     for (let attempt = 1; attempt <= 33; attempt++) {
-      const client = await store.lane.connect();
+      const { client, done } = await laneClient(store.lane);
       try {
         await client.query('BEGIN');
         const lane = await lockLane(client, key);
@@ -113,7 +134,7 @@ export function createLane(deps: LaneDeps): Lane {
         await client.query('ROLLBACK').catch(() => undefined);
         throw err;
       } finally {
-        client.release();
+        done();
       }
     }
     return null;
@@ -139,7 +160,7 @@ export function createLane(deps: LaneDeps): Lane {
 
   /** The outcome, in one transaction under the lane's guards. 'lost' where this process no longer holds the lane or the reservation: nothing is written. */
   async function writeOutcome(res: Reserved, outcome: CheckOutcome): Promise<'written' | 'lost'> {
-    const client = await store.lane.connect();
+    const { client, done } = await laneClient(store.lane);
     try {
       await client.query('BEGIN');
       const lane = await lockLane(client, key);
@@ -182,7 +203,7 @@ export function createLane(deps: LaneDeps): Lane {
       await client.query('ROLLBACK').catch(() => undefined);
       throw err;
     } finally {
-      client.release();
+      done();
     }
   }
 
@@ -202,7 +223,10 @@ export function createLane(deps: LaneDeps): Lane {
         await hooks.at('after-reservation', r.bet.hash);
         const outcome = await checked(r.bet);
         await hooks.at('before-result', r.bet.hash);
-        if ((await writeOutcome(r, outcome)) === 'lost') break;
+        if ((await writeOutcome(r, outcome)) === 'lost') {
+          deps.log('lane: the outcome of a bet was not written: this process no longer holds its lane or its reservation');
+          break;
+        }
       }
     } catch (err) {
       failStop(err, 'a lane step');
@@ -217,7 +241,7 @@ export function createLane(deps: LaneDeps): Lane {
     takingBets: () => epoch !== null && !stopped,
     running: () => running,
     async take(runFacts) {
-      const client = await store.lane.connect();
+      const { client, done } = await laneClient(store.lane);
       try {
         await client.query('BEGIN');
         const taken = await take(client, key, run.id);
@@ -238,7 +262,7 @@ export function createLane(deps: LaneDeps): Lane {
         await client.query('ROLLBACK').catch(() => undefined);
         throw err;
       } finally {
-        client.release();
+        done();
       }
     },
     async admits(client) {

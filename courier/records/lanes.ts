@@ -68,6 +68,14 @@ export async function lockLane(on: Client, key: Address): Promise<{ epoch: bigin
   return { epoch: BigInt(r.epoch), reservation: r.reservation === null ? null : BigInt(r.reservation), heldBet: r.held_bet, openCross: r.open_cross };
 }
 
+/** The lane's row as it stands, for the status: the run that owns it and its epoch, read with no lock, or null where the lane has no row. */
+export async function laneNow(on: Client, key: Address): Promise<{ ownerRun: number | null; epoch: bigint } | null> {
+  const { rows } = await on.query<{ owner_run: string | null; epoch: string }>('SELECT owner_run::text AS owner_run, epoch::text AS epoch FROM lanes WHERE sender = $1', [key.toLowerCase()]);
+  const r = rows[0];
+  if (r === undefined) return null;
+  return { ownerRun: r.owner_run === null ? null : Number(r.owner_run), epoch: BigInt(r.epoch) };
+}
+
 /** Check 17's read, in the door's transaction: the lane's epoch under a share lock, or null where the lane has no row. */
 export async function shareLane(on: Client, key: Address): Promise<bigint | null> {
   const { rows } = await on.query<{ epoch: string }>('SELECT epoch::text AS epoch FROM lanes WHERE sender = $1 FOR SHARE', [key.toLowerCase()]);
