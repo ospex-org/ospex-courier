@@ -20,7 +20,7 @@ export interface LaneHooks {
   /** A fault: this quote taken as live by the walk whatever the reads say of it. */
   listAsLive?: (quote: Hex) => boolean;
   /** A lower ceiling on one transaction's gas than the chain's own, for a test of the search for a shorter fill. */
-  transactionGasCap?: bigint;
+  transactionGasCap?: bigint | undefined;
   /** Told what the check saw at the boundary between the candidates and the listing: the candidate statement's rows, and the walk's input, by hash. */
   observe?: (what: 'candidates' | 'walk input', hashes: Hex[]) => void;
 }

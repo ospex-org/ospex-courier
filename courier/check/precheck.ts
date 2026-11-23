@@ -502,15 +502,16 @@ async function exactCall(ctx: RoundContext, listed: ListedLeg[], skipped: Set<st
     g = searched.gas;
     limit = g + g / 5n;
     trim = searched.trim;
-    // The chosen prefix is run exactly: its simulation, its comparison, and its call at the limit.
+    // The chosen prefix is run exactly, as a whole list is: its simulation, its comparison, and its call at the limit.
+    // Its simulation's refusal is the plain one: the search found it to fit, and the exact run refuses it.
     const prefixData = crossData(bet, chosen);
     const prefixPredicted = prediction(ctx, chosen);
     const sim2 = await exact(deps, H, prefixData);
     if (!sim2.ok) {
-      if ('outOfGas' in sim2) return refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT(n, reasonText({ kind: 'empty' })), { reason: 'none', trimmedTo: chosen.length }, ctx.incidents);
+      if ('outOfGas' in sim2) return refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT(n, reasonText({ kind: 'empty' })), { reason: 'none' }, ctx.incidents);
       const d = decodeRevert(sim2.data);
       if (d.kind === 'unknown') return fault(ctx, 'UNKNOWN_REVERT', { selector: d.selector, at: 'simulation of the chosen prefix' });
-      return refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT_TRIMMED(n, String(chosen.length), reasonText(d)), { reason: d.kind === 'named' ? d.name : 'none', trimmedTo: chosen.length }, ctx.incidents);
+      return refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT(n, reasonText(d)), { reason: d.kind === 'named' ? d.name : 'none', ...(d.kind === 'named' ? { args: d.args } : {}) }, ctx.incidents);
     }
     if (deps.overrideTaken) {
       const compared = await compare(ctx, chosen, prefixData, prefixPredicted);
