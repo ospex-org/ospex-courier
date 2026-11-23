@@ -1,13 +1,16 @@
-import { isAddress, type Address } from 'viem';
+import { getAddress, isAddress, type Address } from 'viem';
 
 // The courier's settings, read from the environment. Every problem is listed
 // at once, and no value is ever echoed: a problem names the setting and what
 // is wrong with it.
 //
-// This is the first build's list: the database, the node, where the set is,
-// the low-wallet mark and the port. The key's three settings
-// (COURIER_KEYSTORE_JSON, COURIER_KEYSTORE_PASSWORD, COURIER_ADDRESS) arrive
-// with the sender, which is the build that first holds a key.
+// The list: the database, the node, where the set is, the key's address, the
+// low-wallet mark and the port. COURIER_ADDRESS is the address of the key the
+// courier sends from: an address, not a secret. The bet's check is made from
+// it, its lane is named by it, and the relay's sender is held to it at every
+// check, so it is required, and never taken from the chain. The key itself
+// (COURIER_KEYSTORE_JSON, COURIER_KEYSTORE_PASSWORD) arrives with the sender,
+// which is the build that first holds one.
 
 export interface CourierConfig {
   /** The courier's own Postgres. */
@@ -17,6 +20,8 @@ export interface CourierConfig {
   /** The signpost, and the betting entry's number on it: where the set is. */
   signpostAddress: Address;
   bettingEntryId: bigint;
+  /** The address of the key the courier sends from: its lane's name, the sender of the bet's check, and what the relay's sender must be. */
+  courierAddress: Address;
   /** Under this many POL the key's wallet is reported low. 3 unless set. */
   lowPol: number;
   port: number;
@@ -78,6 +83,10 @@ export function readCourierConfig(env: Record<string, string | undefined>): Conf
   if (signpostAddress === '') problems.push('SIGNPOST_ADDRESS is not set');
   else if (!isAddress(signpostAddress)) problems.push('SIGNPOST_ADDRESS is not an address');
 
+  const courierAddress = get('COURIER_ADDRESS');
+  if (courierAddress === '') problems.push('COURIER_ADDRESS is not set');
+  else if (!isAddress(courierAddress)) problems.push('COURIER_ADDRESS is not an address');
+
   const entryText = get('BETTING_ENTRY_ID');
   if (entryText === '') problems.push('BETTING_ENTRY_ID is not set');
   else if (!/^[0-9]{1,18}$/.test(entryText)) problems.push('BETTING_ENTRY_ID must be a whole number: the betting entry\'s place on the signpost');
@@ -106,6 +115,7 @@ export function readCourierConfig(env: Record<string, string | undefined>): Conf
       rpcUrl,
       signpostAddress: signpostAddress as Address,
       bettingEntryId: BigInt(entryText),
+      courierAddress: getAddress(courierAddress),
       lowPol,
       port,
       ...(databaseCaFile === '' ? {} : { databaseCaFile }),

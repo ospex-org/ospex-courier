@@ -1,5 +1,6 @@
 import type { Address } from 'viem';
 import type { NodeCheck } from '../chain/node';
+import type { Lane } from '../check/lane';
 import type { BettingSet } from '../chain/set';
 import type { ChainReader } from '../chain/snapshot';
 import { BOUNDS, CHAIN_LIMITS, TIMEOUTS, type AddressLimiter, type Counters } from '../http/limits';
@@ -23,6 +24,8 @@ export interface StatusDeps {
   chain: ChainReader;
   set: BettingSet;
   node: NodeCheck;
+  /** The lane this process owns: the key's address, its epoch, and whether this process still takes bets. */
+  lane: Lane;
   run: Run;
   counters: Counters;
   /** The limit kept in memory: each address's minute, for every request but a stop. */
@@ -96,7 +99,11 @@ export async function status(deps: StatusDeps): Promise<Record<string, unknown>>
       timelock: set.timelock,
       readAt: { number: set.readAt.number.toString(), hash: set.readAt.hash },
     },
-    sender: { relay: set.sender, key: null },
+    sender: {
+      relay: set.sender,
+      key: deps.lane.key,
+      lane: { ownerRun: deps.run.id, epoch: deps.lane.epoch()?.toString() ?? null, takingBets: deps.lane.takingBets() },
+    },
     node: deps.node,
     bounds: BOUNDS,
     /** What the chain itself allows, pinned from its client's source: the most gas one transaction may carry. */

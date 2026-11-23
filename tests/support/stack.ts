@@ -27,7 +27,7 @@ export interface Stack {
   relayedUrl: string;
   dbRelay: TcpRelay;
   courier: CourierProcess;
-  env: { DATABASE_URL: string; POLYGON_RPC_URL: string; SIGNPOST_ADDRESS: string; BETTING_ENTRY_ID: string; PUBLISHED_REPORTERS_FILE: string };
+  env: { DATABASE_URL: string; POLYGON_RPC_URL: string; SIGNPOST_ADDRESS: string; BETTING_ENTRY_ID: string; PUBLISHED_REPORTERS_FILE: string; COURIER_ADDRESS: string };
   /** A published list naming the rig's reporter: what the courier under test is given. */
   publishedListFile: string;
   close(): Promise<void>;
@@ -58,6 +58,8 @@ export async function startStack(prefix: string): Promise<Stack> {
     SIGNPOST_ADDRESS: rig.addresses.signpost,
     BETTING_ENTRY_ID: rig.bettingEntryId.toString(),
     PUBLISHED_REPORTERS_FILE: publishedListFile,
+    // The key's address: the relay's sender on the rig, account 4, which this build holds no key for.
+    COURIER_ADDRESS: rig.accounts.sender.address,
   };
   let courier: CourierProcess;
   try {

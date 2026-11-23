@@ -289,7 +289,7 @@ export interface MulticallResult {
  * prove the node ran the call on that block; it catches a node that ignored
  * the hash and answered at its head.
  */
-export async function multicallAt(rpc: JsonRpc, header: Header, calls: Array<{ target: Address; callData: Hex; allowFailure?: boolean }>): Promise<MulticallResult[]> {
+export async function multicallAt(rpc: JsonRpc, header: Header, calls: Array<{ target: Address; callData: Hex; allowFailure?: boolean }>, override?: StateOverride): Promise<MulticallResult[]> {
   const probes = [
     { target: MULTICALL_ADDRESS, allowFailure: false, callData: encodeFunctionData({ abi: MULTICALL_ABI, functionName: 'getBlockNumber' }) },
     { target: MULTICALL_ADDRESS, allowFailure: false, callData: encodeFunctionData({ abi: MULTICALL_ABI, functionName: 'getCurrentBlockTimestamp' }) },
@@ -300,7 +300,7 @@ export async function multicallAt(rpc: JsonRpc, header: Header, calls: Array<{ t
     functionName: 'aggregate3',
     args: [[...probes, ...calls.map((c) => ({ target: c.target, allowFailure: c.allowFailure ?? false, callData: c.callData }))]],
   });
-  const out = await callAt(rpc, { to: MULTICALL_ADDRESS, data }, byHash(header.hash));
+  const out = await callAt(rpc, { to: MULTICALL_ADDRESS, data }, byHash(header.hash), override);
   const results = decoded('the multicall envelope', () => decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', data: out }) as readonly MulticallResult[]);
   if (results.length !== probes.length + calls.length) throw new NodeFailure('malformed', 'eth_call', null, 'the multicall answered the wrong number of results');
   // A result marked failed where the call allowed no failure is an answer the read cannot use, whatever its bytes

@@ -21,6 +21,7 @@ export interface CourierEnv {
   POLYGON_RPC_URL: string;
   SIGNPOST_ADDRESS: string;
   BETTING_ENTRY_ID: string;
+  COURIER_ADDRESS: string;
   PORT?: string;
   COURIER_LOW_POL?: string;
   PUBLISHED_REPORTERS_FILE?: string;

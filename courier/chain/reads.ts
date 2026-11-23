@@ -1,5 +1,5 @@
 import { decodeFunctionResult, encodeFunctionData, getAddress, type Address, type Hex } from 'viem';
-import { COIN_ABI, GAMES_ABI, MATCHING_ABI } from './abi';
+import { COIN_ABI, GAMES_ABI, MARKETS_ABI, MATCHING_ABI, MULTICALL_ABI, MULTICALL_ADDRESS, POSITIONS_ABI, RELAY_ABI } from './abi';
 import { splitNonce, type OrderFields } from '../orders/order';
 import { decoded, NodeFailure, type Header, type MulticallResult } from './rpc';
 import type { BettingSet } from './set';
@@ -85,9 +85,15 @@ function grantOf(data: Hex): GrantRead {
  * call's argument is another call's answer.
  */
 export async function readForDoor(chain: ChainReader, set: BettingSet, header: Header, order: OrderFields, hash: Hex, marketKey: Hex): Promise<DoorRead> {
+  const calls = doorCalls(set, order, hash, marketKey);
+  return chain.read(header, calls, (answered) => decodeDoor(header, order, exactly(answered, calls.length)));
+}
+
+/** The door's calls for one order, in the door's order; the bet's check makes the same ones first. */
+function doorCalls(set: BettingSet, order: OrderFields, hash: Hex, marketKey: Hex) {
   const nonce = splitNonce(order.nonce);
   const underGrant = nonce.grantNumber !== 0;
-  const calls = [
+  return [
     { target: set.matching, callData: m('isCourier', [order.account, set.relay]) },
     { target: set.matching, callData: m('getOrderHash', [order]) },
     { target: set.matching, callData: m('s_cancelledOrders', [hash]) },
@@ -108,8 +114,12 @@ export async function readForDoor(chain: ChainReader, set: BettingSet, header: H
         ]
       : []),
   ];
-  return chain.read(header, calls, (answered) => {
-    const results = exactly(answered, calls.length);
+}
+
+/** The door's read decoded from its calls' results, in the order `doorCalls` makes them. */
+function decodeDoor(header: Header, order: OrderFields, results: MulticallResult[]): DoorRead {
+  const underGrant = splitNonce(order.nonce).grantNumber !== 0;
+  {
     const [registered, contractHash, cancelled, version, floor, filled, cap, lifted, status, start, window, reporters] = results as [
       MulticallResult, MulticallResult, MulticallResult, MulticallResult, MulticallResult, MulticallResult, MulticallResult, MulticallResult,
       MulticallResult, MulticallResult, MulticallResult, MulticallResult,
@@ -138,6 +148,104 @@ export async function readForDoor(chain: ChainReader, set: BettingSet, header: H
         reporters: known && reporters.success ? dg<readonly [readonly Address[], readonly number[]]>('getGameReporters', reporters.returnData)[0].map((a) => getAddress(a)) : null,
       },
     };
+  }
+}
+
+/** What the bet's check reads at H, beyond the door's read: read A. */
+export interface BetRead extends DoorRead {
+  /** The relay's sender, and the matching contract it passes to. */
+  relaySender: Address;
+  relayMatching: Address;
+  /** The market's id, 0 where no market is drawn on the three fields; and the count of markets drawn. */
+  marketId: bigint;
+  marketCount: bigint;
+  /** The bettor's balance, and its allowance to the positions contract. */
+  balance: bigint;
+  allowance: bigint;
+  /** The key's POL, and the coin held by the key and by the relay: recorded with the result, deciding nothing. */
+  keyPol: bigint;
+  keyCoin: bigint;
+  relayCoin: bigint;
+}
+
+const mk = (functionName: string, args: readonly unknown[] = []) => encodeFunctionData({ abi: MARKETS_ABI, functionName, args } as never);
+const mc = (functionName: string, args: readonly unknown[] = []) => encodeFunctionData({ abi: MULTICALL_ABI, functionName, args } as never);
+const rl = (functionName: string, args: readonly unknown[] = []) => encodeFunctionData({ abi: RELAY_ABI, functionName, args } as never);
+const pc = (functionName: string, args: readonly unknown[] = []) => encodeFunctionData({ abi: POSITIONS_ABI, functionName, args } as never);
+const dmk = <T>(functionName: string, data: Hex) => decoded(functionName, () => decodeFunctionResult({ abi: MARKETS_ABI, functionName, data } as never) as T);
+const dmc = <T>(functionName: string, data: Hex) => decoded(functionName, () => decodeFunctionResult({ abi: MULTICALL_ABI, functionName, data } as never) as T);
+const drl = <T>(functionName: string, data: Hex) => decoded(functionName, () => decodeFunctionResult({ abi: RELAY_ABI, functionName, data } as never) as T);
+const dp = <T>(functionName: string, data: Hex) => decoded(functionName, () => decodeFunctionResult({ abi: POSITIONS_ABI, functionName, data } as never) as T);
+
+/**
+ * Read A: one call at H, every argument known from the bet. The door's read (the cap and its switch; the bet's hash
+ * as the contract computes it, its cancel and its fill; its account's registration, version and floor; its grant's
+ * record and line; the game's four reads), then the relay's sender and the matching contract it passes to; the
+ * market's id on the bet's three fields, and the count of markets; the bettor's balance and allowance; the key's
+ * POL and coin, and the relay's coin.
+ */
+export async function readForBet(chain: ChainReader, set: BettingSet, header: Header, order: OrderFields, hash: Hex, marketKey: Hex, courier: Address): Promise<BetRead> {
+  const door = doorCalls(set, order, hash, marketKey);
+  const calls = [
+    ...door,
+    { target: set.relay, callData: rl('s_sender') },
+    { target: set.relay, callData: rl('i_matching') },
+    { target: set.markets, callData: mk('getMarketId', [order.gameId, order.scorer, order.lineTicks]) },
+    { target: set.markets, callData: mk('s_marketCount') },
+    { target: set.coin, callData: c('balanceOf', [order.account]) },
+    { target: set.coin, callData: c('allowance', [order.account, set.positions]) },
+    { target: MULTICALL_ADDRESS, callData: mc('getEthBalance', [courier]) },
+    { target: set.coin, callData: c('balanceOf', [courier]) },
+    { target: set.coin, callData: c('balanceOf', [set.relay]) },
+  ];
+  return chain.read(header, calls, (answered) => {
+    const results = exactly(answered, calls.length);
+    const at = (i: number) => (results[door.length + i] as MulticallResult).returnData;
+    return {
+      ...decodeDoor(header, order, results.slice(0, door.length)),
+      relaySender: getAddress(drl<Address>('s_sender', at(0))),
+      relayMatching: getAddress(drl<Address>('i_matching', at(1))),
+      marketId: BigInt(dmk<bigint>('getMarketId', at(2))),
+      marketCount: BigInt(dmk<bigint>('s_marketCount', at(3))),
+      balance: dc<bigint>('balanceOf', at(4)),
+      allowance: dc<bigint>('allowance', at(5)),
+      keyPol: dmc<bigint>('getEthBalance', at(6)),
+      keyCoin: dc<bigint>('balanceOf', at(7)),
+      relayCoin: dc<bigint>('balanceOf', at(8)),
+    };
+  });
+}
+
+/** One account's two records on a market and what is held for it. */
+export interface PositionRead {
+  riskA: bigint;
+  profitA: bigint;
+  riskB: bigint;
+  profitB: bigint;
+  held: bigint;
+}
+
+/** Read C: the market's record, and for each account its two records and what is held for it, at H. Only where the market is drawn. */
+export async function readPositions(chain: ChainReader, set: BettingSet, header: Header, marketId: bigint, accounts: readonly Address[]): Promise<{ open: boolean; positions: Map<string, PositionRead> }> {
+  const calls = [
+    { target: set.markets, callData: mk('getMarket', [marketId]) },
+    ...accounts.flatMap((a) => [
+      { target: set.positions, callData: pc('getPosition', [marketId, a, 0]) },
+      { target: set.positions, callData: pc('getPosition', [marketId, a, 1]) },
+      { target: set.positions, callData: pc('s_held', [marketId, a]) },
+    ]),
+  ];
+  return chain.read(header, calls, (answered) => {
+    const results = exactly(answered, calls.length);
+    const at = (i: number) => (results[i] as MulticallResult).returnData;
+    const market = dmk<{ status: number }>('getMarket', at(0));
+    const positions = new Map<string, PositionRead>();
+    accounts.forEach((a, i) => {
+      const A = dp<{ risk: bigint; profit: bigint }>('getPosition', at(1 + 3 * i));
+      const B = dp<{ risk: bigint; profit: bigint }>('getPosition', at(2 + 3 * i));
+      positions.set(a.toLowerCase(), { riskA: A.risk, profitA: A.profit, riskB: B.risk, profitB: B.profit, held: dp<bigint>('s_held', at(3 + 3 * i)) });
+    });
+    return { open: Number(market.status) === 0, positions };
   });
 }
 
@@ -164,6 +272,8 @@ export interface QuotesRead {
   floors: Map<string, bigint>;
   /** The record of each grant the quotes' nonces name, for each (account, grant number) above zero; keyed by `grantKey`. */
   grants: Map<string, GrantRead>;
+  /** Where the read was asked about a line (the bet's check): whether each grant above names that line; keyed by `grantKey`. Empty otherwise. */
+  grantLines?: Map<string, boolean>;
 }
 
 /** The key a floor is held under in a read of quotes: the account and the version. */
@@ -183,7 +293,15 @@ export const grantKey = (account: Address, grantNumber: number): string => `${ac
  * a quote and five an account, whatever the records hold: a page's, not the
  * book's.
  */
-export async function readQuotes(chain: ChainReader, set: BettingSet, header: Header, marketKey: Hex, quotes: ReadonlyArray<{ hash: Hex; account: Address; nonce: bigint }>): Promise<QuotesRead> {
+export async function readQuotes(
+  chain: ChainReader,
+  set: BettingSet,
+  header: Header,
+  marketKey: Hex,
+  quotes: ReadonlyArray<{ hash: Hex; account: Address; nonce: bigint }>,
+  /** The bet's line, for the bet's check (read B): each grant above is also asked whether its list names it. */
+  line?: { gameId: bigint; scorer: Address; lineTicks: number },
+): Promise<QuotesRead> {
   const accounts = [...new Set(quotes.map((q) => getAddress(q.account)))];
   const floorsAsked = new Map<string, { account: Address; version: bigint }>();
   const grantsAsked = new Map<string, { account: Address; grantNumber: number }>();
@@ -206,11 +324,12 @@ export async function readQuotes(chain: ChainReader, set: BettingSet, header: He
     ]),
     ...[...floorsAsked.values()].map((f) => ({ target: set.matching, callData: m('s_floors', [f.account, f.version, marketKey]) })),
     ...[...grantsAsked.values()].map((gr) => ({ target: set.matching, callData: m('getGrant', [gr.account, gr.grantNumber]) })),
+    ...(line === undefined ? [] : [...grantsAsked.values()].map((gr) => ({ target: set.matching, callData: m('isGrantLine', [gr.account, gr.grantNumber, line.gameId, line.scorer, line.lineTicks]) }))),
   ];
-  if (calls.length === 0) return { quotes: new Map(), accounts: new Map(), floors: new Map(), grants: new Map() };
+  if (calls.length === 0) return { quotes: new Map(), accounts: new Map(), floors: new Map(), grants: new Map(), grantLines: new Map() };
   return chain.read(header, calls, (answered) => {
     const results = exactly(answered, calls.length);
-    const out: QuotesRead = { quotes: new Map(), accounts: new Map(), floors: new Map(), grants: new Map() };
+    const out: QuotesRead = { quotes: new Map(), accounts: new Map(), floors: new Map(), grants: new Map(), grantLines: new Map() };
     const at = (i: number) => (results[i] as MulticallResult).returnData;
     quotes.forEach((q, i) => {
       out.quotes.set(q.hash.toLowerCase(), {
@@ -232,6 +351,10 @@ export async function readQuotes(chain: ChainReader, set: BettingSet, header: He
     [...floorsAsked.keys()].forEach((key, i) => out.floors.set(key, BigInt(dm<bigint>('s_floors', at(floorsAt + i)))));
     const grantsAt = floorsAt + floorsAsked.size;
     [...grantsAsked.keys()].forEach((key, i) => out.grants.set(key, grantOf(at(grantsAt + i))));
+    if (line !== undefined) {
+      const linesAt = grantsAt + grantsAsked.size;
+      [...grantsAsked.keys()].forEach((key, i) => out.grantLines?.set(key, dm<boolean>('isGrantLine', at(linesAt + i))));
+    }
     return out;
   });
 }

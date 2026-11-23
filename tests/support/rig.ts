@@ -292,8 +292,9 @@ export async function startRig(): Promise<Rig> {
   };
   const gameId = await createGame();
 
-  // Enough blocks behind the head for a read 50 back.
-  await rpc('anvil_mine', ['0x3c']);
+  // Enough blocks behind the head for a read 50 back, a second apart, so the block 50 back has an earlier time than
+  // the head: the node check's timed call needs two blocks of two times.
+  await rpc('anvil_mine', ['0x3c', '0x1']);
 
   return {
     url,

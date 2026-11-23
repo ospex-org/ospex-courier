@@ -192,6 +192,146 @@ SELECT (SELECT count(*) FROM scanned)::int AS scanned,
           'recordNumber', l.record_number::text)), '[]'::json)
         FROM (SELECT * FROM live LIMIT $8::integer) l) AS rows`;
 
+/**
+ * The bet's candidate query, one statement: the book's scan with its mark (SCAN_SQL above), from the start of the
+ * other side, with three changes. The inner scan stops at the highest tick that meets the bet's, $3, so it returns
+ * only quotes whose price meets the bet's. The outer filter leaves out the bettor's own quotes, $7, and counts them
+ * apart. And the page is the bound of quotes a bet examines, $8. Unchanged: the bound of rows returned, $4; `ended
+ * IS NULL`; the order, tick then record number; the mark of quotes expired at the final block, F + 1 ($5), their
+ * rows locked first in the order of their hashes; and the live filter, expiry above T + 1 ($6). The rows carry the
+ * ten signed fields and the stored signature, which the check hashes again and recovers, and the statement's own
+ * time.
+ */
+export const CANDIDATES_SQL = `WITH scanned AS (
+  SELECT hash, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, record_number
+  FROM orders
+  WHERE role = 'rest' AND ended IS NULL AND market_key = $1::text AND side = $2::smallint AND odds_tick <= $3::integer
+  ORDER BY odds_tick, record_number
+  LIMIT $4::integer
+),
+held AS (
+  SELECT o.hash FROM orders o WHERE o.hash IN (SELECT s.hash FROM scanned s WHERE s.expiry <= $5::numeric) ORDER BY o.hash FOR NO KEY UPDATE
+),
+marked AS (
+  UPDATE orders SET ended = 'expired', ended_at = now()
+  WHERE hash IN (SELECT h.hash FROM held h) AND ended IS NULL
+  RETURNING hash
+),
+live AS (
+  SELECT hash, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, record_number
+  FROM scanned WHERE expiry > $6::numeric
+)
+SELECT (SELECT count(*) FROM scanned)::int AS scanned,
+       (SELECT count(*) FROM marked)::int AS marked,
+       (SELECT count(*) FROM live WHERE account = $7::text)::int AS own,
+       (SELECT count(*) FROM live WHERE account <> $7::text)::int AS others,
+       now() AS ran_at,
+       (SELECT coalesce(json_agg(json_build_object(
+          'hash', l.hash, 'account', l.account, 'gameId', l.game_id::text, 'scorer', l.scorer, 'lineTicks', l.line_ticks,
+          'positionType', l.position_type, 'oddsTick', l.odds_tick, 'riskAmount', l.risk_amount::text, 'nonce', l.nonce::text,
+          'expiry', l.expiry::text, 'minFill', l.min_fill::text, 'signature', l.signature, 'recordNumber', l.record_number::text)
+          ORDER BY l.odds_tick, l.record_number), '[]'::json)
+        FROM (SELECT v.* FROM live v WHERE v.account <> $7::text ORDER BY v.odds_tick, v.record_number LIMIT $8::integer) l) AS rows`;
+
+/** One candidate as the query returns it: the ten fields, the stored signature, the hash it is kept under and its record number. */
+export interface CandidateRow {
+  hash: Hex;
+  order: OrderFields;
+  signature: Hex;
+  recordNumber: number;
+}
+
+export interface CandidatesResult {
+  /** Rows the inner scan returned, at most the bound. */
+  scanned: number;
+  /** Rows this statement marked expired at the final block. */
+  marked: number;
+  /** Live rows that are the bettor's own, counted apart. */
+  own: number;
+  /** Live rows that are not the bettor's, among those returned. */
+  others: number;
+  /** The first `page` of those, in the published order. */
+  rows: CandidateRow[];
+  /** The database's time when the statement ran. */
+  ranAt: Date;
+}
+
+/** The highest tick whose price meets a bet's at tick b: (r − 100)(b − 100) ≤ 10,000, so r ≤ 100 + ⌊10,000 ÷ (b − 100)⌋. */
+export function highestMeetingTick(betTick: number): number {
+  return 100 + Math.floor(10_000 / (betTick - 100));
+}
+
+export interface CandidatesArgs {
+  marketKey: Hex;
+  /** The side of the quotes: the other side from the bet's. */
+  side: 0 | 1;
+  betTick: number;
+  bettor: Address;
+  /** H's time, T: a quote whose expiry is at or under T + 1 is not live. */
+  blockTime: bigint;
+  /** F's time: a quote whose expiry is at or under F + 1 is marked. */
+  finalTime: bigint;
+  bound?: number;
+  page?: number;
+}
+
+export function candidatesParams(a: CandidatesArgs): unknown[] {
+  return [
+    a.marketKey.toLowerCase(),
+    a.side,
+    highestMeetingTick(a.betTick),
+    a.bound ?? BOUNDS.scanRows,
+    (a.finalTime + 1n).toString(),
+    (a.blockTime + 1n).toString(),
+    a.bettor.toLowerCase(),
+    a.page ?? BOUNDS.quotesExamined,
+  ];
+}
+
+/** The candidate query, run as one statement on the connection given. */
+export async function candidates(on: Writer, a: CandidatesArgs): Promise<CandidatesResult> {
+  const { rows } = await on.query<{ scanned: number; marked: number; own: number; others: number; ran_at: Date; rows: Array<Record<string, unknown>> }>(CANDIDATES_SQL, candidatesParams(a));
+  const r = rows[0];
+  if (r === undefined) throw new Error('the candidate query returned no summary row');
+  return {
+    scanned: r.scanned,
+    marked: r.marked,
+    own: r.own,
+    others: r.others,
+    ranAt: r.ran_at,
+    rows: r.rows.map((q) => ({
+      hash: q.hash as Hex,
+      signature: q.signature as Hex,
+      recordNumber: Number(q.recordNumber),
+      order: {
+        account: q.account as Address,
+        gameId: BigInt(q.gameId as string),
+        scorer: q.scorer as Address,
+        lineTicks: Number(q.lineTicks),
+        positionType: Number(q.positionType) as 0 | 1,
+        oddsTick: Number(q.oddsTick),
+        riskAmount: BigInt(q.riskAmount as string),
+        nonce: BigInt(q.nonce as string),
+        expiry: BigInt(q.expiry as string),
+        minFill: BigInt(q.minFill as string),
+      },
+    })),
+  };
+}
+
+/**
+ * The first waiting bet by record number, along `orders_bets_waiting`, with no lock: the reservation's find, which
+ * returns the bet's row whole. The predicate is the index's, so the planner can take it.
+ */
+export async function firstWaitingBet(on: Writer): Promise<OrderRow | null> {
+  const { rows } = await on.query(
+    `SELECT ${ORDER_COLUMNS} FROM orders o
+     WHERE o.role = 'take' AND o.bet_state IN ('waiting', 'held') AND o.ended IS NULL AND o.bet_state = 'waiting'
+     ORDER BY o.record_number LIMIT 1`,
+  );
+  return rows.length === 0 ? null : toRow(rows[0] as Record<string, unknown>);
+}
+
 export interface ScanArgs {
   marketKey: Hex;
   side: 0 | 1;
