@@ -12,6 +12,7 @@ import { quoteEnd } from '../courier/orders/standing';
 import { stopHash, stopSigner, STOP_TYPES } from '../courier/orders/stop';
 import { openPool } from '../courier/records/store';
 import { get, startCourier } from './support/courier';
+import { holdTheLane } from './support/lanehold';
 import {
   cancelAll,
   cancelOnChain,
@@ -520,7 +521,11 @@ test("the order's standing on chain: cancelled is CANCELLED; a nonce under the a
   assert.equal(filled.body.code, 'FILLED', JSON.stringify(filled.body));
 });
 
-test('a bet: 202 queued, with no Cross; the cap before the lift refuses 10,100 with the sentence and takes 10,000; the expiry at most 30 seconds past the chain\'s time; two waiting bets an account; a quote is never capped; after the lift 10,100 is taken', async () => {
+test('a bet: 202 queued, with no Cross; the cap before the lift refuses 10,100 with the sentence and takes 10,000; the expiry at most 30 seconds past the chain\'s time; two waiting bets an account; a quote is never capped; after the lift 10,100 is taken', async (t) => {
+  // Set-up, since bets are checked: this case's bets wait their turn, as before. A set-up bet of an account of its
+  // own holds the lane until the case ends (tests/support/lanehold.ts).
+  const lane = await holdTheLane(stack, pool);
+  t.after(() => lane.release());
   const taker = rig.accounts.taker;
   const maker = rig.accounts.maker;
   let T = await rig.time();
@@ -1142,7 +1147,11 @@ test("a cancel of everything moves the account to a new version: a new order at 
   assert.deepEqual({ ended: stands.endedOnChain, cancelled: stands.markedCancelled }, { ended: 0, cancelled: 0 });
 });
 
-test("an agent's order at the door: signed by its grant's agent within the cap and the list it is admitted, listed under its account, and fills on chain; signed by the account's own key or by a stranger it is BAD_SIGNATURE; one lot over the cap is AGENT_STAKE_ABOVE_CAP, naming the cap; a line outside a grant's list is LINE_NOT_IN_GRANT, and any line passes a grant with no list; each refusal is before admission, and is the contract's own refusal of the same order", async () => {
+test("an agent's order at the door: signed by its grant's agent within the cap and the list it is admitted, listed under its account, and fills on chain; signed by the account's own key or by a stranger it is BAD_SIGNATURE; one lot over the cap is AGENT_STAKE_ABOVE_CAP, naming the cap; a line outside a grant's list is LINE_NOT_IN_GRANT, and any line passes a grant with no list; each refusal is before admission, and is the contract's own refusal of the same order", async (t) => {
+  // Set-up, since bets are checked: this case's bet waits its turn, as before. A set-up bet of an account of its own
+  // holds the lane until the case ends (tests/support/lanehold.ts).
+  const lane = await holdTheLane(stack, pool);
+  t.after(() => lane.release());
   const owner = rig.account(22);
   const listed = rig.account(23);
   const agent = rig.account(24);
@@ -1768,19 +1777,32 @@ test('a live quote after kickoff on a game with a written start is taken; a scor
   const ended = await postOrder(url(), rig, maker, 'rest', orderOn(rig, maker, { expiry: T + 600n, gameId: second }));
   assert.equal(ended.body.code, 'GAME_ENDED', JSON.stringify(ended.body));
 
-  // The rig's first game, still verified: at the start plus the window, bets are closed; one second before, not.
+  // The rig's first game, still verified: at the start plus the window, bets are closed. One second before, they are
+  // closed too, for a quote and a bet alike: no later block's time is under the chain's time plus one, and the
+  // contract refuses a fill from the second of the close. Two seconds before, a quote is taken.
   const firstStart = await rig.read<bigint>(rig.addresses.games, rig.abis.OspexGames as Abi, 'getGameStart', [rig.gameId]);
-  // The block before the close is named by its time, not reached by adding to the clock: a block mined after an
+  // The blocks before the close are named by their times, not reached by adding to the clock: a block mined after an
   // addition carries the wall clock's seconds since the last read as well, and can land on the close itself.
   const closesAt = firstStart + window;
   T = await rig.time();
-  assert.ok(T < closesAt - 1n, 'the close is still ahead');
+  assert.ok(T < closesAt - 2n, 'the close is still ahead');
+  await rig.setNextBlockTime(closesAt - 2n);
+  await rig.mine(1);
+  T = await rig.time();
+  assert.equal(T, closesAt - 2n);
+  const open = await postOrder(url(), rig, maker, 'rest', orderOn(rig, maker, { expiry: T + 600n, oddsTick: 444 }));
+  assert.equal(open.status, 201, JSON.stringify(open.body));
   await rig.setNextBlockTime(closesAt - 1n);
   await rig.mine(1);
   T = await rig.time();
   assert.equal(T, closesAt - 1n);
-  const open = await postOrder(url(), rig, maker, 'rest', orderOn(rig, maker, { expiry: T + 600n, oddsTick: 444 }));
-  assert.equal(open.status, 201, JSON.stringify(open.body));
+  for (const [role, order] of [
+    ['rest', orderOn(rig, maker, { expiry: T + 600n, oddsTick: 446 })],
+    ['take', orderOn(rig, maker, { expiry: T + 20n, riskAmount: 10_000n, positionType: 1 })],
+  ] as const) {
+    const lastSecond = await postOrder(url(), rig, maker, role, order);
+    assert.deepEqual({ status: lastSecond.status, code: lastSecond.body.code, closesAt: lastSecond.body.closesAt }, { status: 422, code: 'BETS_CLOSED', closesAt: closesAt.toString() }, `${role}, one second before the close: ${JSON.stringify(lastSecond.body)}`);
+  }
   await rig.increaseTime(1n);
   T = await rig.time();
   const closed = await postOrder(url(), rig, maker, 'rest', orderOn(rig, maker, { expiry: T + 600n, oddsTick: 445 }));

@@ -11,6 +11,7 @@ import { MARK_ENDED_SQL, SCAN_SQL, scanParams } from '../courier/records/orders'
 import { AHEAD_COUNT_SQL, MARK_STOPPED_SQL } from '../courier/records/stops';
 import { openPool } from '../courier/records/store';
 import { get, startCourier, type CourierProcess } from './support/courier';
+import { holdTheLane } from './support/lanehold';
 import { cancelOnChain, contractHash, grantAgent, nextOrderNumber, nonceOf, orderOn, post, postOrder, postOrderAs, refusedForm, revokeAgent, sign, wire, type Answer, type Order } from './support/orders';
 import type { Rig } from './support/rig';
 import { startStack, type Stack } from './support/stack';
@@ -286,7 +287,11 @@ async function threeCarried(headers: Record<string, string>): Promise<{ who: HDA
 
 // ──────────────────────────── 1 to 3: the stop of carried orders ────────────────────────────
 
-test("1. the signed message in, the answer out, the rows: a maker's stop of two quotes and a waiting bet is answered stopped for each, in the message's order, with no chain read and no budget taken; three stops point at one message row that holds the signed payload and no block; the three orders are marked stopped; one line; the page lists neither quote, each record says stopped, the bet has left the queue and the door takes another; the status no longer lists the stop as not yet built", async () => {
+test("1. the signed message in, the answer out, the rows: a maker's stop of two quotes and a waiting bet is answered stopped for each, in the message's order, with no chain read and no budget taken; three stops point at one message row that holds the signed payload and no block; the three orders are marked stopped; one line; the page lists neither quote, each record says stopped, the bet has left the queue and the door takes another; the status no longer lists the stop as not yet built", async (t) => {
+  // Set-up, since bets are checked: this case's bets wait their turn, as before, and no check runs while it measures. A
+  // set-up bet of an account of its own holds the lane until the case ends (tests/support/lanehold.ts).
+  const lane = await holdTheLane(stack, pool);
+  t.after(() => lane.release());
   const from = at(1);
   const { who, market, q1, q2, bet, message } = await threeCarried(from);
   assert.deepEqual(await listed(market, 'A', from), [q1.hash, q2.hash], 'both quotes are listed before the stop');
@@ -393,7 +398,11 @@ test("1a. a page is one block's and one scan's answer: a page whose scan ran bef
   }
 });
 
-test("2. the door's answer afterwards: a stopped order posted again under its role is answered with its record, ended stopped, and under the other role is a conflict; neither reads the chain and neither writes anything", async () => {
+test("2. the door's answer afterwards: a stopped order posted again under its role is answered with its record, ended stopped, and under the other role is a conflict; neither reads the chain and neither writes anything", async (t) => {
+  // Set-up, since bets are checked: this case's bets wait their turn, as before, and no check runs while it measures. A
+  // set-up bet of an account of its own holds the lane until the case ends (tests/support/lanehold.ts).
+  const lane = await holdTheLane(stack, pool);
+  t.after(() => lane.release());
   const from = at(2);
   const { who, q1, bet, message } = await threeCarried(from);
   assert.deepEqual(outcomes(await postStop(url(), rig, who, message, undefined, from)), ['stopped', 'stopped', 'stopped']);
@@ -411,7 +420,11 @@ test("2. the door's answer afterwards: a stopped order posted again under its ro
   assert.deepEqual(await everything(), before_, 'no row, no mark, no line, and no budget row touched');
 });
 
-test('3. already stopped, and nothing written: the same message again is answered already stopped for each hash, with no chain read; the rows, the lines, the messages and every budget row are as they were', async () => {
+test('3. already stopped, and nothing written: the same message again is answered already stopped for each hash, with no chain read; the rows, the lines, the messages and every budget row are as they were', async (t) => {
+  // Set-up, since bets are checked: this case's bets wait their turn, as before, and no check runs while it measures. A
+  // set-up bet of an account of its own holds the lane until the case ends (tests/support/lanehold.ts).
+  const lane = await holdTheLane(stack, pool);
+  t.after(() => lane.release());
   const from = at(3);
   const { who, message } = await threeCarried(from);
   const first = await postStop(url(), rig, who, message, undefined, from);
@@ -1045,7 +1058,11 @@ test("5. both ways round the first post: the first post of an order and the stop
 const RECIPE =
   "Send the stop of your own carried orders as a message of its own, with no other hash and no original: it takes none of your budgets, and signed by the account's key it reads no chain; the only limit on it is this route's count for your network address (its `retry-after`, when it refuses, names the next free slot and promises nothing), and the on-chain cancel does not go through this courier.";
 
-test("6. the forged and the stranger's: a stop is taken on no signature but the account's, or its live agent's, over this message under the courier's domain. Each apart: a signature nothing recovers from; a stranger's key; the quote's own order signature; the message signed under the matching contract's domain, under the order's domain name and version, on another chain; and the account's own signature in each form the chain refuses. Each is BAD_SIGNATURE for the whole message, never AGENT_NOT_LIVE; nothing is written and no budget touched; the quotes stay listed and a bet still finds them; and the account's own signature then stops them", async () => {
+test("6. the forged and the stranger's: a stop is taken on no signature but the account's, or its live agent's, over this message under the courier's domain. Each apart: a signature nothing recovers from; a stranger's key; the quote's own order signature; the message signed under the matching contract's domain, under the order's domain name and version, on another chain; and the account's own signature in each form the chain refuses. Each is BAD_SIGNATURE for the whole message, never AGENT_NOT_LIVE; nothing is written and no budget touched; the quotes stay listed and a bet still finds them; and the account's own signature then stops them", async (t) => {
+  // Set-up, since bets are checked: this case's bet waits its turn, as before, and no check runs while it measures. A
+  // set-up bet of an account of its own holds the lane until the case ends (tests/support/lanehold.ts).
+  const lane = await holdTheLane(stack, pool);
+  t.after(() => lane.release());
   const from = at(6);
   const who = await freshAccount();
   const stranger = await freshAccount(false);
@@ -1733,7 +1750,11 @@ async function refusingRows(table: 'stops' | 'orders'): Promise<() => Promise<vo
   };
 }
 
-test("10. the rollback: a stop's message row, its lines, its stops and its marks commit together or not at all. With the database refusing the stops, and then, the stops written, refusing the marks, the stop is answered DATABASE_UNREADABLE and nothing of it stands: no message, no stop, no mark, no line. The same for a message under the budgets that stops one hash and refuses another: neither of its two lines stands, and neither budget was taken. The refusal lifted, the same messages are taken; the first sent again is already stopped, with the rows and the lines as they were", async () => {
+test("10. the rollback: a stop's message row, its lines, its stops and its marks commit together or not at all. With the database refusing the stops, and then, the stops written, refusing the marks, the stop is answered DATABASE_UNREADABLE and nothing of it stands: no message, no stop, no mark, no line. The same for a message under the budgets that stops one hash and refuses another: neither of its two lines stands, and neither budget was taken. The refusal lifted, the same messages are taken; the first sent again is already stopped, with the rows and the lines as they were", async (t) => {
+  // Set-up, since bets are checked: this case's bets wait their turn, as before, and no check runs while it measures. A
+  // set-up bet of an account of its own holds the lane until the case ends (tests/support/lanehold.ts).
+  const lane = await holdTheLane(stack, pool);
+  t.after(() => lane.release());
   const from = at(10);
   const { who, market, q1, q2, message } = await threeCarried(from);
   // A second message, under the budgets: a carried quote on a market of its own, and a hash the courier does not

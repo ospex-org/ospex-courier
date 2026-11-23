@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { readdirSync, rmSync } from 'node:fs';
 import { after, before, test } from 'node:test';
 import { promisify } from 'node:util';
+import { MULTICALL_ADDRESS } from '../courier/chain/abi';
 import { checkNode, UNKNOWN_HASH } from '../courier/chain/node';
 import { createJsonRpc, headerByTag, type JsonRpc } from '../courier/chain/rpc';
 import { startProxy, type ChainProxy } from './support/proxy';
@@ -31,8 +32,51 @@ after(async () => {
   await rig?.close();
 });
 
+/**
+ * What the node must prove at start, as the design has it: one request to a line. Each line is the method, what it
+ * reads, and the block it names: the latest block's hash, the hash 50 back, or the hash no block has.
+ */
+const PROVED_AT_START = [
+  // Each request the pre-check makes, three ways, as the check made them before the key's address was its sender.
+  'eth_call the multicall contract at latest',
+  'eth_call the multicall contract at back',
+  'eth_call the multicall contract at unknown',
+  'eth_getTransactionCount the sender at latest',
+  'eth_getTransactionCount the sender at back',
+  'eth_getTransactionCount the sender at unknown',
+  'eth_call the relay, from the sender at latest',
+  'eth_call the relay, from the sender at back',
+  'eth_call the relay, from the sender at unknown',
+  'eth_estimateGas the relay, from the sender at latest',
+  'eth_estimateGas the relay, from the sender at back',
+  'eth_estimateGas the relay, from the sender at unknown',
+  // The relay's storage slot 0 held to the relay's sender, both read at the latest block's hash.
+  "eth_getStorageAt the relay's slot 0 at latest",
+  "eth_call the relay's sender at latest",
+  // The override: the relay's slot 0 set to the multicall contract for one call, and the sender read back.
+  'eth_call the relay, slot 0 overridden at latest',
+  // A call whose answer depends on the block's time, at two hashes of two times: it succeeds at the older block, and
+  // its estimate and the call at the estimated limit name the same hash; from the later block's time it is refused,
+  // and so is its estimate.
+  'eth_call the timed code at back',
+  'eth_estimateGas the timed code at back',
+  "eth_call the timed code, at the estimate's limit at back",
+  'eth_call the timed code at latest',
+  'eth_estimateGas the timed code at latest',
+];
+
 test('the local chain honours every request at a block\'s hash, refuses a hash no block has, and takes an override', async () => {
-  const check = await checkNode(rpc, { relay: rig.addresses.relay, sender: rig.accounts.sender.address });
+  // Each request's parameters as they reached the proxy, which passes them on unchanged.
+  const seen: Array<{ method: string; params: unknown[] }> = [];
+  for (const method of ['eth_call', 'eth_estimateGas', 'eth_getTransactionCount', 'eth_getStorageAt']) {
+    proxy.rule(method, { kind: 'rewrite', params: (params) => (seen.push({ method, params }), params) });
+  }
+  let check: Awaited<ReturnType<typeof checkNode>>;
+  try {
+    check = await checkNode(rpc, { relay: rig.addresses.relay, sender: rig.accounts.sender.address });
+  } finally {
+    proxy.clear();
+  }
   assert.equal(check.usable, true, JSON.stringify(check, null, 1));
   assert.equal(check.verdicts.length, 4);
   for (const v of check.verdicts) {
@@ -44,12 +88,45 @@ test('the local chain honours every request at a block\'s hash, refuses a hash n
   assert.equal(BigInt(check.back?.number ?? '0'), BigInt(check.latest?.number ?? '0') - 50n);
   assert.equal(check.overrideTaken.ok, true, check.overrideTaken.saw);
   assert.equal(check.finalized.ok, true, check.finalized.saw);
-  // The calls went through the proxy: the multicall probe three ways, the relay's read three ways, the override once.
-  assert.equal(proxy.count('eth_call'), 7);
-  assert.equal(proxy.count('eth_estimateGas'), 3);
+  // The calls went through the proxy, as the list above gives them: eth_call 11, eth_estimateGas 5,
+  // eth_getStorageAt 1, eth_getTransactionCount 3.
+  const listed = (method: string) => PROVED_AT_START.filter((l) => l.startsWith(`${method} `)).length;
+  assert.deepEqual(
+    { eth_call: listed('eth_call'), eth_estimateGas: listed('eth_estimateGas'), eth_getStorageAt: listed('eth_getStorageAt'), eth_getTransactionCount: listed('eth_getTransactionCount') },
+    { eth_call: 11, eth_estimateGas: 5, eth_getStorageAt: 1, eth_getTransactionCount: 3 },
+  );
+  assert.equal(proxy.count('eth_call'), 11);
+  assert.equal(proxy.count('eth_estimateGas'), 5);
+  assert.equal(proxy.count('eth_getStorageAt'), 1);
   assert.equal(proxy.count('eth_getTransactionCount'), 3);
   // The headers: latest, the block 50 back, finalized.
   assert.equal(proxy.count('eth_getBlockByNumber'), 3);
+  // Each request named its block by a hash, required canonical, and is the one the list names: the old ones and the
+  // new ones alike. A block named any other way reads as NOT BY HASH.
+  const latestHash = check.latest?.hash.toLowerCase();
+  const backHash = check.back?.hash.toLowerCase();
+  const lower = (a: unknown) => (typeof a === 'string' ? a.toLowerCase() : a);
+  const blockOf = (ref: unknown): string => {
+    const r = ref as { blockHash?: string; requireCanonical?: boolean } | undefined;
+    if (r === undefined || r === null || typeof r !== 'object' || r.requireCanonical !== true || typeof r.blockHash !== 'string') return `NOT BY HASH: ${JSON.stringify(ref)}`;
+    const h = r.blockHash.toLowerCase();
+    return h === latestHash ? 'latest' : h === backHash ? 'back' : h === UNKNOWN_HASH.toLowerCase() ? 'unknown' : `another hash ${h}`;
+  };
+  const what = ({ method, params }: { method: string; params: unknown[] }): string => {
+    const call = params[0] as { from?: string; to?: string; gas?: string };
+    if (method === 'eth_getTransactionCount') return lower(params[0]) === lower(rig.accounts.sender.address) ? 'the sender' : `the count of ${String(params[0])}`;
+    if (method === 'eth_getStorageAt') return lower(params[0]) === lower(rig.addresses.relay) && BigInt(params[1] as string) === 0n ? "the relay's slot 0" : `the storage ${JSON.stringify(params.slice(0, 2))}`;
+    if (call.to === undefined) return `the timed code${call.gas === undefined ? '' : ", at the estimate's limit"}`;
+    if (lower(call.to) === lower(MULTICALL_ADDRESS)) return 'the multicall contract';
+    if (lower(call.to) === lower(rig.addresses.relay)) {
+      if (method === 'eth_call' && params[2] !== undefined) return 'the relay, slot 0 overridden';
+      if (lower(call.from) === lower(rig.accounts.sender.address)) return 'the relay, from the sender';
+      return "the relay's sender";
+    }
+    return `a call to ${call.to}`;
+  };
+  const at = (method: string, params: unknown[]) => blockOf(params[method === 'eth_getStorageAt' ? 2 : 1]);
+  assert.deepEqual(seen.map((s) => `${s.method} ${what(s)} at ${at(s.method, s.params)}`).sort(), [...PROVED_AT_START].sort());
 });
 
 test('a node that refuses one method at a hash fails that verdict and no other, and the node is not usable', async () => {
