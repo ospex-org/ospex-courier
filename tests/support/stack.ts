@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { testServer } from './database';
-import { startCourier, type CourierProcess } from './courier';
+import { startCourier, startHookedCourier, type CourierProcess, type HookControl } from './courier';
 export type { CourierProcess };
 import { startProxy, type ChainProxy } from './proxy';
 import { startRig, type Rig } from './rig';
@@ -26,7 +26,15 @@ export interface Stack {
   /** The database's URL through the relay the test can cut: what the courier is given. */
   relayedUrl: string;
   dbRelay: TcpRelay;
-  courier: CourierProcess;
+  /** The stack's own courier: the one its tests post to. A restart replaces it. */
+  courier: CourierProcess & { hooks?: HookControl };
+  /**
+   * Stops the stack's courier and starts it again, so the stack's process owns the lanes again (its take raises every
+   * lane's epoch): after a case that started another process on the stack's database, and wherever a case needs the
+   * runner held from the start. `hooked` starts it through the tests' start file; `holds` arms its points before the
+   * service starts.
+   */
+  restartCourier(options?: { hooked?: boolean; holds?: string }): Promise<CourierProcess & { hooks?: HookControl }>;
   env: { DATABASE_URL: string; POLYGON_RPC_URL: string; SIGNPOST_ADDRESS: string; BETTING_ENTRY_ID: string; PUBLISHED_REPORTERS_FILE: string; COURIER_ADDRESS: string };
   /** A published list naming the rig's reporter: what the courier under test is given. */
   publishedListFile: string;
@@ -41,8 +49,13 @@ export function publishedList(reporters: string[]): string {
   return file;
 }
 
-export async function startStack(prefix: string): Promise<Stack> {
-  const rig = await startRig();
+/** Starts the stack's courier: through the production start file, or through the tests' start file where `hooked`. */
+function launchCourier(env: Stack['env'], options: { hooked?: boolean; holds?: string }): Promise<CourierProcess & { hooks?: HookControl }> {
+  return options.hooked === true || options.holds !== undefined ? startHookedCourier(env, options.holds ?? '') : startCourier(env);
+}
+
+export async function startStack(prefix: string, options: { hooked?: boolean; holds?: string; genesisTime?: bigint; coin?: 'TestCoin' | 'RefusingCoin' | 'FalseCoin' } = {}): Promise<Stack> {
+  const rig = await startRig({ ...(options.genesisTime === undefined ? {} : { genesisTime: options.genesisTime }), ...(options.coin === undefined ? {} : { coin: options.coin }) });
   const proxy = await startProxy(rig.url);
   const db = testServer();
   const { name, url } = await db.createWithSchema(prefix);
@@ -61,9 +74,9 @@ export async function startStack(prefix: string): Promise<Stack> {
     // The key's address: the relay's sender on the rig, account 4, which this build holds no key for.
     COURIER_ADDRESS: rig.accounts.sender.address,
   };
-  let courier: CourierProcess;
+  let courier: CourierProcess & { hooks?: HookControl };
   try {
-    courier = await startCourier(env);
+    courier = await launchCourier(env, options);
   } catch (err) {
     await dbRelay.close();
     await proxy.close();
@@ -71,7 +84,7 @@ export async function startStack(prefix: string): Promise<Stack> {
     await db.end();
     throw err;
   }
-  return {
+  const stack: Stack = {
     rig,
     proxy,
     db,
@@ -82,8 +95,13 @@ export async function startStack(prefix: string): Promise<Stack> {
     courier,
     env,
     publishedListFile,
+    async restartCourier(again = {}) {
+      await stack.courier.stop();
+      stack.courier = await launchCourier(env, again);
+      return stack.courier;
+    },
     async close() {
-      await courier.stop();
+      await stack.courier.stop();
       // Counted once the courier has stopped, so a send in flight at the close is in the count too.
       const sends = proxy.sends();
       console.log(`# the courier's sends through the proxy (${prefix}): eth_sendRawTransaction ${sends.eth_sendRawTransaction}, eth_sendTransaction ${sends.eth_sendTransaction}`);
@@ -94,4 +112,5 @@ export async function startStack(prefix: string): Promise<Stack> {
       assert.deepEqual(sends, { eth_sendRawTransaction: 0, eth_sendTransaction: 0 }, 'the courier sent a transaction, or tried to: this build signs and sends nothing');
     },
   };
+  return stack;
 }

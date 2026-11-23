@@ -126,9 +126,10 @@ async function freePort(): Promise<number> {
   });
 }
 
-async function startAnvil(): Promise<ChainProcess> {
+async function startAnvil(genesisTime?: bigint): Promise<ChainProcess> {
   const port = await freePort();
-  const child = spawn('anvil', ['--port', String(port), '--host', '127.0.0.1', '--chain-id', String(CHAIN_ID), '--silent'], {
+  const at = genesisTime === undefined ? [] : ['--timestamp', genesisTime.toString()];
+  const child = spawn('anvil', ['--port', String(port), '--host', '127.0.0.1', '--chain-id', String(CHAIN_ID), '--silent', ...at], {
     stdio: 'ignore',
     env: { ...process.env, FOUNDRY_DISABLE_NIGHTLY_WARNING: '1' },
   });
@@ -156,8 +157,12 @@ async function startAnvil(): Promise<ChainProcess> {
   return { process: child, port };
 }
 
-export async function startRig(): Promise<Rig> {
-  const anvil = await startAnvil();
+/**
+ * Starts the rig. `genesisTime` starts the chain's clock at that second instead of the wall clock's: a chain a day
+ * behind the wall clock is made so, since a running chain's time never goes back. `coin` chooses the set's coin.
+ */
+export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin' | 'RefusingCoin' | 'FalseCoin' } = {}): Promise<Rig> {
+  const anvil = await startAnvil(options.genesisTime);
   const url = `http://127.0.0.1:${anvil.port}`;
   const transport = http(url, { retryCount: 0 });
   const chain = { id: CHAIN_ID, name: 'rig', nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [url] } } } as const;
@@ -206,7 +211,11 @@ export async function startRig(): Promise<Rig> {
   // The stock timelock: the key proposes and cancels, anyone executes, no admin.
   const timelock = await deploy(accounts.deployer, 'TimelockController.sol', 'TimelockController', [TIMELOCK_DELAY, [accounts.timelockKey.address], ['0x0000000000000000000000000000000000000000'], '0x0000000000000000000000000000000000000000']);
   // A six-decimal coin; anyone mints.
-  const coin = await deploy(accounts.deployer, 'CoinFixtures.sol', 'TestCoin');
+  // The coin: the plain test coin, or one that can refuse (a blocked account's transfer, a pay-back), each built from
+  // the pinned fixtures. Whichever it is, its interface is the plain coin's and more, and is kept as TestCoin's too.
+  const coinName = options.coin ?? 'TestCoin';
+  const coin = await deploy(accounts.deployer, 'CoinFixtures.sol', coinName);
+  if (coinName !== 'TestCoin') abis.TestCoin = abis[coinName] as Abi;
   // The reporter needs the games address at its own deploy, and the games set needs the reporter's: predict the
   // games address from the deployer's nonce, as the deploy script will.
   const nonce = await publicClient.getTransactionCount({ address: accounts.deployer.address });
