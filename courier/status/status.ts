@@ -2,7 +2,7 @@ import type { Address } from 'viem';
 import type { NodeCheck } from '../chain/node';
 import type { BettingSet } from '../chain/set';
 import type { ChainReader } from '../chain/snapshot';
-import { BOUNDS, TIMEOUTS, type AddressLimiter, type Counters } from '../http/limits';
+import { BOUNDS, CHAIN_LIMITS, TIMEOUTS, type AddressLimiter, type Counters } from '../http/limits';
 import type { Store } from '../records/store';
 import type { Run } from '../records/runs';
 
@@ -99,6 +99,8 @@ export async function status(deps: StatusDeps): Promise<Record<string, unknown>>
     sender: { relay: set.sender, key: null },
     node: deps.node,
     bounds: BOUNDS,
+    /** What the chain itself allows, pinned from its client's source: the most gas one transaction may carry. */
+    chainLimits: CHAIN_LIMITS,
     /** How long the server waits for a request to arrive whole, in milliseconds. */
     timeouts: TIMEOUTS,
     published: { reporters: deps.published },
