@@ -319,6 +319,22 @@ test("a maker that holds the other side (risk 3,000, profit 2,500, held 3,000) q
   }
 });
 
+test("a quote where nothing fits, then one that fits: the first at tick 150 with one lot of room, whose taking side is 50 units, under a lot's worth; the second at tick 160 with room. The walk passes the first and lists the second, as the contract fills it", async () => {
+  const market = { scorer: rig.addresses.spread, lineTicks: 1_000 + 5 * nextLine++ };
+  const [M1, M2] = [await freshAccount(), await freshAccount()];
+  const T = await rig.time();
+  const quotes = [
+    { who: M1, order: { ...orderOn(rig, M1, { expiry: T + 600n, oddsTick: 150, riskAmount: 100n, ...market }), positionType: 0 as const } },
+    { who: M2, order: { ...orderOn(rig, M2, { expiry: T + 600n, oddsTick: 160, riskAmount: 10_000n, ...market }), positionType: 0 as const } },
+  ];
+  const bettor = await freshAccount();
+  const bet: Order = { ...orderOn(rig, bettor, { expiry: T + 25n, oddsTick: 196, riskAmount: 10_000n, ...market }), positionType: 1 };
+  const { record, reference, own } = await runCase({ rig, url: url(), hooks: stack.courier.hooks as HookControl }, quotes, bettor, bet);
+  holdsTo('nothing fits, then a fit', record, reference, own);
+  assert.equal(record.state, 'not sent', JSON.stringify(record));
+  assert.deepEqual(reference.legs.map((l) => l.makerRisk), [10_000n], 'the contract fills the second quote alone, 100 lots');
+});
+
 test("a pay-back the coin refuses: the maker paid back nothing, the amount still held for it; the courier's record names the refused pay-back as the contract records it, and the Cross is ready", async () => {
   const falseStack = await startStack('differential_false', { coin: 'FalseCoin', hooked: true });
   try {
