@@ -274,6 +274,8 @@ export interface QuotesRead {
   grants: Map<string, GrantRead>;
   /** Where the read was asked about a line (the bet's check): whether each grant above names that line; keyed by `grantKey`. Empty otherwise. */
   grantLines?: Map<string, boolean>;
+  /** Where the read was asked for the market's id (a market's page): the id on its three fields, 0 where no market is drawn. */
+  marketId?: bigint;
 }
 
 /** The key a floor is held under in a read of quotes: the account and the version. */
@@ -301,6 +303,8 @@ export async function readQuotes(
   quotes: ReadonlyArray<{ hash: Hex; account: Address; nonce: bigint }>,
   /** The bet's line, for the bet's check (read B): each grant above is also asked whether its list names it. */
   line?: { gameId: bigint; scorer: Address; lineTicks: number },
+  /** A market's page: the market's id on its three fields is asked in the same call, so the page knows whether to read the positions. */
+  market?: { gameId: bigint; scorer: Address; lineTicks: number },
 ): Promise<QuotesRead> {
   const accounts = [...new Set(quotes.map((q) => getAddress(q.account)))];
   const floorsAsked = new Map<string, { account: Address; version: bigint }>();
@@ -325,6 +329,7 @@ export async function readQuotes(
     ...[...floorsAsked.values()].map((f) => ({ target: set.matching, callData: m('s_floors', [f.account, f.version, marketKey]) })),
     ...[...grantsAsked.values()].map((gr) => ({ target: set.matching, callData: m('getGrant', [gr.account, gr.grantNumber]) })),
     ...(line === undefined ? [] : [...grantsAsked.values()].map((gr) => ({ target: set.matching, callData: m('isGrantLine', [gr.account, gr.grantNumber, line.gameId, line.scorer, line.lineTicks]) }))),
+    ...(market === undefined || quotes.length === 0 ? [] : [{ target: set.markets, callData: encodeFunctionData({ abi: MARKETS_ABI, functionName: 'getMarketId', args: [market.gameId, market.scorer, market.lineTicks] }) }]),
   ];
   if (calls.length === 0) return { quotes: new Map(), accounts: new Map(), floors: new Map(), grants: new Map(), grantLines: new Map() };
   return chain.read(header, calls, (answered) => {
@@ -351,9 +356,13 @@ export async function readQuotes(
     [...floorsAsked.keys()].forEach((key, i) => out.floors.set(key, BigInt(dm<bigint>('s_floors', at(floorsAt + i)))));
     const grantsAt = floorsAt + floorsAsked.size;
     [...grantsAsked.keys()].forEach((key, i) => out.grants.set(key, grantOf(at(grantsAt + i))));
+    const linesAt = grantsAt + grantsAsked.size;
     if (line !== undefined) {
-      const linesAt = grantsAt + grantsAsked.size;
       [...grantsAsked.keys()].forEach((key, i) => out.grantLines?.set(key, dm<boolean>('isGrantLine', at(linesAt + i))));
+    }
+    if (market !== undefined && quotes.length > 0) {
+      const marketAt = linesAt + (line === undefined ? 0 : grantsAsked.size);
+      out.marketId = BigInt(decoded('getMarketId', () => decodeFunctionResult({ abi: MARKETS_ABI, functionName: 'getMarketId', data: at(marketAt) }) as bigint));
     }
     return out;
   });
