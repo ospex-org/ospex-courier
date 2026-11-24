@@ -664,22 +664,25 @@ test("no order-row lock is carried from the bet's candidate statement into anoth
   const S = await freshAccount();
   // Two quotes of one account whose hashes fall high and low, the high one about to expire and the low one cancelled
   // on chain: the candidate statement marks the first, the check's marks the second.
-  let high: { hash: Hex; order: Order } | null = null;
-  let low: { hash: Hex; order: Order } | null = null;
   const T = await rig.time();
-  // The high one expires in seconds; the low one stands, to be cancelled on chain. A quote posted in the search that
-  // falls on the wrong side is cancelled on chain at once, so it is no candidate either.
-  for (let i = 0; i < 7 && high === null; i++) {
-    const q = await quoteOf(S, market, { expiry: T + 8n, oddsTick: 200 + i });
-    if (q.hash.toLowerCase() > '0x8') high = q;
-    else await cancelOnChain(rig, S, q.order);
-  }
-  for (let i = 0; i < 7 && low === null; i++) {
-    const q = await quoteOf(S, market, { expiry: T + 600n, oddsTick: 220 + i });
-    if (q.hash.toLowerCase() < '0x8') low = q;
-    else await cancelOnChain(rig, S, q.order);
-  }
-  assert.ok(high !== null && low !== null, 'a high and a low hash among seven tries each');
+  // The high one expires in seconds; the low one stands, to be cancelled on chain. Each hash is computed before
+  // anything is posted, a fresh nonce at each try and up to 24 tries a side, and only the two that fit are posted.
+  const fitting = (terms: { expiry: bigint; oddsTick: number }, high: boolean): { nonce: bigint; hash: string } | null => {
+    for (let i = 0; i < 24; i++) {
+      const order: Order = { ...orderOn(rig, S, { riskAmount: 100_000n, ...market, ...terms }), positionType: 0 };
+      const hash = orderHash(order, 31337n, rig.addresses.matching).toLowerCase();
+      if (high ? hash > '0x8' : hash < '0x8') return { nonce: order.nonce, hash };
+    }
+    return null;
+  };
+  const highTerms = { expiry: T + 8n, oddsTick: 200 };
+  const lowTerms = { expiry: T + 600n, oddsTick: 220 };
+  const highFit = fitting(highTerms, true);
+  const lowFit = fitting(lowTerms, false);
+  assert.ok(highFit !== null && lowFit !== null, 'a high and a low hash among 24 tries each');
+  const high = await quoteOf(S, market, { ...highTerms, nonce: highFit.nonce });
+  const low = await quoteOf(S, market, { ...lowTerms, nonce: lowFit.nonce });
+  assert.deepStrictEqual([high.hash.toLowerCase(), low.hash.toLowerCase()], [highFit.hash, lowFit.hash], 'the two quotes posted are the two the search found');
   // The low one lives on in the records, cancelled on chain: the check's read shows it ended and marks it.
   const lowLive: Order = { ...low.order };
   await cancelOnChain(rig, S, lowLive);

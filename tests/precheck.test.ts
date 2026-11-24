@@ -590,14 +590,22 @@ test("a stop ahead's original is never a candidate: an original that would meet 
   const stop = await postStop(url(), rig, M, stopMessage(M.address, [originalHash as Hex]), [{ orderHash: originalHash as Hex, order: original, signature }]);
   assert.equal(stop.status, 200, JSON.stringify(stop.body));
   const seen = hooks().observed.length;
+  // The boundary first: held once the check has ended and before its outcome is written, by which point both of its
+  // observations have come (they travel ahead of the hold on the same channel). Then the check goes on to its outcome.
+  await hooks().arm('before-result');
   const bet = await betOn(B, market);
+  const held = await hooks().reached('before-result');
+  try {
+    const observed = hooks().observed.slice(seen);
+    const candidates = observed.filter((o) => o.what === 'candidates');
+    const input = observed.filter((o) => o.what === 'walk input');
+    assert.ok(candidates.length >= 1 && input.length >= 1, 'the boundary was observed');
+    for (const o of observed) assert.ok(!o.hashes.map((h) => h.toLowerCase()).includes(originalHash), `${o.what} held the original`);
+  } finally {
+    await hooks().go(held);
+  }
   const record = await judged(bet.hash);
   assert.equal((record.verdict as { code: string }).code, 'NO_DEPTH', JSON.stringify(record));
-  const observed = hooks().observed.slice(seen);
-  const candidates = observed.filter((o) => o.what === 'candidates');
-  const input = observed.filter((o) => o.what === 'walk input');
-  assert.ok(candidates.length >= 1 && input.length >= 1, 'the boundary was observed');
-  for (const o of observed) assert.ok(!o.hashes.map((h) => h.toLowerCase()).includes(originalHash), `${o.what} held the original`);
   // The control: the same terms, signed afresh and posted with no stop, listed and ready.
   const posted = await quoteOn(M, market);
   const control = await betOn(await freshAccount(), market);

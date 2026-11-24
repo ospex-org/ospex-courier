@@ -415,7 +415,9 @@ test("model or coin: a quote cancelled at H, listed as if live by a test's fault
   const [M1, M2] = [await freshAccount(), await freshAccount()];
   const T = await rig.time();
   const q1: Order = { ...orderOn(rig, M1, { expiry: T + 600n, oddsTick: 200, riskAmount: 5_000n, ...market }), positionType: 0 };
-  const q2: Order = { ...orderOn(rig, M2, { expiry: T + 600n, oddsTick: 202, riskAmount: 100_000n, ...market }), positionType: 0 };
+  // The survivor's room is its own share of the bet, 49 lots at its price: the contract, skipping the cancelled quote,
+  // fills it no more than the walk lists it, so the comparison sees only the unfilled leg and the probe decides.
+  const q2: Order = { ...orderOn(rig, M2, { expiry: T + 600n, oddsTick: 202, riskAmount: 4_900n, ...market }), positionType: 0 };
   const p1 = await postOrder(url(), rig, M1, 'rest', q1);
   await postOrder(url(), rig, M2, 'rest', q2);
   await rig.write(M1, rig.addresses.matching, rig.abis.OspexMatching as Abi, 'cancelOrder', [q1]);
