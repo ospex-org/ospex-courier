@@ -402,6 +402,17 @@ const fault = (ctx: RoundContext, reason: string, facts: Record<string, unknown>
 
 const jsonDecoded = (d: Decoded) => (d.kind === 'named' ? { name: d.name, args: d.args } : d);
 
+/**
+ * The courier carries a game only once its start is written, which the contract's gate takes as Verified or Disputed.
+ * So `GameNotVerified` from the contract means the courier's read of the game at H and the contract disagree: the
+ * refusal stands as the contract names it, and an incident line beside it records the courier's own fault, with the
+ * step that met it and the error's arguments.
+ */
+const gameIncident = (ctx: RoundContext, at: string, d: Decoded): Incident[] =>
+  d.kind === 'named' && d.name === 'OspexMarkets__GameNotVerified'
+    ? [...ctx.incidents, { reason: 'GAME_READ_AND_CONTRACT_DIFFER', orderHash: ctx.bet.hash, facts: { block: ctx.n, at, revert: jsonDecoded(d) } }]
+    : ctx.incidents;
+
 /** The model's prediction for these legs, on the round's reads, with a test's skew applied where one is planted. */
 function prediction(ctx: RoundContext, legs: readonly ListedLeg[]): Pulls {
   const p = predict(
@@ -446,7 +457,7 @@ async function exactCall(ctx: RoundContext, listed: ListedLeg[], skipped: Set<st
       }
       return rewalk(ctx, skipped, left);
     }
-    return refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT(n, reasonText(d)), { reason: d.kind === 'named' ? d.name : 'none', ...(d.kind === 'named' ? { args: d.args } : {}) }, ctx.incidents);
+    return refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT(n, reasonText(d)), { reason: d.kind === 'named' ? d.name : 'none', ...(d.kind === 'named' ? { args: d.args } : {}) }, gameIncident(ctx, 'simulation', d));
   }
 
   // The model's comparison, where the node takes an override.
@@ -456,8 +467,9 @@ async function exactCall(ctx: RoundContext, listed: ListedLeg[], skipped: Set<st
     const compared = await compare(ctx, listed, data, predicted);
     if ('outcome' in compared) return compared.outcome;
     if ('unfilled' in compared) {
-      // A listed leg left unfilled: the coin's refusal of that maker's pull only on a positive predicted pull and a
-      // one-quote probe that names PullRefused; then one re-walk at the same H without it.
+      // A listed leg left unfilled, whatever else the comparison saw differ: the coin's refusal of that maker's pull
+      // only on a positive predicted pull and a one-quote probe that names PullRefused; then one re-walk at the same H
+      // without it, whose own simulation, comparison and gas must agree exactly. A second refusal there ends the check.
       const left: Hex[] = [];
       for (const i of compared.unfilled) {
         const leg = listed[i] as ListedLeg;
@@ -485,10 +497,10 @@ async function exactCall(ctx: RoundContext, listed: ListedLeg[], skipped: Set<st
   const within = (limit: bigint) => limit <= blockLimit && limit <= cap;
   const est = await estimate(deps, H, data);
   if (!est.ok) {
-    if ('outOfGas' in est) return refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT(n, reasonText({ kind: 'empty' })), { reason: 'none', at: 'estimate' }, ctx.incidents);
+    if ('outOfGas' in est) return refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT(n, reasonText({ kind: 'empty' })), { reason: 'none', step: 'estimate' }, ctx.incidents);
     const d = decodeRevert(est.data);
     if (d.kind === 'unknown') return fault(ctx, 'UNKNOWN_REVERT', { selector: d.selector, at: 'estimate' });
-    return refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT(n, reasonText(d)), { reason: d.kind === 'named' ? d.name : 'none', at: 'estimate' }, ctx.incidents);
+    return refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT(n, reasonText(d)), { reason: d.kind === 'named' ? d.name : 'none', ...(d.kind === 'named' ? { args: d.args } : {}), step: 'estimate' }, gameIncident(ctx, 'estimate', d));
   }
   const ceilings = { blockGasLimit: blockLimit.toString(), transactionGasCap: cap.toString() };
   let chosen = listed;
@@ -511,7 +523,7 @@ async function exactCall(ctx: RoundContext, listed: ListedLeg[], skipped: Set<st
       if ('outOfGas' in sim2) return refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT(n, reasonText({ kind: 'empty' })), { reason: 'none' }, ctx.incidents);
       const d = decodeRevert(sim2.data);
       if (d.kind === 'unknown') return fault(ctx, 'UNKNOWN_REVERT', { selector: d.selector, at: 'simulation of the chosen prefix' });
-      return refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT(n, reasonText(d)), { reason: d.kind === 'named' ? d.name : 'none', ...(d.kind === 'named' ? { args: d.args } : {}) }, ctx.incidents);
+      return refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT(n, reasonText(d)), { reason: d.kind === 'named' ? d.name : 'none', ...(d.kind === 'named' ? { args: d.args } : {}) }, gameIncident(ctx, 'simulation of the chosen prefix', d));
     }
     if (deps.overrideTaken) {
       const compared = await compare(ctx, chosen, prefixData, prefixPredicted);
@@ -543,7 +555,7 @@ async function finishReady(
   if (!atLimit.ok) {
     const d: Decoded = 'outOfGas' in atLimit ? { kind: 'empty' } : decodeRevert(atLimit.data);
     if (d.kind === 'unknown') return fault(ctx, 'UNKNOWN_REVERT', { selector: d.selector, at: 'call at the limit' });
-    return refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT_AT_LIMIT(n, reasonText(d)), { reason: d.kind === 'named' ? d.name : 'none', atGasLimit: limit.toString() }, ctx.incidents);
+    return refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT_AT_LIMIT(n, reasonText(d)), { reason: d.kind === 'named' ? d.name : 'none', atGasLimit: limit.toString() }, gameIncident(ctx, 'call at the limit', d));
   }
   // The key's count at H, as the node check asks for it.
   const nonce = await deps.chain.ask(H, () => transactionCountAt(deps.rpc, deps.courier, byHash(H.hash)));
@@ -614,8 +626,10 @@ const slotWord = (address: Address): Hex => `0x${'0'.repeat(24)}${address.slice(
  * The model's comparison: the same Cross at H run from inside the multicall contract, the relay's sender slot
  * overridden to it for this call alone, and in the same call, after the Cross, the bet's and each listed quote's
  * filled amount, each account's coin, and what is held for it on the market. Held to the walk: each fill the walk's;
- * each pay-back one of its two outcomes, paid or refused and kept held. A leg left unfilled is the caller's to probe;
- * any other difference is the courier's fault.
+ * each pay-back one of its two outcomes, paid or refused and kept held. A leg left unfilled is the caller's to probe,
+ * whatever else differs: where the coin refuses a maker's pull, the contract puts that leg's fill back, and the quotes
+ * behind it may fill more than the walk listed them for; the probe and the one re-walk, which must then agree exactly,
+ * decide. With no leg left unfilled, any difference is the courier's fault.
  */
 async function compare(ctx: RoundContext, legs: readonly ListedLeg[], data: Hex, predicted: Pulls): Promise<Compared> {
   const { deps, bet, A, H, readB, positions } = ctx;
@@ -645,7 +659,7 @@ async function compare(ctx: RoundContext, legs: readonly ListedLeg[], data: Hex,
     if (after === before) unfilled.push(i);
     else if (after - before !== l.makerRisk) differences.push(`quote ${l.candidate.hash} filled ${after - before}, the walk ${l.makerRisk}`);
   });
-  if (unfilled.length > 0 && differences.length === 0) return { unfilled };
+  if (unfilled.length > 0) return { unfilled };
   const takerRisk = legs.reduce((s, l) => s + l.takerRisk, 0n);
   if (betAfter - A.filled !== takerRisk) differences.push(`the bet filled ${betAfter - A.filled}, the walk ${takerRisk}`);
   // Each account's coin and held, against the model's two outcomes of its pay-back.
@@ -720,7 +734,7 @@ async function search(
     }
     if (d.kind === 'unknown') return { outcome: fault(ctx, 'UNKNOWN_REVERT', { selector: d.selector, at: `the search's estimate of the first ${k}` }) };
     steps.push({ k, answer: d.name });
-    if (deps.overrideTaken) return { outcome: fault(ctx, 'MODEL_AND_CONTRACT_DIFFER', { at: `the search's estimate of the first ${k}`, refused: jsonDecoded(d), note: 'the comparison agreed on the whole list, and the contract refuses a prefix the model accepted' }) };
+    if (deps.overrideTaken) return { outcome: fault(ctx, 'MODEL_AND_CONTRACT_DIFFER', { at: `the search's estimate of the first ${k}`, refused: jsonDecoded(d), note: 'the comparison ran on the whole list and agreed; the model did not judge this prefix, and the contract refused its estimate' }) };
     return {
       outcome: refusedAt(H, 'CROSS_WOULD_REVERT', VERDICT.CROSS_WOULD_REVERT_TRIMMED(n, String(k), reasonText(d)), { reason: d.name, trimmedTo: k, steps }, ctx.incidents),
     };

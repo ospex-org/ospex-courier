@@ -68,7 +68,7 @@ function betState(row: OrderRow, outcome: BetOutcome | null): string {
   return String(row.betState);
 }
 
-/** A bet's verdict as its record serves it: the code and its sentence, the block that decided it or null, the last header read where none did, the time it was recorded, and the code's own fields. */
+/** A bet's verdict as its record serves it: the code and its sentence, the block that decided it or null, the last header read where none did, the code's own fields, and the time it was recorded, last, so that no field replaces it. */
 function verdictOf(v: NonNullable<BetOutcome['verdict']>): Record<string, unknown> {
   const { code, error, block, lastObservedBlock, ...fields } = v.facts as { code?: unknown; error?: unknown; block?: unknown; lastObservedBlock?: unknown };
   return {
@@ -76,8 +76,8 @@ function verdictOf(v: NonNullable<BetOutcome['verdict']>): Record<string, unknow
     error,
     block: block ?? null,
     ...(lastObservedBlock === undefined ? {} : { lastObservedBlock }),
-    at: v.at.toISOString(),
     ...fields,
+    at: v.at.toISOString(),
   };
 }
 

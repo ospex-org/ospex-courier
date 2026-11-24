@@ -106,7 +106,10 @@ interface Done {
   legs: Array<{ orderHash: string; makerRisk: bigint; takerRisk: bigint }>;
   pulled: Map<string, bigint>;
   paidBack: Map<string, bigint>;
+  /** What stays held for each account whose pay-back the coin refused: the last refusal's amount, whatever their number. */
   refused: Map<string, bigint>;
+  /** How many times the contract refused each account a pay-back in this Cross: a count of events, apart from what stays held (`refused`). */
+  refusals: Map<string, number>;
   revert?: string;
 }
 
@@ -114,7 +117,7 @@ interface Done {
 async function crossAt(on: Rig, time: bigint, taking: Signed, resting: Signed[]): Promise<Done> {
   await on.setNextBlockTime(time);
   const add = (m: Map<string, bigint>, k: string, v: bigint) => m.set(k, (m.get(k) ?? 0n) + v);
-  const done: Done = { filled: false, legs: [], pulled: new Map(), paidBack: new Map(), refused: new Map() };
+  const done: Done = { filled: false, legs: [], pulled: new Map(), paidBack: new Map(), refused: new Map(), refusals: new Map() };
   let hash: Hex;
   try {
     hash = await on.write(on.accounts.sender, on.addresses.relay, on.abis.OspexCourierRelay as Abi, 'cross', [taking, resting]);
@@ -141,7 +144,13 @@ async function crossAt(on: Rig, time: bigint, taking: Signed, resting: Signed[])
         if (e.eventName === 'HeldChanged' && account !== undefined) {
           add(done.pulled, account, e.args.pulled as bigint);
           add(done.paidBack, account, e.args.paidBack as bigint);
-        } else if (e.eventName === 'PayBackRefused' && account !== undefined) add(done.refused, account, e.args.amount as bigint);
+        } else if (e.eventName === 'PayBackRefused' && account !== undefined) {
+          // What stays held for the account, not the sum of the events: the contract visits a maker once for each of
+          // its legs, a refusal puts the held amount back, and a later visit in the same Cross finds the same excess
+          // and is refused again. So the amount still held is the last refusal's; the refusals are counted apart.
+          done.refused.set(account, e.args.amount as bigint);
+          done.refusals.set(account, (done.refusals.get(account) ?? 0) + 1);
+        }
       } catch {
         // another event of the module's
       }
@@ -299,25 +308,28 @@ test(`the differential set: ${CASES} cases from the seed ${SEED}, each within th
   assert.ok(ready > 0 && ready < CASES, `both outcomes are in the set: ${ready} ready of ${CASES}`);
 });
 
-test("a maker that holds the other side (risk 3,000, profit 2,500, held 3,000) quotes twice at tick 204 with 4,800 of room each, the bet 10,000 at tick 196. The contract pulls the maker nothing at the first leg and 4,100 at the second, and pays it nothing back; the bettor 9,984. With the maker's wallet and allowance each 4,100, and with the largest allowance, the courier records the same", async () => {
-  for (const allowance of [4_100n, MAX]) {
-    const market = { scorer: rig.addresses.spread, lineTicks: 1_000 + 5 * nextLine++ };
-    const M = await freshAccount();
-    await takesSideB(rig, M, market, 25n, 220);
-    const coin = rig.abis.TestCoin as Abi;
-    const balance = await rig.read<bigint>(rig.addresses.coin, coin, 'balanceOf', [M.address]);
-    await rig.write(M, rig.addresses.coin, coin, 'transfer', [rig.accounts.stranger.address, balance - 4_100n]);
-    await rig.write(M, rig.addresses.coin, coin, 'approve', [rig.addresses.positions, allowance]);
-    const T = await rig.time();
-    const quotes = [0, 1].map(() => ({ who: M, order: { ...orderOn(rig, M, { expiry: T + 600n, oddsTick: 204, riskAmount: 4_800n, ...market }), positionType: 0 as const } }));
-    const bettor = await freshAccount();
-    const bet: Order = { ...orderOn(rig, bettor, { expiry: T + 25n, oddsTick: 196, riskAmount: 10_000n, ...market }), positionType: 1 };
-    const { record, reference, own } = await runCase({ rig, url: url(), hooks: stack.courier.hooks as HookControl }, quotes, bettor, bet);
-    holdsTo(`allowance ${allowance}`, record, reference, own);
-    assert.deepEqual(nonzero(reference.pulled), { [M.address.toLowerCase()]: '4100', [bettor.address.toLowerCase()]: '9984' });
-    assert.deepEqual(nonzero(reference.paidBack), {});
-  }
-});
+/** The maker that holds the other side, its wallet 4,100 and its allowance `allowance`: the case below, one allowance a registration. */
+async function holdsTheOtherSide(allowance: bigint): Promise<void> {
+  const market = { scorer: rig.addresses.spread, lineTicks: 1_000 + 5 * nextLine++ };
+  const M = await freshAccount();
+  await takesSideB(rig, M, market, 25n, 220);
+  const coin = rig.abis.TestCoin as Abi;
+  const balance = await rig.read<bigint>(rig.addresses.coin, coin, 'balanceOf', [M.address]);
+  await rig.write(M, rig.addresses.coin, coin, 'transfer', [rig.accounts.stranger.address, balance - 4_100n]);
+  await rig.write(M, rig.addresses.coin, coin, 'approve', [rig.addresses.positions, allowance]);
+  const T = await rig.time();
+  const quotes = [0, 1].map(() => ({ who: M, order: { ...orderOn(rig, M, { expiry: T + 600n, oddsTick: 204, riskAmount: 4_800n, ...market }), positionType: 0 as const } }));
+  const bettor = await freshAccount();
+  const bet: Order = { ...orderOn(rig, bettor, { expiry: T + 25n, oddsTick: 196, riskAmount: 10_000n, ...market }), positionType: 1 };
+  const { record, reference, own } = await runCase({ rig, url: url(), hooks: stack.courier.hooks as HookControl }, quotes, bettor, bet);
+  holdsTo(`allowance ${allowance}`, record, reference, own);
+  assert.deepEqual(nonzero(reference.pulled), { [M.address.toLowerCase()]: '4100', [bettor.address.toLowerCase()]: '9984' });
+  assert.deepEqual(nonzero(reference.paidBack), {});
+}
+
+test("a maker that holds the other side (risk 3,000, profit 2,500, held 3,000) quotes twice at tick 204 with 4,800 of room each, the bet 10,000 at tick 196. The contract pulls the maker nothing at the first leg and 4,100 at the second, and pays it nothing back; the bettor 9,984. With the maker's wallet and allowance each 4,100, the courier records the same", () => holdsTheOtherSide(4_100n));
+
+test("a maker that holds the other side (risk 3,000, profit 2,500, held 3,000) quotes twice at tick 204 with 4,800 of room each, the bet 10,000 at tick 196. The contract pulls the maker nothing at the first leg and 4,100 at the second, and pays it nothing back; the bettor 9,984. With the maker's wallet 4,100 and the largest allowance, the courier records the same", () => holdsTheOtherSide(MAX));
 
 test("a quote where nothing fits, then one that fits: the first at tick 150 with one lot of room, whose taking side is 50 units, under a lot's worth; the second at tick 160 with room. The walk passes the first and lists the second, as the contract fills it", async () => {
   const market = { scorer: rig.addresses.spread, lineTicks: 1_000 + 5 * nextLine++ };
@@ -397,6 +409,7 @@ test("the skew: one predicted pull changed after selection, funds ample and the 
     const bettor = await freshAccount();
     const b = await postOrder(url(), rig, bettor, 'take', { ...orderOn(rig, bettor, { expiry: T + 25n, oddsTick: 200, riskAmount: 10_000n, ...market }), positionType: 1 });
     const record = await judged(b.body.orderHash as string);
+    assert.ok(record.verdict, JSON.stringify(record));
     assert.equal((record.verdict as { code: string }).code, 'COURIER_FAULT', JSON.stringify(record));
     const incidents = await pool.query(`SELECT reason FROM events WHERE kind = 'incident' AND bet_hash = $1`, [String(b.body.orderHash).toLowerCase()]);
     assert.deepEqual(incidents.rows, [{ reason: 'MODEL_AND_CONTRACT_DIFFER' }]);
@@ -426,11 +439,93 @@ test("model or coin: a quote cancelled at H, listed as if live by a test's fault
     const bettor = await freshAccount();
     const b = await postOrder(url(), rig, bettor, 'take', { ...orderOn(rig, bettor, { expiry: T + 25n, oddsTick: 196, riskAmount: 10_000n, ...market }), positionType: 1 });
     const record = await judged(b.body.orderHash as string);
+    assert.ok(record.verdict, JSON.stringify(record));
     assert.equal((record.verdict as { code: string }).code, 'COURIER_FAULT', JSON.stringify(record));
     const incidents = await pool.query(`SELECT reason, facts FROM events WHERE kind = 'incident' AND bet_hash = $1`, [String(b.body.orderHash).toLowerCase()]);
     assert.equal(incidents.rows.length, 1);
     assert.equal(incidents.rows[0].reason, 'MODEL_AND_CONTRACT_DIFFER');
   } finally {
     await hooks.fault({ listAsLive: [] });
+  }
+});
+
+test("model or coin, its second form: the same quote cancelled at H and listed as if live, with the survivor behind it given room of 100,000, so the contract, skipping the cancelled quote, fills the survivor for more than the walk lists it. The leg left unfilled still goes to the one-quote probe, which names Cancelled and not PullRefused: it is still the courier's fault, COURIER_FAULT with one incident line, and no Cross row", async () => {
+  const hooks = stack.courier.hooks as HookControl;
+  const market = { scorer: rig.addresses.spread, lineTicks: 1_000 + 5 * nextLine++ };
+  const [M1, M2] = [await freshAccount(), await freshAccount()];
+  const T = await rig.time();
+  const q1: Order = { ...orderOn(rig, M1, { expiry: T + 600n, oddsTick: 200, riskAmount: 5_000n, ...market }), positionType: 0 };
+  const q2: Order = { ...orderOn(rig, M2, { expiry: T + 600n, oddsTick: 202, riskAmount: 100_000n, ...market }), positionType: 0 };
+  const p1 = await postOrder(url(), rig, M1, 'rest', q1);
+  await postOrder(url(), rig, M2, 'rest', q2);
+  await rig.write(M1, rig.addresses.matching, rig.abis.OspexMatching as Abi, 'cancelOrder', [q1]);
+  await hooks.fault({ listAsLive: [String(p1.body.orderHash)] });
+  try {
+    const bettor = await freshAccount();
+    const b = await postOrder(url(), rig, bettor, 'take', { ...orderOn(rig, bettor, { expiry: T + 25n, oddsTick: 196, riskAmount: 10_000n, ...market }), positionType: 1 });
+    const record = await judged(b.body.orderHash as string);
+    assert.ok(record.verdict, JSON.stringify(record));
+    assert.equal((record.verdict as { code: string }).code, 'COURIER_FAULT', JSON.stringify(record));
+    const incidents = await pool.query(`SELECT reason, facts FROM events WHERE kind = 'incident' AND bet_hash = $1`, [String(b.body.orderHash).toLowerCase()]);
+    assert.equal(incidents.rows.length, 1);
+    assert.equal(incidents.rows[0].reason, 'MODEL_AND_CONTRACT_DIFFER');
+    console.log(`# model or coin, its second form: the incident's facts ${JSON.stringify(incidents.rows[0].facts)}`);
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM crosses WHERE bet_hash = $1', [String(b.body.orderHash).toLowerCase()])).rows[0].n, 0);
+  } finally {
+    await hooks.fault({ listAsLive: [] });
+  }
+});
+
+test("a refused maker ahead of a survivor that then fills more: the coin refuses the first maker's pull (tick 200, room 5,000), and the contract, skipping it, fills the survivor behind it (tick 202, room 10,000) for 98 lots where the walk listed 49. The leg left unfilled goes to the one-quote probe whatever else differs; the probe names PullRefused, and the one re-walk at the same block lists the survivor alone, 9,800 and 9,996, as the contract fills it: the bet is ready, and the refused quote is named in the figures", async () => {
+  const refusing = await startStack('differential_refusing_more', { coin: 'RefusingCoin', hooked: true });
+  try {
+    const r = refusing.rig;
+    const [M1, M2] = [await freshAccount(r), await freshAccount(r)];
+    const market = { scorer: r.addresses.spread, lineTicks: -9 };
+    const T = await r.time();
+    const quotes = [
+      { who: M1, order: { ...orderOn(r, M1, { expiry: T + 600n, oddsTick: 200, riskAmount: 5_000n, ...market }), positionType: 0 as const } },
+      { who: M2, order: { ...orderOn(r, M2, { expiry: T + 600n, oddsTick: 202, riskAmount: 10_000n, ...market }), positionType: 0 as const } },
+    ];
+    await r.write(r.accounts.deployer, r.addresses.coin, r.abis.RefusingCoin as Abi, 'setBlocked', [M1.address, true]);
+    const bettor = await freshAccount(r);
+    const bet: Order = { ...orderOn(r, bettor, { expiry: T + 25n, oddsTick: 196, riskAmount: 10_000n, ...market }), positionType: 1 };
+    const { record, reference, own } = await runCase({ rig: r, url: refusing.courier.url, hooks: refusing.courier.hooks as HookControl }, quotes, bettor, bet);
+    holdsTo('a refused maker ahead of a survivor that fills more', record, reference, own);
+    assert.deepEqual(reference.legs.map((l) => [l.makerRisk, l.takerRisk]), [[9_800n, 9_996n]], 'the contract fills the survivor alone, 98 lots');
+    const rpool = openPool(refusing.databaseUrl, null);
+    try {
+      const { rows } = await rpool.query<{ checked: { leftOutAfterCoinRefusal: string[] } }>('SELECT checked FROM crosses WHERE bet_hash = $1', [String(record.orderHash).toLowerCase()]);
+      const posted = await rpool.query<{ hash: string }>('SELECT hash FROM orders WHERE account = $1', [M1.address.toLowerCase()]);
+      assert.deepEqual(rows[0]?.checked.leftOutAfterCoinRefusal.map((h) => h.toLowerCase()), posted.rows.map((p) => p.hash), 'the refused quote is named');
+    } finally {
+      await rpool.end();
+    }
+  } finally {
+    await refusing.close();
+  }
+});
+
+test("one maker behind two quotes, its pay-back refused at each visit: the maker, which holds side B (risk 3,000, profit 2,500, held 3,000), quotes twice at tick 204 with 2,400 of room each, and the coin refuses every transfer to it; the bet of 5,000 at tick 196 takes both, 4,992. The contract visits the maker once for each leg and refuses the same 700 at each, so 700 stays held, not 1,400: the courier records 700 refused, the reference counts the two refusals apart, and the Cross is ready", async () => {
+  const falseStack = await startStack('differential_false_twice', { coin: 'FalseCoin', hooked: true });
+  try {
+    const r = falseStack.rig;
+    const M = await freshAccount(r);
+    const market = { scorer: r.addresses.spread, lineTicks: -7 };
+    await takesSideB(r, M, market, 25n, 220);
+    await r.write(r.accounts.deployer, r.addresses.coin, r.abis.FalseCoin as Abi, 'setRefuseTo', [M.address, true]);
+    const T = await r.time();
+    const quotes = [0, 1].map(() => ({ who: M, order: { ...orderOn(r, M, { expiry: T + 600n, oddsTick: 204, riskAmount: 2_400n, ...market }), positionType: 0 as const } }));
+    const bettor = await freshAccount(r);
+    // 24 lots at 104 each from each quote, 4,992 in all, in whole lots of 100: the two quotes' room bounds the fill.
+    const bet: Order = { ...orderOn(r, bettor, { expiry: T + 25n, oddsTick: 196, riskAmount: 5_000n, ...market }), positionType: 1 };
+    const { record, reference, own } = await runCase({ rig: r, url: falseStack.courier.url, hooks: falseStack.courier.hooks as HookControl }, quotes, bettor, bet);
+    holdsTo('one maker, two refused visits', record, reference, own);
+    const m = M.address.toLowerCase();
+    assert.equal(reference.legs.length, 2, 'both quotes filled');
+    assert.equal(reference.refusals.get(m), 2, 'the contract refused the pay-back at each of its two visits');
+    assert.deepEqual(nonzero((record.cross as { paysBackRefused: Record<string, string> }).paysBackRefused), { [m]: '700' }, 'what stays held, once');
+  } finally {
+    await falseStack.close();
   }
 });

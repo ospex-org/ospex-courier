@@ -187,6 +187,8 @@ is closed `not sent`.
   at which a complete decision was made. It is absent where no header was read, and from an outcome a check decided.
   The block a bet was admitted at is never in either field.
 - `at` is the time the outcome was recorded.
+- `step` is `"estimate"` on a `CROSS_WOULD_REVERT` that came from the node's gas estimate for the exact transaction:
+  the transaction itself ran at that block, and its estimate was refused. Other verdicts have no `step`.
 - `cross.message` is the sentence of the Cross's state. `paysBackRefused` holds the pay-backs the courier's
   comparison with the contract saw the coin refuse at H; those amounts stay held for those accounts.
 - **The state is the bet's first end.** `stopped` where a stop's mark came before the judgment: with the verdict

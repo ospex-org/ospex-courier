@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { after, before, beforeEach, test } from 'node:test';
 import pg from 'pg';
-import { encodeAbiParameters, encodeFunctionData, keccak256, toBytes, type Abi, type Address, type Hex } from 'viem';
+import { decodeFunctionData, encodeAbiParameters, encodeFunctionData, keccak256, toBytes, type Abi, type Address, type Hex } from 'viem';
 import type { HDAccount } from 'viem/accounts';
 import { MULTICALL_ABI, MULTICALL_ADDRESS, RELAY_ABI } from '../courier/chain/abi';
 import { byHash, callAt, createJsonRpc, estimateGasAt, ExecutionReverted, headerByTag, NodeFailure, OutOfGas } from '../courier/chain/rpc';
@@ -415,6 +415,42 @@ test("one block: every request for a value the check makes names H by its hash, 
   }
 });
 
+test("one block: the last check of H. Its header, read again by its number at the end of the check, answers another hash, once: the round is thrown away and the check starts again from the latest header, and the bet is ready at the block its second round read, that round's own last check passing", async () => {
+  const market = ownMarket();
+  await quoteOn(await freshAccount(), market);
+  await hooks().arm('after-reservation');
+  const bet = await betOn(await freshAccount(), market);
+  const held = await hooks().reached('after-reservation');
+  const heads: unknown[] = [];
+  let answeredOtherwise = 0;
+  proxy.rule('eth_getBlockByNumber', {
+    kind: 'rewriteResult',
+    result: (p, r) => {
+      heads.push(p[0]);
+      const byNumber = typeof p[0] === 'string' && p[0] !== 'latest' && p[0] !== 'finalized';
+      if (byNumber && answeredOtherwise === 0 && r !== null && typeof r === 'object') {
+        answeredOtherwise++;
+        return { ...(r as Record<string, unknown>), hash: keccak256(toBytes('another block at the same height')) };
+      }
+      return r;
+    },
+  });
+  try {
+    await hooks().go(held);
+    const record = await judged(bet.hash);
+    assert.equal(record.state, 'not sent', JSON.stringify(record));
+    const H = (record.cross as { block: { number: string } }).block;
+    assert.equal(answeredOtherwise, 1, 'the last check read H by its number and was answered another hash');
+    assert.deepEqual(
+      { first: heads.slice(0, 2), firstLast: typeof heads[2] === 'string' && /^0x[0-9a-f]+$/.test(heads[2] as string), second: heads.slice(3) },
+      { first: ['latest', 'finalized'], firstLast: true, second: ['latest', 'finalized', `0x${BigInt(H.number).toString(16)}`] },
+      `the headers read, in order: ${JSON.stringify(heads)}`,
+    );
+  } finally {
+    proxy.rule('eth_getBlockByNumber', null);
+  }
+});
+
 for (const variant of ['both rounds\' headers fail', 'each round reads its header, and then read A fails twice', 'the control: a refusal decided at H'] as const) {
   test(`one block: the same fault twice is CHAIN_UNREACHABLE with no block that decided it; ${variant}`, async () => {
     const B = await freshAccount();
@@ -501,6 +537,7 @@ test('the exact call at the recorded limit: the node halving the estimate, as on
   try {
     const bet = await betOn(B, market);
     const record = await judged(bet.hash);
+    assert.ok(record.verdict, JSON.stringify(record));
     const verdict = record.verdict as Record<string, unknown>;
     assert.equal(verdict.code, 'CROSS_WOULD_REVERT', JSON.stringify(record));
     assert.ok(typeof verdict.atGasLimit === 'string', 'marked as at the gas limit');
@@ -513,6 +550,121 @@ test('the exact call at the recorded limit: the node halving the estimate, as on
   const control = await betOn(await freshAccount(), market);
   assert.equal((await judged(control.hash)).state, 'not sent');
 });
+
+test("the estimate's refusal on the record: the simulation at H clean, and the estimate of the same call refused, once by name (the node made to run it from a stranger, so the relay names the caller) and once with no reason (the node made to run it on too little gas). Each is CROSS_WOULD_REVERT with its reason, the named one with the error's arguments; `step` names the estimate, and `at` is the time the outcome was recorded, never a word; no Cross row", async () => {
+  const market = ownMarket();
+  await quoteOn(await freshAccount(), market);
+  for (const variant of ['by name', 'no reason'] as const) {
+    proxy.rule('eth_estimateGas', {
+      kind: 'rewrite',
+      params: (p) => [variant === 'by name' ? { ...(p[0] as object), from: rig.accounts.stranger.address } : { ...(p[0] as object), gas: `0x${(21_300).toString(16)}` }, ...p.slice(1)],
+    });
+    try {
+      const bet = await betOn(await freshAccount(), market);
+      const record = await judged(bet.hash);
+      assert.ok(record.verdict, JSON.stringify(record));
+      const verdict = record.verdict as Record<string, unknown>;
+      assert.equal(verdict.code, 'CROSS_WOULD_REVERT', `${variant}: ${JSON.stringify(record)}`);
+      const line = (await pool.query<{ at: Date }>(`SELECT at FROM events WHERE bet_hash = $1 AND kind = 'bet refused'`, [bet.hash.toLowerCase()])).rows[0];
+      assert.equal(verdict.at, line?.at.toISOString(), `${variant}: at is the time the outcome was recorded`);
+      assert.equal(verdict.step, 'estimate', variant);
+      if (variant === 'by name') {
+        assert.equal(verdict.reason, 'OspexCourierRelay__NotTheSender');
+        assert.deepEqual(verdict.args, [rig.accounts.stranger.address], "the error's arguments");
+      } else {
+        assert.equal(verdict.reason, 'none');
+        assert.equal('args' in verdict, false);
+      }
+      assert.equal((await pool.query('SELECT count(*)::int AS n FROM crosses WHERE bet_hash = $1', [bet.hash.toLowerCase()])).rows[0].n, 0);
+    } finally {
+      proxy.rule('eth_estimateGas', null);
+    }
+  }
+});
+
+test("the record's `at` is the time its outcome was recorded, whatever the line's facts hold: a refusal line whose facts carry a field named at, planted by the test in its own database ahead of the check's own line, is served with `at` that line's time, and the field does not replace it", async () => {
+  await hooks().arm('after-reservation');
+  const bet = await betOn(await freshAccount(), ownMarket());
+  const held = await hooks().reached('after-reservation');
+  const run = (await pool.query<{ run: string }>('SELECT run::text AS run FROM events WHERE order_hash = $1 ORDER BY number LIMIT 1', [bet.hash.toLowerCase()])).rows[0]?.run;
+  const planted = (
+    await pool.query<{ at: Date }>(`INSERT INTO events (run, kind, bet_hash, reason, facts) VALUES ($1, 'bet refused', $2, 'NO_DEPTH', $3) RETURNING at`, [
+      run,
+      bet.hash.toLowerCase(),
+      JSON.stringify({ code: 'NO_DEPTH', error: 'planted by the test', block: null, at: 'a fact named at' }),
+    ])
+  ).rows[0];
+  await hooks().go(held);
+  const record = await judged(bet.hash);
+  assert.ok(record.verdict, JSON.stringify(record));
+  const verdict = record.verdict as Record<string, unknown>;
+  assert.equal(verdict.error, 'planted by the test', 'the record is served from the first line, the planted one');
+  assert.equal(verdict.at, planted?.at.toISOString(), JSON.stringify(record));
+});
+
+/**
+ * A game that the read at H finds with its start written, and that the contract at an earlier block does not: created
+ * at block e, its start written at the next. The case's accounts are funded first, so at e they stand as they do at H;
+ * a rule of the proxy then points one request of the check at e, where the contract refuses the fill by name,
+ * GameNotVerified: the courier's read of the game and the contract disagree.
+ */
+async function gameWrittenAfter(): Promise<{ gameId: bigint; earlier: { blockHash: Hex; requireCanonical: true } }> {
+  const gameId = await rig.createGame();
+  const head = (await rig.rpc('eth_getBlockByNumber', ['latest', false])) as { number: Hex };
+  const created = (await rig.rpc('eth_getBlockByNumber', [`0x${(BigInt(head.number) - 1n).toString(16)}`, false])) as { hash: Hex };
+  return { gameId, earlier: { blockHash: created.hash, requireCanonical: true } };
+}
+
+/** The Cross's own call to the relay, and whether it carries a gas limit: the call at the limit does, the simulations do not. */
+const toRelay = (p: unknown[]) => (p[0] as { to?: string }).to?.toLowerCase() === rig.addresses.relay.toLowerCase();
+const carriesGas = (p: unknown[]) => (p[0] as { gas?: string }).gas !== undefined;
+
+for (const site of ['simulation', 'estimate', 'simulation of the chosen prefix', 'call at the limit'] as const) {
+  test(`GameNotVerified from the contract at the ${site}, where the read at H found the game's start written: the bet is CROSS_WOULD_REVERT naming it, with an incident line beside the refusal that names the ${site}, the courier's read of the game and the contract disagreeing; no Cross row`, async () => {
+    const [M1, M2, B] = [await freshAccount(), await freshAccount(), await freshAccount()];
+    const { gameId, earlier } = await gameWrittenAfter();
+    const market = ownMarket();
+    // Two quotes where the search needs a shorter prefix to choose; one that fills the bet otherwise.
+    if (site === 'simulation of the chosen prefix') {
+      await quoteOn(M1, market, { oddsTick: 200, riskAmount: 5_000n, gameId });
+      await quoteOn(M2, market, { oddsTick: 200, riskAmount: 5_000n, gameId });
+    } else {
+      await quoteOn(M1, market, { oddsTick: 200, riskAmount: 100_000n, gameId });
+    }
+    let simulations = 0;
+    let estimates = 0;
+    const atEarlier = (p: unknown[]) => [p[0], earlier, ...p.slice(2)];
+    if (site === 'simulation') proxy.rule('eth_call', { kind: 'rewrite', params: (p) => (toRelay(p) && !carriesGas(p) && simulations++ === 0 ? atEarlier(p) : p) });
+    if (site === 'estimate') proxy.rule('eth_estimateGas', { kind: 'rewrite', params: (p) => (estimates++ === 0 ? atEarlier(p) : p) });
+    if (site === 'simulation of the chosen prefix') {
+      // The whole list's estimate answered at the one transaction's cap, so its limit is over it and the search runs;
+      // the search's own estimate of the one-quote prefix is the node's. The prefix's simulation is pointed at e.
+      proxy.rule('eth_estimateGas', { kind: 'rewriteResult', result: (_p, r) => (estimates++ === 0 ? `0x${BigInt(CHAIN_LIMITS.transactionGasCap).toString(16)}` : r) });
+      proxy.rule('eth_call', { kind: 'rewrite', params: (p) => (toRelay(p) && !carriesGas(p) && simulations++ === 1 ? atEarlier(p) : p) });
+    }
+    if (site === 'call at the limit') proxy.rule('eth_call', { kind: 'rewrite', params: (p) => (toRelay(p) && carriesGas(p) ? atEarlier(p) : p) });
+    try {
+      const bet = await betOn(B, market, { oddsTick: 200, riskAmount: 10_000n, gameId });
+      const record = await judged(bet.hash);
+      assert.ok(record.verdict, JSON.stringify(record));
+      const verdict = record.verdict as Record<string, unknown>;
+      assert.deepEqual({ code: verdict.code, reason: verdict.reason }, { code: 'CROSS_WOULD_REVERT', reason: 'OspexMarkets__GameNotVerified' }, JSON.stringify(record));
+      const incidents = (await linesOf(bet.hash)).filter((l) => l.kind === 'incident');
+      assert.deepEqual(
+        incidents.map((l) => {
+          const revert = l.facts.revert as { name?: string; args?: unknown[] } | undefined;
+          return { reason: l.reason, at: l.facts.at, error: revert?.name, args: (revert?.args ?? []).map(String) };
+        }),
+        // The game's status at block e: 1, Unverified, created and its start not yet written.
+        [{ reason: 'GAME_READ_AND_CONTRACT_DIFFER', at: site, error: 'OspexMarkets__GameNotVerified', args: [gameId.toString(), '1'] }],
+        JSON.stringify(incidents),
+      );
+      assert.equal((await pool.query('SELECT count(*)::int AS n FROM crosses WHERE bet_hash = $1', [bet.hash.toLowerCase()])).rows[0].n, 0);
+    } finally {
+      proxy.clear();
+    }
+  });
+}
 
 test("the relay's sender at H is the key: with the sender set to another key through the timelock, the bet is COURIER_CANNOT_SEND and no Cross row; set back, the control is ready", async () => {
   const market = ownMarket();
@@ -555,6 +707,7 @@ test('the exact call from the key: a coin that refuses the bettor, with its bala
     const posted = await postOrder(courier.url, r, B, 'take', bet);
     assert.equal(posted.status, 202, JSON.stringify(posted.body));
     const record = await judged(posted.body.orderHash as string, courier.url);
+    assert.ok(record.verdict, JSON.stringify(record));
     const verdict = record.verdict as Record<string, unknown>;
     assert.equal(verdict.code, 'CROSS_WOULD_REVERT', JSON.stringify(record));
     assert.equal(verdict.reason, 'OspexPositions__TakerPullRefused');
@@ -1355,6 +1508,90 @@ test('DEPTH_BEYOND_BOUND, by the quotes listed: forty-one quotes of 100 each, th
 // ──────────────────────────── what changed between a bet's post and its turn ────────────────────────────
 
 /** The check of the bet `post` makes, held just after its reservation while `between` runs, then let go: its record. */
+test("the largest read B and read C, on the rig: 200 quotes of 200 registered accounts, each quote signed by an agent under a grant of its account's own, on a market drawn by one fill. Read B is two calls, each of 100 quotes, 100 accounts and 100 grants; read C is one call over 201 accounts, the 200 and the bettor's; every one names H. The bet is ready, and the two payloads' sizes are recorded", async () => {
+  const market = ownMarket();
+  // The market drawn: one fill, by a Cross the test sends.
+  const [X, Y] = [await freshAccount(), await freshAccount()];
+  let T = await rig.time();
+  const x: Order = { ...orderOn(rig, X, { expiry: T + 600n, oddsTick: 200, riskAmount: 100n, ...market }), positionType: 0 };
+  const y: Order = { ...orderOn(rig, Y, { expiry: T + 25n, oddsTick: 200, riskAmount: 100n, ...market }), positionType: 1 };
+  const drawn = await crossFromTheTest(rig, { order: y, signature: await sign(Y, y, 31337, rig.addresses.matching) }, [{ order: x, signature: await sign(X, x, 31337, rig.addresses.matching) }]);
+  assert.equal(drawn.filled, true, JSON.stringify(drawn));
+  // The 200 accounts: each registered, each under a grant of its own to one agent; the first funded, and its quote,
+  // the best price, fills the bet. The others hold no coin: the walk passes them, and every read reads them.
+  const agent = rig.account(nextAccount++);
+  T = await rig.time();
+  const quotes: Array<{ account: Address; order: Order; grant: number }> = [];
+  for (let i = 0; i < 200; i++) {
+    const who = rig.account(nextAccount++);
+    if (i === 0) await rig.fund(who);
+    else {
+      await rig.rpc('anvil_setBalance', [who.address, `0x${(10n ** 18n).toString(16)}`]);
+      await rig.write(who, rig.addresses.matching, rig.abis.OspexMatching as Abi, 'registerCourier', [rig.addresses.relay]);
+    }
+    const grant = await grantAgent(rig, who, agent.address, 1_000_000n, T + 86_400n);
+    const order: Order = { ...orderOn(rig, who, { expiry: T + 3_600n, oddsTick: i === 0 ? 140 : 150, riskAmount: i === 0 ? 100_000n : 10_000n, nonce: nonceOf(0n, grant, nextOrderNumber()), ...market }), positionType: 0 };
+    quotes.push({ account: who.address, order, grant });
+  }
+  // The quotes planted straight into the records, as the book's tests plant a backlog: each signed by the agent.
+  const key = marketKey(rig.gameId, market.scorer, market.lineTicks).toLowerCase();
+  const rows = await Promise.all(quotes.map(async (q) => ({ hash: contractHashLocal(q.order), account: q.account.toLowerCase(), tick: q.order.oddsTick, risk: q.order.riskAmount.toString(), nonce: q.order.nonce.toString(), signature: await sign(agent, q.order, 31337, rig.addresses.matching) })));
+  await pool.query(
+    `INSERT INTO orders (hash, role, account, game_id, scorer, line_ticks, position_type, odds_tick, risk_amount, nonce, expiry, min_fill, signature, market_key, side, received_block, received_hash, received_time)
+     SELECT r.hash, 'rest', r.account, $1, $2, $3, 0, r.tick::int, r.risk::numeric, r.nonce::numeric, $4, 0, r.signature, $5, 0, 1, '0x' || repeat('cd', 32), 1
+     FROM unnest($6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[]) AS r(hash, account, tick, risk, nonce, signature)`,
+    [rig.gameId.toString(), market.scorer.toLowerCase(), market.lineTicks, (T + 3_600n).toString(), key, rows.map((r) => r.hash), rows.map((r) => r.account), rows.map((r) => String(r.tick)), rows.map((r) => r.risk), rows.map((r) => r.nonce), rows.map((r) => r.signature)],
+  );
+
+  await hooks().arm('after-reservation');
+  const bet = await betOn(await freshAccount(), market, { oddsTick: 200, riskAmount: 10_000n });
+  const held = await hooks().reached('after-reservation');
+  const from = proxy.counted.length;
+  const log = recording(['eth_call']);
+  let record: Record<string, unknown>;
+  try {
+    await hooks().go(held);
+    record = await judged(bet.hash);
+  } finally {
+    log.stop();
+  }
+  assert.equal(record.state, 'not sent', JSON.stringify(record));
+  const H = (record.cross as { block: { hash: string } }).block;
+  assert.deepEqual(legsOf(record), [rows[0]?.hash], 'the best price fills the bet');
+
+  // The check's calls to the node, each with its bytes as the proxy counted them, in the order they arrived.
+  const counted = proxy.counted.slice(from).filter((c) => c.method === 'eth_call');
+  assert.equal(counted.length, log.calls.length, 'every call the proxy counted was recorded');
+  const name = (target: string, data: Hex) => {
+    const abi = target === rig.addresses.matching.toLowerCase() ? rig.abis.OspexMatching : target === rig.addresses.positions.toLowerCase() ? rig.abis.OspexPositions : target === rig.addresses.markets.toLowerCase() ? rig.abis.OspexMarkets : null;
+    return abi === null ? target : decodeFunctionData({ abi: abi as Abi, data }).functionName;
+  };
+  const reads = log.calls.map((c, i) => {
+    const call = c.params[0] as { to: string; data: Hex };
+    const inner = call.to.toLowerCase() === MULTICALL_ADDRESS.toLowerCase() && c.params[2] === undefined ? (decodeFunctionData({ abi: MULTICALL_ABI, data: call.data }).args[0] as ReadonlyArray<{ target: string; callData: Hex }>) : [];
+    const names = inner.map((s) => name(s.target.toLowerCase(), s.callData));
+    const count = (n: string) => names.filter((m) => m === n).length;
+    return { block: byHashOf(c.params[1]), names, count, requestBytes: counted[i]?.requestBytes ?? 0, answerBytes: counted[i]?.answerBytes ?? 0 };
+  });
+  // Read A asks the market's count and read B does not: read B is every call that asks a quote's standing and not that.
+  const readB = reads.filter((r) => r.count('s_cancelledOrders') > 0 && r.count('s_marketCount') === 0);
+  // Read C asks the market's record; the comparison, which also asks what is held, is made with an override and is not a read here.
+  const readC = reads.filter((r) => r.count('getMarket') === 1 && r.count('s_held') > 0);
+  assert.deepEqual(
+    readB.map((r) => ({ quotes: r.count('s_cancelledOrders'), accounts: r.count('isCourier'), grants: r.count('getGrant'), grantLines: r.count('isGrantLine'), blockProbes: r.count(MULTICALL_ADDRESS.toLowerCase()), calls: r.names.length, block: r.block })),
+    [0, 1].map(() => ({ quotes: 100, accounts: 100, grants: 100, grantLines: 100, blockProbes: 3, calls: 1_003, block: { blockHash: H.hash, requireCanonical: true } })),
+    "read B: two calls, each of 100 quotes (2 subcalls a quote), 100 accounts (5 an account), 100 floors, 100 grants and 100 grant lines, and the multicall's three probes of the block, at H",
+  );
+  assert.deepEqual(
+    readC.map((r) => ({ accounts: r.count('s_held'), positions: r.count('getPosition'), blockProbes: r.count(MULTICALL_ADDRESS.toLowerCase()), calls: r.names.length, block: r.block })),
+    [{ accounts: 201, positions: 402, blockProbes: 3, calls: 607, block: { blockHash: H.hash, requireCanonical: true } }],
+    "read C: one call, the market's record and three subcalls for each of 201 accounts, and the three probes of the block, at H",
+  );
+  console.log(
+    `# the largest reads on the rig: read B, two calls of 1,003 subcalls each, requests ${readB.map((r) => r.requestBytes).join(' and ')} bytes, answers ${readB.map((r) => r.answerBytes).join(' and ')} bytes; read C, one call of 607 subcalls, request ${readC[0]?.requestBytes} bytes, answer ${readC[0]?.answerBytes} bytes`,
+  );
+});
+
 async function checkedAfter(post: () => Promise<{ hash: Hex }>, between: () => Promise<void>): Promise<Record<string, unknown>> {
   await hooks().arm('after-reservation');
   const posted = await post();

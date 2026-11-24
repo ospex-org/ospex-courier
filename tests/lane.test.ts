@@ -341,16 +341,45 @@ test("two waiting bets of one account, the first recorded with the higher hash, 
   }
 });
 
-test('two processes starting at once on one database, a bet held by a third that is gone: each take locks the lane, raises its epoch and returns the held bet, one after the other; no statement is ended for a deadlock; one owns the lane and the other takes no bets; and the bet is judged exactly once', async () => {
+test('two processes starting at once on one database, a bet held by a third that is gone, the two takes seen waiting together on the lane\'s row the test holds: each take locks the lane, raises its epoch and returns the held bet, one after the other, so the epoch rises by two; no statement is ended for a deadlock; one owns the lane and the other takes no bets; and the bet is judged exactly once', async () => {
   // The stack's courier holds a bet just after its reservation, and is stopped there: the bet stays held.
   await hooks().arm('after-reservation');
   const bet = await lonelyBet(await freshAccount());
   await hooks().reached('after-reservation');
   await stack.courier.stop();
-  assert.equal((await laneRow()).held_bet, bet.hash.toLowerCase(), 'held by a process that is gone');
-  const both = await Promise.allSettled([startHookedCourier(stack.env), startHookedCourier(stack.env)]);
+  const before = await laneRow();
+  assert.equal(before.held_bet, bet.hash.toLowerCase(), 'held by a process that is gone');
+  // The two takes made to overlap: the test holds the lane's row, starts both, and lets the row go only once the lock
+  // view shows both waiting on the lane. A process takes the lane before it listens, so neither start is awaited while
+  // the row is held; a start that ends first ends the look.
+  const holder = await pool.connect();
+  let starting: Promise<Array<PromiseSettledResult<CourierProcess>>> | null = null;
+  let waiting = -1;
+  try {
+    await holder.query('BEGIN');
+    await holder.query('SELECT 1 FROM lanes WHERE sender = $1 FOR UPDATE', [rig.accounts.sender.address.toLowerCase()]);
+    const holderPid = (await holder.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]?.pid as number;
+    starting = Promise.allSettled([startHookedCourier(stack.env), startHookedCourier(stack.env)]);
+    let ended = false;
+    void starting.then(() => {
+      ended = true;
+    });
+    waiting = await seen(async () => {
+      if (ended) return 0;
+      const { rows } = await pool.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = current_database() AND pid <> $1 AND wait_event_type = 'Lock' AND cardinality(pg_blocking_pids(pid)) > 0 AND query ILIKE '%lanes%'`,
+        [holderPid],
+      );
+      return (rows[0]?.n ?? 0) >= 2 ? (rows[0]?.n as number) : null;
+    });
+  } finally {
+    await holder.query('ROLLBACK').catch(() => undefined);
+    holder.release();
+  }
+  const both = await (starting ?? Promise.resolve([]));
   const started = both.flatMap((b) => (b.status === 'fulfilled' ? [b.value] : []));
   try {
+    assert.equal(waiting, 2, "both takes seen waiting on the lane's row before the test let it go");
     const anyOne = started[0] ?? assert.fail(`neither process started: ${both.map((b) => (b.status === 'rejected' ? String(b.reason) : 'started')).join('; ')}`);
     const record = await judged(bet.hash, anyOne.url).catch((err: unknown) => ({ unjudged: String(err) }) as Record<string, unknown>);
     const lane = await laneRow();
@@ -363,9 +392,9 @@ test('two processes starting at once on one database, a bet held by a third that
     // Which take came last is the database's order, not the runs' numbers: the owner is one of the two, and the
     // other takes no bets. The bet is judged once, by whichever held it last; a take after its outcome finds it judged.
     assert.deepStrictEqual(
-      { started: both.map((b) => b.status), ownerIsOneOfThem: runs.includes(owner), taking: [...taking].sort(), bet: record.state, lines, laneHolds: lane.held_bet, endedForADeadlock },
-      { started: ['fulfilled', 'fulfilled'], ownerIsOneOfThem: true, taking: [false, true], bet: 'refused', lines: [{ kind: 'bet refused', reason: 'NO_DEPTH', byOneOfThem: true }], laneHolds: null, endedForADeadlock: [] },
-      'both started; one owns the lane and the other takes no bets; the held bet was judged once; no deadlock',
+      { started: both.map((b) => b.status), epochRose: Number(BigInt(lane.epoch) - BigInt(before.epoch)), ownerIsOneOfThem: runs.includes(owner), taking: [...taking].sort(), bet: record.state, lines, laneHolds: lane.held_bet, endedForADeadlock },
+      { started: ['fulfilled', 'fulfilled'], epochRose: 2, ownerIsOneOfThem: true, taking: [false, true], bet: 'refused', lines: [{ kind: 'bet refused', reason: 'NO_DEPTH', byOneOfThem: true }], laneHolds: null, endedForADeadlock: [] },
+      'both started; each take raised the epoch once; one owns the lane and the other takes no bets; the held bet was judged once; no deadlock',
     );
   } finally {
     for (const c of started) await c.stop();
@@ -497,6 +526,7 @@ for (const variant of ['the process ended at the kill point', "the outcome's tra
     const restarted = await stack.restartCourier({ hooked: true });
     const record = (await get(url(), `/v1/orders/${pair.hash}`)).body;
     assert.equal(record.state, 'stopped', JSON.stringify(record));
+    assert.ok(record.verdict, JSON.stringify(record));
     const verdict = record.verdict as Record<string, unknown>;
     assert.equal(verdict.code, 'STOPPED');
     assert.equal(verdict.error, 'A stop for this bet was recorded while it was being checked. Nothing was sent.');
@@ -560,7 +590,9 @@ test('a stopped quote is listed for no bet whose candidate query begins after th
   const stop = await postStop(url(), rig, M, stopMessage(M.address, [q.hash]));
   assert.equal(stop.status, 200, JSON.stringify(stop.body));
   const bet = await betOf(await freshAccount(), market);
-  assert.equal(((await judged(bet.hash)).verdict as { code: string }).code, 'NO_DEPTH');
+  const record = await judged(bet.hash);
+  assert.ok(record.verdict, JSON.stringify(record));
+  assert.equal((record.verdict as { code: string }).code, 'NO_DEPTH');
   const other = ownMarket() as { scorer: Hex; lineTicks: number };
   await quoteOf(await freshAccount(), other);
   assert.equal((await judged((await betOf(await freshAccount(), other)).hash)).state, 'not sent', 'the control');
