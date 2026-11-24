@@ -1,14 +1,16 @@
 import { decodeFunctionResult, encodeFunctionData, keccak256, toBytes, type Address, type Hex } from 'viem';
-import { MULTICALL_ABI, MULTICALL_ADDRESS, RELAY_ABI } from './abi';
+import { MULTICALL_ABI, MULTICALL_ADDRESS, RELAY_ABI, RELAY_SENDER_SLOT } from './abi';
 import {
   byHash,
   callAt,
   describeNodeFailure,
   estimateGasAt,
+  ExecutionReverted,
   headerByNumber,
   headerByTag,
   multicallAt,
   NodeFailure,
+  storageAt,
   transactionCountAt,
   type Header,
   type JsonRpc,
@@ -20,8 +22,16 @@ import {
 // pre-check will make three ways: at the latest block's hash; at the hash of a
 // block 50 back, where the multicall contract's answer must be that older
 // block's number; and at a hash no block has, which must come back as an
-// error. It also overrides one balance and reads it back, to learn whether an
-// override is taken. The verdicts are on the status address.
+// error. It reads the relay's storage slot 0 at the latest hash and holds it to
+// the relay's sender. It overrides that slot for one call, setting it to the
+// multicall contract, and reads the sender back, to learn whether an override
+// is taken. And it makes a call whose answer depends on the block's time at two
+// hashes of two different times, a call that succeeds while the block's time is
+// under the later block's and is refused from that second on: the call, its
+// estimate and the call at the estimated limit, each at the same hash, so a
+// node that runs a call named by a hash at another block's time is seen. The
+// verdicts are on the status address; while one the pre-check needs fails, the
+// door takes no order.
 
 export interface Outcome {
   ok: boolean;
@@ -42,11 +52,15 @@ export interface NodeCheck {
   latest: { number: string; hash: Hex } | null;
   back: { number: string; hash: Hex } | null;
   verdicts: Verdict[];
-  /** Whether the node took a balance override on eth_call, read back at the latest block's hash. */
+  /** Whether the relay's storage slot 0 at the latest block's hash holds the relay's sender, as the relay's own read answers it at that hash. */
+  relaySenderSlot: Outcome;
+  /** Whether the node took an override on eth_call: the relay's slot 0 set to the multicall contract for one call, and the relay's sender read back as that, at the latest block's hash. */
   overrideTaken: Outcome;
+  /** Whether a call whose answer depends on the block's time ran at each named block's own time: at the older hash it, its estimate and the call at the estimated limit succeed; at the later hash the call and the estimate are refused. */
+  timedCall: Outcome;
   /** Whether the node answers the finalized tag with a block at or under the latest. */
   finalized: Outcome;
-  /** Every request the pre-check needs held, at both hashes and refused at the unknown one, and finalized answered. */
+  /** Every request the pre-check needs held, at both hashes and refused at the unknown one; the relay's slot is its sender; the timed call ran at each block's time; and finalized answered. An override is not needed: without one the comparison is skipped. */
   usable: boolean;
 }
 
@@ -56,7 +70,6 @@ export const BLOCKS_BACK = 50n;
 /** A hash no block has: the hash of a sentence, which no header is. */
 export const UNKNOWN_HASH: Hex = keccak256(toBytes('ospex courier: a hash no block has'));
 
-const OVERRIDDEN_BALANCE = 0x1234_5678_9abc_def0n;
 
 function failed(err: unknown): Outcome {
   const d = describeNodeFailure(err);
@@ -88,9 +101,21 @@ async function expectRefusal(work: () => Promise<unknown>): Promise<Outcome> {
 export interface NodeCheckTargets {
   /** The relay: the address the exact call goes to. */
   relay: Address;
-  /** The address whose transaction count is read: the sender key's, once there is one; the relay's sender until then. */
+  /** The address the calls are made from and whose transaction count is read: COURIER_ADDRESS, the key's address. */
   sender: Address;
 }
+
+/**
+ * The creation code of the timed call: it returns nothing while the block's time is under `before`, and reverts with
+ * no data from that second on. A call with no target runs it as a creation, so no contract need be on the chain:
+ * PUSH8 before, TIMESTAMP, LT, PUSH1 19, JUMPI, (REVERT 0 0), JUMPDEST at 19, (RETURN 0 0).
+ */
+export function timedCode(before: bigint): Hex {
+  return `0x67${before.toString(16).padStart(16, '0')}421060135760006000fd5b60006000f3`;
+}
+
+/** The word the relay's slot 0 holds for an address: twelve zero bytes and the address. */
+const slotWord = (address: Address): Hex => `0x${'0'.repeat(24)}${address.slice(2).toLowerCase()}`;
 
 export async function checkNode(rpc: JsonRpc, targets: NodeCheckTargets, now: () => Date = () => new Date()): Promise<NodeCheck> {
   const checkedAt = now().toISOString();
@@ -99,7 +124,7 @@ export async function checkNode(rpc: JsonRpc, targets: NodeCheckTargets, now: ()
     latest = await headerByTag(rpc, 'latest');
   } catch (err) {
     const saw = failed(err);
-    return { checkedAt, latest: null, back: null, verdicts: [], overrideTaken: saw, finalized: saw, usable: false };
+    return { checkedAt, latest: null, back: null, verdicts: [], relaySenderSlot: saw, overrideTaken: saw, timedCall: saw, finalized: saw, usable: false };
   }
   const backNumber = latest.number >= BLOCKS_BACK ? latest.number - BLOCKS_BACK : 0n;
   let back: Header | null = null;
@@ -165,16 +190,58 @@ export async function checkNode(rpc: JsonRpc, targets: NodeCheckTargets, now: ()
     ),
   );
 
-  // One balance overridden and read back, at the latest block's hash.
-  const probe = targets.sender;
-  const override: StateOverride = { [probe]: { balance: `0x${OVERRIDDEN_BALANCE.toString(16)}` } };
+  // The relay's slot 0 at the latest hash, held to the relay's sender as its own read answers it at that hash: the
+  // slot the comparison's override writes is the sender's.
+  const relaySenderSlot = await expectAnswer(
+    async () => ({
+      slot: await storageAt(rpc, targets.relay, RELAY_SENDER_SLOT, byHash(latest.hash)),
+      sender: decodeFunctionResult({ abi: RELAY_ABI, functionName: 's_sender', data: await callAt(rpc, { to: targets.relay, data: relayRead }, byHash(latest.hash)) }) as Address,
+    }),
+    ({ slot, sender }) => (slot === slotWord(sender) ? null : `the relay's slot 0 does not hold its sender ${sender}`),
+  );
+
+  // The override: the relay's slot 0 set to the multicall contract for one call, and the sender read back as that.
+  const override: StateOverride = { [targets.relay]: { stateDiff: { [`0x${'0'.repeat(64)}`]: slotWord(MULTICALL_ADDRESS) } } };
   const overrideTaken = await expectAnswer(
-    () => callAt(rpc, { to: MULTICALL_ADDRESS, data: encodeFunctionData({ abi: MULTICALL_ABI, functionName: 'getEthBalance', args: [probe] }) }, byHash(latest.hash), override),
+    () => callAt(rpc, { to: targets.relay, data: relayRead }, byHash(latest.hash), override),
     (out) => {
-      const balance = decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'getEthBalance', data: out }) as bigint;
-      return balance === OVERRIDDEN_BALANCE ? null : 'the balance read back was not the one overridden';
+      const sender = decodeFunctionResult({ abi: RELAY_ABI, functionName: 's_sender', data: out }) as Address;
+      return sender.toLowerCase() === MULTICALL_ADDRESS.toLowerCase() ? null : 'the sender read back was not the one the override wrote';
     },
   );
+
+  // The timed call, at two hashes of two times: at the older block it, its estimate and the call at the estimated
+  // limit succeed, each at that block's hash; at the later block the call and the estimate are refused, each at the
+  // later block's hash. The limit is the courier's own, the estimate and a fifth of it.
+  const timedCall = await (async (): Promise<Outcome> => {
+    if (back === null) return { ok: false, saw: `no header for block ${backNumber}` };
+    if (back.timestamp >= latest.timestamp) return { ok: false, saw: `the two blocks have one time (${latest.timestamp}): a call at each cannot show which time it ran at` };
+    const call = { from: targets.sender, data: timedCode(latest.timestamp) };
+    const older = byHash(back.hash);
+    const later = byHash(latest.hash);
+    const run = async (work: () => Promise<unknown>): Promise<'answered' | 'refused'> => {
+      try {
+        await work();
+        return 'answered';
+      } catch (err) {
+        if (err instanceof ExecutionReverted) return 'refused';
+        throw err;
+      }
+    };
+    try {
+      const callOlder = await run(() => rpc.request('eth_call', [call, older]));
+      const g = await estimateCreation(rpc, call, older);
+      const limited = await run(() => rpc.request('eth_call', [{ ...call, gas: `0x${(g + g / 5n).toString(16)}` }, older]));
+      const callLater = await run(() => rpc.request('eth_call', [call, later]));
+      const estimateLater = await run(() => rpc.request('eth_estimateGas', [call, later]));
+      const seen = { callOlder, limited, callLater, estimateLater };
+      return callOlder === 'answered' && limited === 'answered' && callLater === 'refused' && estimateLater === 'refused'
+        ? { ok: true, saw: 'answered as expected' }
+        : { ok: false, saw: `the call did not run at each block's own time: ${JSON.stringify(seen)}` };
+    } catch (err) {
+      return failed(err);
+    }
+  })();
 
   // The finalized tag: a block at or under the latest.
   const finalized = await expectAnswer(
@@ -182,14 +249,23 @@ export async function checkNode(rpc: JsonRpc, targets: NodeCheckTargets, now: ()
     (h) => (h.number <= latest.number ? null : `finalized (${h.number}) is above latest (${latest.number})`),
   );
 
-  const usable = verdicts.every((v) => v.atLatest.ok && v.atBlockBack.ok && v.atUnknownHash.ok) && finalized.ok;
+  const usable = verdicts.every((v) => v.atLatest.ok && v.atBlockBack.ok && v.atUnknownHash.ok) && relaySenderSlot.ok && timedCall.ok && finalized.ok;
   return {
     checkedAt,
     latest: { number: latest.number.toString(), hash: latest.hash },
     back: back === null ? null : { number: back.number.toString(), hash: back.hash },
     verdicts,
+    relaySenderSlot,
     overrideTaken,
+    timedCall,
     finalized,
     usable,
   };
+}
+
+/** eth_estimateGas of a call with no target (a creation), at a named block. */
+async function estimateCreation(rpc: JsonRpc, call: { from: Address; data: Hex }, ref: ReturnType<typeof byHash>): Promise<bigint> {
+  const answer = await rpc.request<unknown>('eth_estimateGas', [call, ref]);
+  if (typeof answer !== 'string' || !/^0x[0-9a-fA-F]{1,64}$/.test(answer)) throw new NodeFailure('malformed', 'eth_estimateGas', null, 'the estimate is not a hex quantity');
+  return BigInt(answer);
 }

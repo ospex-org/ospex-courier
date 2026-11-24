@@ -457,6 +457,88 @@ test('a stops table of the older shape that holds a row is not brought to this s
   }
 });
 
+/** A table's columns and constraints, as the catalog states them: the shape two databases are compared by. */
+async function tableShape(on: pg.Pool, table: string): Promise<{ columns: string[]; constraints: string[] }> {
+  const columns = await on.query<{ column_name: string; data_type: string; is_nullable: string; column_default: string | null }>(
+    'SELECT c.column_name, c.data_type, c.is_nullable, c.column_default FROM information_schema.columns c WHERE c.table_schema = current_schema() AND c.table_name = $1 ORDER BY c.column_name',
+    [table],
+  );
+  const constraints = await on.query<{ conname: string; contype: string; convalidated: boolean; definition: string }>(
+    'SELECT c.conname, c.contype, c.convalidated, pg_get_constraintdef(c.oid) AS definition FROM pg_constraint c WHERE c.conrelid = $1::regclass ORDER BY c.conname',
+    [table],
+  );
+  return {
+    columns: columns.rows.map((r) => `${r.column_name} ${r.data_type} ${r.is_nullable === 'YES' ? 'null' : 'not null'}${r.column_default === null ? '' : ` default ${r.column_default}`}`),
+    constraints: constraints.rows.map((r) => `${r.conname} ${r.contype} ${r.convalidated ? 'validated' : 'NOT VALIDATED'} ${r.definition}`),
+  };
+}
+
+/** The three rules the lane's build adds, with the oid of the constraint that holds each: the catalog's identity, which a drop and an add again would change. */
+async function laneRules(on: pg.Pool): Promise<Array<{ name: string; oid: string; validated: boolean; definition: string }>> {
+  const { rows } = await on.query<{ name: string; oid: string; validated: boolean; definition: string }>(
+    `SELECT c.conname AS name, c.oid::text AS oid, c.convalidated AS validated, pg_get_constraintdef(c.oid) AS definition FROM pg_constraint c
+     WHERE c.conname IN ('lanes_reserved_at_with_bet', 'crosses_not_sent_reasons', 'crosses_not_sent_with_reason') ORDER BY c.conname`,
+  );
+  return rows;
+}
+
+/** What the lane's build adds, taken away again: the lanes, crosses and events tables as the schema before it made them. */
+const BEFORE_THE_LANE = `
+  ALTER TABLE lanes DROP CONSTRAINT lanes_reserved_at_with_bet;
+  ALTER TABLE lanes DROP COLUMN reserved_at;
+  ALTER TABLE crosses DROP CONSTRAINT crosses_not_sent_reasons;
+  ALTER TABLE crosses DROP CONSTRAINT crosses_not_sent_with_reason;
+  ALTER TABLE crosses DROP COLUMN not_sent_reason;
+  ALTER TABLE crosses DROP COLUMN checked;
+  DROP INDEX events_bet_lines;
+  DROP SEQUENCE lane_reservations;`;
+
+test("lanes and crosses as the schema before the lane made them, and events without the bet's index, are named by the start's probe and brought to this schema by applying it: the columns, the constraints, the index and the sequence read back as a database this schema made by itself; applied again, each new rule is the same constraint; and the rules hold", async () => {
+  const fresh = { lanes: await tableShape(pool, 'lanes'), crosses: await tableShape(pool, 'crosses') };
+  assert.ok(fresh.lanes.constraints.includes('lanes_reserved_at_with_bet c validated CHECK (((held_bet IS NULL) = (reserved_at IS NULL)))'), fresh.lanes.constraints.join(' | '));
+  assert.ok(fresh.crosses.constraints.includes("crosses_not_sent_reasons c validated CHECK ((not_sent_reason = 'SENDER_NOT_BUILT'::text))"), fresh.crosses.constraints.join(' | '));
+  assert.ok(fresh.crosses.constraints.includes("crosses_not_sent_with_reason c validated CHECK (((state = 'not sent'::text) = (not_sent_reason IS NOT NULL)))"), fresh.crosses.constraints.join(' | '));
+  const name = await db.createDatabase('lane_before');
+  const older = openPool(db.urlFor(name), null);
+  try {
+    await applySchema(older);
+    await older.query(BEFORE_THE_LANE);
+    // The start's probe names what this build reads that the older tables lack.
+    assert.deepEqual((await missingSchema(older)).sort(), ['crosses.checked', 'crosses.not_sent_reason', 'lanes.reserved_at']);
+    await applySchema(older);
+    assert.deepEqual(await missingSchema(older), []);
+    assert.deepEqual({ lanes: await tableShape(older, 'lanes'), crosses: await tableShape(older, 'crosses') }, fresh, 'the older tables, brought to this shape');
+    const index = await older.query<{ indexdef: string }>("SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'events_bet_lines'");
+    assert.match(index.rows[0]?.indexdef ?? '', /\(bet_hash, number\) WHERE \(bet_hash IS NOT NULL\)$/);
+    const seq = await older.query<{ n: string }>("SELECT nextval('lane_reservations')::text AS n");
+    assert.equal(seq.rows[0]?.n, '1', 'the sequence is there, from 1');
+    // Applied a second time: each rule is the constraint the first apply made, by its oid.
+    const first = await laneRules(older);
+    assert.equal(first.length, 3);
+    await applySchema(older);
+    assert.deepEqual(await laneRules(older), first, 'nothing dropped, nothing added again');
+    // The rules hold on the converged tables.
+    await insertOrder(HASH('b1'), 'take', { bet_state: 'held' }, older);
+    await older.query(`INSERT INTO lanes (sender) VALUES ($1)`, [ADDRESS('c')]);
+    await refused(older.query('UPDATE lanes SET held_bet = $1, reservation = 1 WHERE sender = $2', [HASH('b1'), ADDRESS('c')]), '23514', 'a lane that holds a bet holds its reservation\'s time');
+    await older.query('UPDATE lanes SET held_bet = $1, reservation = 1, reserved_at = now() WHERE sender = $2', [HASH('b1'), ADDRESS('c')]);
+    await refused(older.query('UPDATE lanes SET held_bet = NULL, reservation = NULL WHERE sender = $1', [ADDRESS('c')]), '23514', 'a lane freed is freed of its time too');
+    const cross = (state: string, reason: string | null) =>
+      older.query(
+        `INSERT INTO crosses (bet_hash, lane, epoch, reservation, block_number, block_hash, block_time, state, not_sent_reason) VALUES ($1, $2, 1, 1, 1, $3, 1, $4, $5)`,
+        [HASH('b1'), ADDRESS('c'), HASH('d'), state, reason],
+      );
+    await refused(cross('not sent', null), '23514', 'a Cross not sent has its reason');
+    await refused(cross('intent', 'SENDER_NOT_BUILT'), '23514', 'only a Cross not sent has a reason');
+    await refused(cross('not sent', 'THE_NODE_SAID_NO'), '23514', 'a reason this build does not have');
+    await cross('not sent', 'SENDER_NOT_BUILT');
+    const checked = await older.query<{ checked: unknown }>('SELECT checked FROM crosses WHERE bet_hash = $1', [HASH('b1')]);
+    assert.deepEqual(checked.rows[0]?.checked, {}, 'the figures start empty');
+  } finally {
+    await older.end();
+  }
+});
+
 test('the courier\'s own budget row and an account\'s both fit the accounts table, and nothing else does', async () => {
   await pool.query("INSERT INTO accounts (account, budget) VALUES ('courier', 2400)");
   await pool.query('INSERT INTO accounts (account, budget) VALUES ($1, 240)', [ADDRESS('a')]);

@@ -238,6 +238,29 @@ export const COLUMNS_USED: ReadonlyArray<readonly [table: string, column: string
   ['games', 'start'],
   ['games', 'reporters_published'],
   ['games', 'start_unreadable_at'],
+  ['lanes', 'sender'],
+  ['lanes', 'epoch'],
+  ['lanes', 'owner_run'],
+  ['lanes', 'held_bet'],
+  ['lanes', 'reservation'],
+  ['lanes', 'open_cross'],
+  ['lanes', 'reserved_at'],
+  ['crosses', 'bet_hash'],
+  ['crosses', 'lane'],
+  ['crosses', 'epoch'],
+  ['crosses', 'reservation'],
+  ['crosses', 'block_number'],
+  ['crosses', 'block_hash'],
+  ['crosses', 'block_time'],
+  ['crosses', 'state'],
+  ['crosses', 'hand_offs'],
+  ['crosses', 'not_sent_reason'],
+  ['crosses', 'checked'],
+  ['legs', 'bet_hash'],
+  ['legs', 'position'],
+  ['legs', 'order_hash'],
+  ['legs', 'expected_maker_risk'],
+  ['legs', 'expected_taker_risk'],
 ];
 
 /** The tables the schema makes, all of which must exist. */
@@ -279,6 +302,12 @@ export interface Store {
    * waits the pool's time out is answered as the database being unavailable.
    */
   door: pg.Pool;
+  /**
+   * The lane's own pool, one connection: the bet's check runs its transactions and its two statements (the candidate
+   * query and the marks) on it, each a statement or a short transaction, never held across a read of the chain. So
+   * the book's readers waiting on the node never keep the lane waiting for a connection; only a row lock can.
+   */
+  lane: pg.Pool;
   runs: Runs;
   events: Events;
   conditions: Conditions;
@@ -298,14 +327,16 @@ export interface Store {
 
 const REPORT_KINDS = ['condition opened', 'condition cleared', 'incident'];
 
-export function createStore(pool: pg.Pool, door: pg.Pool, log: (line: string) => void = () => undefined): Store {
+export function createStore(pool: pg.Pool, door: pg.Pool, log: (line: string) => void = () => undefined, lane: pg.Pool = door): Store {
   // An idle connection the database drops raises an error on the pool itself, which with no listener would end the
   // process. It is logged by its code and the pool makes a new connection at the next query.
   pool.on('error', (err) => log(`database: an idle connection failed${errorCode(err)}`));
   door.on('error', (err) => log(`database: the door's idle connection failed${errorCode(err)}`));
+  if (lane !== door) lane.on('error', (err) => log(`database: the lane's idle connection failed${errorCode(err)}`));
   return {
     pool,
     door,
+    lane,
     runs: createRuns(pool),
     events: createEvents(pool),
     conditions: createConditions(pool),
@@ -347,7 +378,7 @@ export function createStore(pool: pg.Pool, door: pg.Pool, log: (line: string) =>
       });
     },
     async close() {
-      await Promise.all([pool.end(), door.end()]);
+      await Promise.all([pool.end(), door.end(), ...(lane === door ? [] : [lane.end()])]);
     },
   };
 }

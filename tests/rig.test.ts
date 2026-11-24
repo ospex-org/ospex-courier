@@ -56,7 +56,7 @@ test('the courier read the set from the signpost and the status names every addr
   assert.equal(lower(set.commit ?? ''), '0xbaa1fc566cf13552d968fb738ccb8ca3d859666f');
   const sender = body.sender as Record<string, string | null>;
   assert.equal(lower(sender.relay ?? ''), lower(rig.accounts.sender.address));
-  assert.equal(sender.key, null, 'this build holds no key');
+  assert.equal(lower(sender.key ?? ''), lower(rig.accounts.sender.address), "the key is COURIER_ADDRESS: an address, for which this build holds no key");
   const node = body.node as Record<string, unknown>;
   assert.equal(node.usable, true, JSON.stringify(node));
   assert.ok(Array.isArray(body.conditions) && body.conditions.length === 0);

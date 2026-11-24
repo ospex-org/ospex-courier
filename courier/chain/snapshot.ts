@@ -1,7 +1,7 @@
 import type { Address, Hex } from 'viem';
 import type { Conditions } from '../records/conditions';
 import { failureCode } from '../records/store';
-import { describeNodeFailure, headerByTag, multicallAt, NodeFailure, StateMismatch, type Header, type JsonRpc, type MulticallResult } from './rpc';
+import { describeNodeFailure, headerByNumber, headerByTag, multicallAt, NodeFailure, StateMismatch, type Header, type JsonRpc, type MulticallResult } from './rpc';
 
 // One block, by hash. A read of the chain starts from a block's header, the
 // latest or the final one, and from then on names that block by its hash in
@@ -62,6 +62,14 @@ export interface ChainReader {
    * once more, and twice is the chain unreachable.
    */
   read<T>(header: Header, calls: MulticallCall[], decode: (results: MulticallResult[]) => T): Promise<T>;
+  /**
+   * Any other request the bet's check makes at the header (the exact call, an estimate, the key's count), with the same
+   * rule as a read: the node's failure is tried once more, twice is the chain unreachable, and the outcome goes to the
+   * records. What `once` returns is a success, a refusal it has turned into its answer included.
+   */
+  ask<T>(header: Header, once: () => Promise<T>): Promise<T>;
+  /** The header at a height, by number, or null where the node has none: the last check of the bet's block. */
+  headerAt(number: bigint): Promise<Header | null>;
   /** The last latest-block header read, and when. Null before the first read. */
   last(): LastRead | null;
 }
@@ -138,6 +146,12 @@ export function createChainReader(deps: ChainReaderDeps): ChainReader {
     },
     async read(header, calls, decode) {
       return attempt(async () => decode(await multicallAt(deps.rpc, header, calls)), () => headerFact(header));
+    },
+    async ask(header, once) {
+      return attempt(once, () => headerFact(header));
+    },
+    async headerAt(number) {
+      return attempt(() => headerByNumber(deps.rpc, number), (h) => (h === null ? { block: number.toString(), hash: null } : headerFact(h)));
     },
     last() {
       return last;

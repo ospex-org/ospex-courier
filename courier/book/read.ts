@@ -1,5 +1,6 @@
 import { getAddress, type Address, type Hex } from 'viem';
-import { readQuotes } from '../chain/reads';
+import { readPositions, readQuotes, type PositionRead } from '../chain/reads';
+import { NO_RECORDS, payable } from '../check/pull';
 import type { BettingSet } from '../chain/set';
 import type { ChainReader } from '../chain/snapshot';
 import { BOUNDS } from '../http/limits';
@@ -75,7 +76,11 @@ export interface Quote {
   bettorPrice: string;
   /** The signed stake less what the chain shows filled at the block. */
   remaining: string;
-  /** How much of `remaining` the account could be pulled for at that block, this quote alone: what its balance and its allowance cover. */
+  /**
+   * How much of `remaining` one bet could fill against this quote alone at that block, whole lots, with the account's
+   * wallet covering the leg's netted pull: what the positions contract would take, after what the account already
+   * holds on the market. A maker that holds the other side can be payable for more than its wallet holds.
+   */
   payable: string;
   minFill: string;
   expiry: string;
@@ -212,7 +217,14 @@ export async function readMarketBook(deps: BookDeps, q: MarketQuery): Promise<Ma
   // judged at the version and under the grant its own nonce names. A quote whose account dropped the relay is not
   // listed and not marked: not an end of the quote, and undone by the account itself.
   const examined: ScannedQuote[] = sides.flatMap((s) => scans[s]?.rows ?? []);
-  const state = await readQuotes(deps.chain, deps.set, header, key, examined.map((e) => ({ hash: e.hash, account: e.account, nonce: e.nonce })));
+  const market = { gameId: q.gameId, scorer: q.scorer, lineTicks: q.lineTicks };
+  const state = await readQuotes(deps.chain, deps.set, header, key, examined.map((e) => ({ hash: e.hash, account: e.account, nonce: e.nonce })), undefined, market);
+  // The positions, where the market is drawn: one read more, after the page's read, whose answer it needs. A market not
+  // drawn holds no position and nothing held, so each account's netted pull is its whole stake there.
+  let positions = new Map<string, PositionRead>();
+  if (state.marketId !== undefined && state.marketId !== 0n && state.accounts.size > 0) {
+    positions = (await readPositions(deps.chain, deps.set, header, state.marketId, [...state.accounts.keys()].map((a) => getAddress(a)))).positions;
+  }
   const endOf = (row: ScannedQuote): EndSeen | null => quoteEnd(row, state, header.timestamp);
   const marks = examined.flatMap((e) => {
     const how = endOf(e);
@@ -251,7 +263,11 @@ export async function readMarketBook(deps: BookDeps, q: MarketQuery): Promise<Ma
         endedOnChain++;
         continue;
       }
-      const cover = a.balance < a.allowance ? a.balance : a.allowance;
+      const p = positions.get(row.account.toLowerCase());
+      const coverable = payable(
+        { side: row.positionType, oddsTick: row.oddsTick, remaining },
+        { records: p === undefined ? NO_RECORDS : { riskA: p.riskA, profitA: p.profitA, riskB: p.riskB, profitB: p.profitB }, held: p?.held ?? 0n, balance: a.balance, allowance: a.allowance },
+      );
       quotes.push({
         orderHash: row.hash,
         account: getAddress(row.account),
@@ -260,7 +276,7 @@ export async function readMarketBook(deps: BookDeps, q: MarketQuery): Promise<Ma
         perLot: { bettor: row.oddsTick - 100, maker: 100 },
         bettorPrice: bettorPrice(row.oddsTick),
         remaining: remaining.toString(),
-        payable: (remaining < cover ? remaining : cover).toString(),
+        payable: coverable.toString(),
         minFill: row.minFill.toString(),
         expiry: row.expiry.toString(),
         recordNumber: row.recordNumber,

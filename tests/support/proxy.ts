@@ -35,6 +35,8 @@ export type Rule =
   | { kind: 'refuse'; code: number; message: string }
   /** Refuse the nth request of the method to arrive since the rule was set (1 the first), where `refuse(nth)` says so; pass the others on. */
   | { kind: 'refuseWhen'; refuse: (nth: number) => boolean; code: number; message: string }
+  /** Refuse the requests of the method whose params `refuse` picks, with this error and no data; pass the others on. */
+  | { kind: 'refuseIf'; refuse: (params: unknown[]) => boolean; code: number; message: string }
   | { kind: 'answer'; result: (params: unknown[]) => unknown }
   | { kind: 'rewrite'; params: (params: unknown[]) => unknown[] }
   /** Pass the request on, and answer with the node's result changed: the chain made to say something else. */
@@ -106,6 +108,10 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       // This request is already counted as arrived, so the nth is the count since the rule less the ones before it.
       const nth = counted.filter((c) => c.method === req.method).length - (arrivedAtRule.get(req.method) ?? 0);
       if (rule.refuse(nth)) return { text: JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: rule.code, message: rule.message } }), how: 'refused' };
+      return { text: await upstream(raw), how: 'passed' };
+    }
+    if (rule?.kind === 'refuseIf') {
+      if (rule.refuse(params)) return { text: JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: rule.code, message: rule.message } }), how: 'refused' };
       return { text: await upstream(raw), how: 'passed' };
     }
     if (rule?.kind === 'answer') {

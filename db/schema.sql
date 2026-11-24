@@ -251,8 +251,35 @@ CREATE TABLE IF NOT EXISTS lanes (
   reservation bigint,
   -- The bet hash of the Cross the lane has open (a crosses row); empty when none.
   open_cross  text,
+  -- When the lane took the bet it holds: the reservation's transaction time, a timestamp that decides nothing.
+  reserved_at timestamptz,
   CONSTRAINT lanes_reservation_with_bet CHECK ((held_bet IS NULL) = (reservation IS NULL))
 );
+
+-- The reservation's time, on a lanes table that stood before it. No lane had a row before the bet's check was built.
+ALTER TABLE lanes ADD COLUMN IF NOT EXISTS reserved_at timestamptz;
+
+-- The numbers of the reservations: each one a lane takes a bet under is new, and never reused.
+CREATE SEQUENCE IF NOT EXISTS lane_reservations;
+
+-- A lane that holds a bet holds its reservation's time with it, and one that holds none holds no time: the bet, the
+-- reservation and the time are emptied together. Added only where no constraint of its name stands, as the stops'
+-- rule above is, and for the same reason: a release reads the catalog, not the table.
+DO $$
+DECLARE
+  standing record;
+BEGIN
+  SELECT c.contype, c.convalidated, pg_get_constraintdef(c.oid) AS definition INTO standing
+  FROM pg_constraint c WHERE c.conrelid = 'lanes'::regclass AND c.conname = 'lanes_reserved_at_with_bet';
+  IF NOT FOUND THEN
+    ALTER TABLE lanes ADD CONSTRAINT lanes_reserved_at_with_bet CHECK ((held_bet IS NULL) = (reserved_at IS NULL));
+  ELSIF standing.contype <> 'c' OR NOT standing.convalidated
+     OR standing.definition <> 'CHECK (((held_bet IS NULL) = (reserved_at IS NULL)))' THEN
+    RAISE EXCEPTION 'the lanes table holds a constraint named lanes_reserved_at_with_bet that is not the validated check this schema makes: %', standing.definition
+      USING ERRCODE = 'invalid_table_definition';
+  END IF;
+END
+$$;
 
 -- ──────────────────────────── crosses ─────────────────────────────────────
 -- One row per Cross, keyed by its bet's hash: one bet, one Cross. The lane,
@@ -290,9 +317,50 @@ CREATE TABLE IF NOT EXISTS crosses (
   -- For a Cross that was replaced, the transaction that took its nonce; for one that reverted, the reason.
   replaced_by          text CHECK (replaced_by ~ '^0x[0-9a-f]{64}$'),
   revert_reason        text,
+  -- Why a Cross was closed not sent; empty for every other state. In this build one reason only, SENDER_NOT_BUILT:
+  -- the check found the bet ready, and the sender is a later build.
+  not_sent_reason      text,
+  -- The check's figures: the final block and the time the candidate statement ran; the estimate, the limit and
+  -- each step of the search for a shorter fill; the key's nonce, its POL and its coin, and the relay's coin, at the
+  -- check's block; the comparison's verdict, or that it was skipped for want of an override; the pulls and
+  -- pay-backs predicted, and the pay-backs refused at the block; the quotes left out after the coin refused one;
+  -- what is left unfilled.
+  checked              jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at           timestamptz NOT NULL DEFAULT now(),
   updated_at           timestamptz NOT NULL DEFAULT now()
 );
+
+-- The reason and the figures, on a crosses table that stood before them. No Cross had a row before this build.
+ALTER TABLE crosses ADD COLUMN IF NOT EXISTS not_sent_reason text;
+ALTER TABLE crosses ADD COLUMN IF NOT EXISTS checked jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+-- The reasons a Cross is closed not sent, and that it has one exactly when it is: each added only where no
+-- constraint of its name stands, as the stops' rule above is. The sender's build adds its own reasons: it drops the
+-- first under its name and adds it again, as the legs' reasons are below.
+DO $$
+DECLARE
+  standing record;
+BEGIN
+  SELECT c.contype, c.convalidated, pg_get_constraintdef(c.oid) AS definition INTO standing
+  FROM pg_constraint c WHERE c.conrelid = 'crosses'::regclass AND c.conname = 'crosses_not_sent_reasons';
+  IF NOT FOUND THEN
+    ALTER TABLE crosses ADD CONSTRAINT crosses_not_sent_reasons CHECK (not_sent_reason IN ('SENDER_NOT_BUILT'));
+  ELSIF standing.contype <> 'c' OR NOT standing.convalidated
+     OR standing.definition <> 'CHECK ((not_sent_reason = ''SENDER_NOT_BUILT''::text))' THEN
+    RAISE EXCEPTION 'the crosses table holds a constraint named crosses_not_sent_reasons that is not the validated check this schema makes: %', standing.definition
+      USING ERRCODE = 'invalid_table_definition';
+  END IF;
+  SELECT c.contype, c.convalidated, pg_get_constraintdef(c.oid) AS definition INTO standing
+  FROM pg_constraint c WHERE c.conrelid = 'crosses'::regclass AND c.conname = 'crosses_not_sent_with_reason';
+  IF NOT FOUND THEN
+    ALTER TABLE crosses ADD CONSTRAINT crosses_not_sent_with_reason CHECK ((state = 'not sent') = (not_sent_reason IS NOT NULL));
+  ELSIF standing.contype <> 'c' OR NOT standing.convalidated
+     OR standing.definition <> 'CHECK (((state = ''not sent''::text) = (not_sent_reason IS NOT NULL)))' THEN
+    RAISE EXCEPTION 'the crosses table holds a constraint named crosses_not_sent_with_reason that is not the validated check this schema makes: %', standing.definition
+      USING ERRCODE = 'invalid_table_definition';
+  END IF;
+END
+$$;
 
 -- A second lock on the same door as the lane's epoch, and not what ownership rests on: at most one Cross per
 -- sender key in a state that is not final.
@@ -356,6 +424,12 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_report_lines
   ON events (number)
   WHERE kind IN ('condition opened', 'condition cleared', 'incident');
+
+-- A bet's lines, by the bet's hash and in order: what GET /v1/orders/{hash} reads a bet's verdict along. The lines the
+-- bet's check writes carry the bet's hash in bet_hash.
+CREATE INDEX IF NOT EXISTS events_bet_lines
+  ON events (bet_hash, number)
+  WHERE bet_hash IS NOT NULL;
 
 -- Nothing changes or removes a line once written.
 CREATE OR REPLACE FUNCTION events_append_only() RETURNS trigger

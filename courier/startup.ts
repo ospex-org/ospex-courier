@@ -3,6 +3,8 @@ import { checkNode, type NodeCheck } from './chain/node';
 import { chainId, createJsonRpc, describeNodeFailure, type JsonRpc } from './chain/rpc';
 import { readSet, SetRefused, type BettingSet } from './chain/set';
 import { createChainReader, type ChainReader } from './chain/snapshot';
+import { createLane } from './check/lane';
+import { NO_HOOKS, type LaneHooks } from './check/hooks';
 import { readCourierConfig, type CourierConfig } from './config';
 import { BOUNDS, createAddressLimiter, createCounters, TIMEOUTS } from './http/limits';
 import { createRequestHandler } from './http/service';
@@ -24,10 +26,8 @@ export class StartupRefused extends Error {
 
 /** What this build does not yet do, published on the status address. */
 export const NOT_YET_BUILT = [
-  'the lanes and the pre-check (the pre-check build): a bet posted is recorded and waits, and nothing examines it',
-  'the sender and the key (the sender build): nothing is signed or sent',
+  'the sender and the key (the sender build): nothing is signed or sent; a bet found ready is closed not sent',
   'incidents and their cursor (the reports build)',
-  "the netted pull's payable (the order-4 build): the book's payable is what a balance and an allowance cover",
 ] as const;
 
 export interface RunningService {
@@ -48,6 +48,8 @@ export interface StartupOptions {
   /** Applies db/schema.sql before the columns are checked: the tests' throwaway databases. The app's release step does it. */
   applySchema?: boolean;
   now?: () => Date;
+  /** The lane's hold points and test faults. Passed by the tests' start file only; the production start file passes none. */
+  hooks?: LaneHooks;
 }
 
 export async function startService(env: Record<string, string | undefined>, options: StartupOptions = {}): Promise<RunningService> {
@@ -70,7 +72,7 @@ export async function startService(env: Record<string, string | undefined>, opti
   let store: Store;
   try {
     const authority = pinnedAuthority(config.databaseCaFile);
-    store = createStore(openPool(config.databaseUrl, authority), openPool(config.databaseUrl, authority, 1), log);
+    store = createStore(openPool(config.databaseUrl, authority), openPool(config.databaseUrl, authority, 1), log, openPool(config.databaseUrl, authority, 1));
   } catch (err) {
     throw new StartupRefused(err instanceof StoreRefused ? err.message : 'DATABASE_URL could not be read as a postgres:// URL');
   }
@@ -102,23 +104,42 @@ export async function startService(env: Record<string, string | undefined>, opti
   }
   log(`courier: the set is entry ${set.entryId} on ${set.signpost}, chain ${set.chainId}: core ${set.core}, relay ${set.relay}, coin ${set.coin}`);
 
-  // What the node can do, proved. While it fails one the pre-check needs, the courier takes no order; this build
-  // takes none, and serves the verdicts.
-  const node = await checkNode(rpc, { relay: set.relay, sender: set.sender }, now);
+  // What the node can do, proved, from the key's address. The verdict is kept: while it fails one the pre-check needs,
+  // the door takes no order (the node's gate), and it is served on the status address.
+  const node = await checkNode(rpc, { relay: set.relay, sender: config.courierAddress }, now);
   log(`courier: the node ${node.usable ? 'honours' : 'does not honour'} every request the pre-check makes at a block's hash; override ${node.overrideTaken.ok ? 'taken' : 'not taken'}`);
 
   // This run.
   const run = await store.runs.start();
-  await store.events.write({ run: run.id, kind: 'run started', facts: { chainId: set.chainId.toString(), entry: set.entryId.toString(), nodeUsable: node.usable } });
+
+  // The reads of the chain. Each applies its outcome to the records at once; this process keeps nothing of the
+  // chain-unreachable condition, since another process may open or clear it at any moment while this one runs.
+  const chain = createChainReader({ rpc, conditions: store.conditions, run: run.id, now, log });
+
+  // The lane, taken before the server listens: this process owns every lane from here, the bets a lane held are back
+  // waiting or finished as stopped, and the `run started` line, written in the take's transaction, says so.
+  const lane = createLane({
+    store,
+    key: config.courierAddress,
+    run,
+    check: { chain, rpc, set, published, overrideTaken: node.overrideTaken.ok },
+    hooks: options.hooks ?? NO_HOOKS,
+    log,
+  });
+  let taken;
+  try {
+    taken = await lane.take({ chainId: set.chainId.toString(), entry: set.entryId.toString(), nodeUsable: node.usable });
+  } catch (err) {
+    await store.close().catch(() => undefined);
+    throw new StartupRefused(`the lane could not be taken: ${databaseRefusal(err)}`);
+  }
+  log(`courier: lane ${config.courierAddress} taken at epoch ${taken.epoch}; ${taken.returned.length} held bet${taken.returned.length === 1 ? '' : 's'} back to waiting, ${taken.stopped.length} finished as stopped`);
 
   const counters = createCounters(now);
   const limiter = createAddressLimiter(BOUNDS.requestsPerAddressPerMinute);
   // The stop route's own count: a second limiter, so a stop is held up by no other request from its address, and holds none up.
   const stopLimiter = createAddressLimiter(BOUNDS.stopsPerAddressPerMinute);
-  // The reads of the chain. Each applies its outcome to the records at once; this process keeps nothing of the
-  // chain-unreachable condition, since another process may open or clear it at any moment while this one runs.
-  const chain = createChainReader({ rpc, conditions: store.conditions, run: run.id, now, log });
-  const handler = createRequestHandler({ store, chain, set, node, run, counters, limiter, stopLimiter, settings: { lowPol: config.lowPol }, published, notYetBuilt: NOT_YET_BUILT, log });
+  const handler = createRequestHandler({ store, chain, set, node, lane, run, counters, limiter, stopLimiter, settings: { lowPol: config.lowPol }, published, notYetBuilt: NOT_YET_BUILT, log });
   // The server's own timeout on a request arriving: a stated number (http/limits.ts), not Node's five minutes; and
   // how often it looks, so the close comes within a second of the number and not within Node's thirty.
   const server: Server = createServer({ requestTimeout: TIMEOUTS.requestMs, connectionsCheckingInterval: TIMEOUTS.checkEveryMs }, handler);
@@ -132,6 +153,8 @@ export async function startService(env: Record<string, string | undefined>, opti
   });
   const address = server.address();
   const port = typeof address === 'object' && address !== null ? address.port : config.port;
+  // The runner, woken once the take is done: it checks the bets the take found waiting, in record order.
+  lane.wake();
 
   let closing: Promise<void> | null = null;
   return {

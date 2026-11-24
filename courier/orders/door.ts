@@ -1,6 +1,9 @@
 import type pg from 'pg';
 import type { Address, Hex } from 'viem';
 import { readForDoor, readQuotes, type DoorRead } from '../chain/reads';
+import type { NodeCheck } from '../chain/node';
+import type { Lane } from '../check/lane';
+import { crossOf, verdictLine } from '../records/lanes';
 import type { BettingSet } from '../chain/set';
 import { ChainUnreachable, type ChainReader } from '../chain/snapshot';
 import { BOUNDS, type Counters } from '../http/limits';
@@ -10,6 +13,7 @@ import type { Run } from '../records/runs';
 import type { Store } from '../records/store';
 import { budgetRefusal, takeBudgets } from './budgets';
 import { checkOrderRules, coinAmount, isChainSignature, marketKey, ORDER_RULES, orderHash, orderSigner, orderToJson, readOrderShape, splitNonce, type NonceParts, type OrderFields } from './order';
+import { DOOR } from '../check/sentences';
 import { isPublishedList } from './published';
 import { grantGone, orderGone, quoteEnd } from './standing';
 
@@ -27,6 +31,10 @@ export interface DoorDeps {
   store: Store;
   chain: ChainReader;
   set: BettingSet;
+  /** The node's verdict from the check made at this process's start: while it is not usable, no order is taken. */
+  node: Pick<NodeCheck, 'usable'>;
+  /** The lane: check 17 for a bet, and the wake after a bet's commit. */
+  lane: Pick<Lane, 'admits' | 'wake'>;
   run: Run;
   counters: Counters;
   /** The published list of reporters, read at start. */
@@ -39,9 +47,80 @@ export const GAME_STATUS = { None: 0, Unverified: 1, Verified: 2, Disputed: 3, S
 
 const refusal = (status: number, code: string, error: string, extra: Record<string, unknown> = {}): HttpAnswer => ({ status, body: { error, code, ...extra } });
 
-/** The record of an order, as POST answers it and GET /v1/orders/{hash} serves it. */
-export function orderRecord(row: OrderRow): Record<string, unknown> {
-  const state = row.role === 'rest' ? (row.ended === null ? 'resting' : row.ended) : row.ended !== null ? row.ended : row.betState === 'waiting' ? 'queued' : row.betState;
+/** What a bet's record adds, read from its outcome's line and its Cross. */
+export interface BetOutcome {
+  verdict: Awaited<ReturnType<typeof verdictLine>>;
+  cross: Awaited<ReturnType<typeof crossOf>>;
+}
+
+/**
+ * A bet's state, by its first end: `stopped` where a stop's mark came before any judgment (while it waited, or while
+ * it was held, with the verdict STOPPED); otherwise the judgment's own state, with `ended` showing a later stop beside
+ * it: `refused`, `lapsed`, or the Cross's state, `not sent` in this build. `queued` while it waits its turn or its
+ * check runs.
+ */
+function betState(row: OrderRow, outcome: BetOutcome | null): string {
+  const verdict = outcome?.verdict ?? null;
+  if (row.betState === 'waiting' || row.betState === 'held') return row.ended === 'stopped' ? 'stopped' : 'queued';
+  if (row.betState === 'refused') return verdict?.reason === 'STOPPED' ? 'stopped' : 'refused';
+  if (row.betState === 'lapsed') return 'lapsed';
+  if (row.betState === 'sent') return outcome?.cross?.state ?? 'not sent';
+  return String(row.betState);
+}
+
+/** A bet's verdict as its record serves it: the code and its sentence, the block that decided it or null, the last header read where none did, the code's own fields, and the time it was recorded, last, so that no field replaces it. */
+function verdictOf(v: NonNullable<BetOutcome['verdict']>): Record<string, unknown> {
+  const { code, error, block, lastObservedBlock, ...fields } = v.facts as { code?: unknown; error?: unknown; block?: unknown; lastObservedBlock?: unknown };
+  return {
+    code: code ?? v.reason,
+    error,
+    block: block ?? null,
+    ...(lastObservedBlock === undefined ? {} : { lastObservedBlock }),
+    ...fields,
+    at: v.at.toISOString(),
+  };
+}
+
+/** A bet's Cross as its record serves it. */
+function crossRecord(c: NonNullable<BetOutcome['cross']>, verdict: BetOutcome['verdict']): Record<string, unknown> {
+  const checked = c.checked as Record<string, unknown>;
+  const gas = (checked.gas ?? {}) as Record<string, unknown>;
+  return {
+    state: c.state,
+    handOffs: c.handOffs,
+    reason: c.reason,
+    message: (verdict?.facts as { message?: unknown } | undefined)?.message ?? null,
+    block: c.block,
+    legs: c.legs.map((l) => ({ position: l.position, orderHash: l.orderHash, account: l.account, oddsTick: l.oddsTick, makerRisk: l.makerRisk, takerRisk: l.takerRisk })),
+    takerRisk: checked.takerRisk ?? null,
+    unfilled: checked.unfilled ?? null,
+    pulls: checked.pulls ?? {},
+    paysBack: checked.paysBack ?? {},
+    paysBackRefused: checked.paysBackRefused ?? {},
+    gas: { estimate: gas.estimate ?? checked.estimate ?? null, limit: gas.limit ?? checked.limit ?? null },
+    nonce: checked.nonce ?? null,
+  };
+}
+
+/** What a bet's record needs beyond its row: its outcome's line and its Cross. Two reads, along `events_bet_lines` and the Cross's key. */
+export async function betOutcome(store: Store, row: OrderRow): Promise<BetOutcome | null> {
+  if (row.role !== 'take' || row.betState === 'waiting' || row.betState === 'held') return null;
+  const [verdict, cross] = await Promise.all([verdictLine(store.pool, row.hash), crossOf(store.pool, row.hash)]);
+  return { verdict, cross };
+}
+
+/** The record of an order, as POST answers it and GET /v1/orders/{hash} serves it; a bet's with what came of it. */
+export function orderRecord(row: OrderRow, outcome: BetOutcome | null = null): Record<string, unknown> {
+  const state = row.role === 'rest' ? (row.ended === null ? 'resting' : row.ended) : betState(row, outcome);
+  const verdict = outcome?.verdict ?? null;
+  const bet =
+    row.role === 'take'
+      ? {
+          ...(state === 'queued' ? { turn: row.betState === 'held' ? 'checking' : 'waiting' } : {}),
+          ...(verdict !== null && verdict.kind !== 'cross not sent' ? { verdict: verdictOf(verdict) } : {}),
+          cross: outcome?.cross === null || outcome?.cross === undefined ? null : crossRecord(outcome.cross, verdict),
+        }
+      : {};
   return {
     orderHash: row.hash,
     role: row.role,
@@ -56,7 +135,7 @@ export function orderRecord(row: OrderRow): Record<string, unknown> {
     ended: row.ended,
     endedAt: row.endedAt === null ? null : row.endedAt.toISOString(),
     endedBlock: row.endedBlock === null ? null : { number: row.endedBlock.toString(), hash: row.endedBlockHash },
-    ...(row.role === 'take' ? { cross: null, note: 'a bet posted in this build is recorded and waits; the pre-check and the sender are later builds, so nothing is sent yet' } : {}),
+    ...bet,
   };
 }
 
@@ -70,14 +149,18 @@ interface Refused {
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
+/** Why an order's grant is gone, in the door's words: not its account's current one, or ending at or before the chain's time plus one. The bet's check says the same. */
+export function grantGoneWhy(grantNumber: number, currentGrant: number, endsAt: bigint, chainTime: bigint): string {
+  return grantNumber !== currentGrant
+    ? currentGrant === 0
+      ? 'its account has no grant standing now'
+      : `its account's current grant is ${currentGrant}`
+    : `it ends at ${endsAt}, at or under the chain's time plus one, ${chainTime + 1n}`;
+}
+
 /** The refusal of an order whose grant is gone: not its account's current grant, or ending at or before the chain's time plus one. */
 function grantGoneRefusal(grantNumber: number, currentGrant: number, endsAt: bigint, chainTime: bigint): Refused {
-  const why =
-    grantNumber !== currentGrant
-      ? currentGrant === 0
-        ? 'its account has no grant standing now'
-        : `its account's current grant is ${currentGrant}`
-      : `it ends at ${endsAt}, at or under the chain's time plus one, ${chainTime + 1n}`;
+  const why = grantGoneWhy(grantNumber, currentGrant, endsAt, chainTime);
   return {
     status: 422,
     code: 'GRANT_GONE',
@@ -149,6 +232,10 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
 
   // 2 is the caller's minute, taken by the service before any route.
 
+  // The node's gate, for every order: the node failed the check made at this process's start, so no order is taken
+  // until a process starts on a node that passes. Before anything is read or charged, and nothing is recorded.
+  if (!deps.node.usable) return counted(refusal(503, 'NODE_UNUSABLE', DOOR.NODE_UNUSABLE));
+
   // 3. The order's own rules, as the contract has them.
   const rules = checkOrderRules(order, deps.set);
   if (!rules.ok) return counted(refusal(422, rules.code, rules.error));
@@ -179,7 +266,7 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
   // 5. On record already? A repeat is answered from the record; the other role is a conflict.
   const known = await deps.store.orders.get(hash);
   if (known !== null) {
-    if (known.role === role) return { status: 200, body: orderRecord(known) };
+    if (known.role === role) return { status: 200, body: orderRecord(known, await betOutcome(deps.store, known)) };
     return counted(refusal(409, 'ROLE_CONFLICT', `This order is on record as ${known.role === 'rest' ? 'a quote' : 'a bet'}; an order hash has one role at this courier, the first one posted.`));
   }
 
@@ -217,7 +304,7 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
     const again = await deps.store.orders.get(hash, client);
     if (again !== null) {
       await client.query('COMMIT');
-      if (again.role === role) return { status: 200, body: orderRecord(again) };
+      if (again.role === role) return { status: 200, body: orderRecord(again, await betOutcome(deps.store, again)) };
       return counted(refusal(409, 'ROLE_CONFLICT', `This order is on record as ${again.role === 'rest' ? 'a quote' : 'a bet'}; an order hash has one role at this courier, the first one posted.`));
     }
 
@@ -265,8 +352,10 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
       return await refuse(422, 'REPORTERS_NOT_THE_PUBLISHED_LIST', `Game ${order.gameId}'s reporters are not exactly the published list; the courier carries only games whose reporters are.`, { published: deps.published });
     }
     if (game.status !== null && game.status >= GAME_STATUS.Scored) return await refuse(422, 'GAME_ENDED', `Game ${order.gameId} has ended (status ${game.status}).`);
+    // The contract refuses a fill from the second the game closes, and no later block's time is under T + 1: an order
+    // whose game closes at or under T + 1 can fill in no later block, in either role.
     const closesAt = game.start + (game.window ?? 0n);
-    if (T >= closesAt) return await refuse(422, 'BETS_CLOSED', `Bets on game ${order.gameId} closed at ${closesAt}, the start plus the window; the chain's time is ${T}.`, { closesAt: closesAt.toString(), chainTime: T.toString() });
+    if (closesAt <= T + 1n) return await refuse(422, 'BETS_CLOSED', DOOR.BETS_CLOSED(order.gameId.toString(), closesAt.toString(), T.toString()), { closesAt: closesAt.toString(), chainTime: T.toString() });
 
     // 12. The order's standing on chain, as the contract judges it (standing.ts): the order's own half, then its
     // grant's. For a new order the grant's half was judged above, before the budgets, from this same read, so it
@@ -329,12 +418,18 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
       if (waiting.account >= BOUNDS.betsWaiting.perAccount || waiting.all >= BOUNDS.betsWaiting.all) {
         return await refuse(503, 'QUEUE_FULL', `${waiting.account >= BOUNDS.betsWaiting.perAccount ? `This account has ${waiting.account} bets waiting their turn, the bound` : `${waiting.all} bets are waiting their turn, the bound for all accounts`}; a bet is refused for the count ahead of it and never for the time it has left.`, { waiting });
       }
+      // 17. This process owns the lane and takes bets: the lane's epoch, under a share lock that a take raising it
+      // waits behind, is the one this process took, and no lane step of this process has failed on the database. So a
+      // bet admitted here is one this process's runner will check, or one the next owner's take will find waiting.
+      if (!(await deps.lane.admits(client))) return await refuse(503, 'NOT_TAKING_BETS', DOOR.NOT_TAKING_BETS);
     }
 
     // Recorded, with its line.
     const row = await deps.store.orders.insert(client, { hash, role, order, signature, marketKey: key, receivedBlock: read.header.number, receivedHash: read.header.hash, receivedTime: T });
     await line('order received', undefined, { recordNumber: row.recordNumber, chainTime: T.toString() });
     await client.query('COMMIT');
+    // A bet admitted here: this process's runner goes on, after the commit.
+    if (role === 'take') deps.lane.wake();
     // The record carries the chain's time it was taken at, so the first answer and a repeat's are the same answer.
     return { status: role === 'rest' ? 201 : 202, body: orderRecord(row) };
   } catch (err) {

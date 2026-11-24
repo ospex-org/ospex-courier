@@ -34,6 +34,22 @@ export const BOUNDS = {
 } as const;
 
 /**
+ * What the chain itself allows, pinned from its client's source and published beside the bounds.
+ *
+ * `transactionGasCap`: the most gas one transaction may carry, 33,554,432, which is 2 to the 25th. The chain's
+ * client, Bor (github.com/0xPolygon/bor), at its release v2.11.2 (commit
+ * a4afe5a9c854ef07ea383bfa0d4e4ca45c62d157), sets it as `MaxTxGas = 1 << 25` in params/protocol_params.go, and
+ * refuses a transaction whose gas limit is above it both in its pool (core/txpool/validation.go) and when the
+ * transaction runs (core/state_transition.go), once the Madhugiri fork is active; params/config.go activates that
+ * fork on chain 137 at block 80,084,800. This is one transaction's cap and not the block's gas limit, which the
+ * bet's check reads from each block's header. A node's provider can set a tighter cap of its own: the call and the
+ * estimate are checked on the intended node before live use.
+ */
+export const CHAIN_LIMITS = {
+  transactionGasCap: 33_554_432,
+} as const;
+
+/**
  * How long the server waits for a request to arrive whole, headers and body,
  * in milliseconds: ten seconds. An order's body is at most 8,192 bytes and a
  * read has none, so a request still arriving after ten seconds is not one the

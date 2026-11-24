@@ -10,24 +10,32 @@ contract checks every signed value, and the relay passes the call through unread
 
 ## This build
 
-The third build: the stop. An account, or the agent of its current grant, signs one message that names orders of
+The fourth build: the check of a bet. A bet admitted waits its turn in one lane, the lane of the courier's key; one
+process owns the lane at a time, taken at its start, and checks one bet at a time in the order the bets were
+recorded. At its turn the courier reads the chain at one block named by its hash and judges the bet there: its own
+standing, in the door's order; the quotes on the other side that meet its price, walked in the published order
+(`docs/FILL_PRIORITY.md`), with what each wallet would actually be pulled, net of what the account already holds on
+the market; then the exact call it would send, run at that block, its gas, and a comparison of its own working with
+the contract's. Each outcome is written: ready, refused with a code and a sentence, or lapsed. It still holds no key
+and sends nothing: a bet found ready is closed `not sent`, with the Cross it would have sent recorded beside it. A
+bet's record says which (`docs/API.md`, part 3a).
+
+On the third build's, the stop. An account, or the agent of its current grant, signs one message that names orders of
 the account by hash and posts it (`POST /v1/stops`); from the moment the courier writes it down those orders are
 carried for no fill: a quote is listed for no bet, and a bet waiting its turn is not sent. With an order's signed
 original beside its hash, the message stops an order the courier has never seen, so a post still on its way is
 refused when it arrives. A stop is permanent for its hash. The wire contract, the door's and the stop's, is
 `docs/API.md`.
 
-On the second build's, orders in: the door (`POST /v1/orders`) takes a signed order under a role, runs the sixteen
+On the second build's, orders in: the door (`POST /v1/orders`) takes a signed order under a role, runs its
 checks in order, and records what it admits, each outcome a line; the book's quotes are served, a page a side, in
 the fill-priority order (`docs/FILL_PRIORITY.md`); the two budgets of admitted requests; the game rule against the
 published list; the hash lock; the mark of expired quotes against the final block; and the cost of the book's scan
 measured against the plan's three books in both maintenance states (`docs/COST.md`), with the table's maintenance
 settings set from the measurement. And on the first build's: the repository, the settings, the schema, the
 start-up against the set read from a signpost, the local chain rig and the proxy, the runs and the status address,
-what a node does with a block's hash and with an override, and the store's TLS check. It holds no key, signs
-nothing and sends nothing: a bet posted is recorded and waits, and a stop recovers a signer and makes none. What it
-does not yet do is listed on its own status address under `notYetBuilt`: the lanes and the pre-check, the sender
-and the key, the incidents and their cursor, and the netted pull's `payable`.
+what a node does with a block's hash and with an override, and the store's TLS check. What it does not yet do is
+listed on its own status address under `notYetBuilt`: the sender and the key, and the incidents' cursor.
 
 ## Running it
 
@@ -39,6 +47,7 @@ a value in this repository (`.env.example` lists them).
 | `DATABASE_URL` | The courier's own Postgres. Heroku sets it when the add-on is attached. |
 | `POLYGON_RPC_URL` | The node. https, or plain http to this machine only, where the tests run a local chain. |
 | `SIGNPOST_ADDRESS`, `BETTING_ENTRY_ID` | Where the set is: the signpost, and the betting entry's number on it. Every address of the set is read from the entry at start, and none is written in this repository. |
+| `COURIER_ADDRESS` | The courier's key's address: an address, never a key. Required: the courier does not start without it. A bet's check judges the relay's sender against it, and the node's check makes its calls from it. |
 | `COURIER_LOW_POL` | Under this many POL the key's wallet is reported low. 3 unless set. Read now, used from the sender's build. |
 | `PORT` | Where the process listens. 0 is any free port, which is how the tests start it. |
 | `DATABASE_CA_FILE` | Optional: a file holding the certificate authority the database is verified against, in place of the pinned `db/database-ca.pem`. It can name another authority and nothing else; verification is never off. |
@@ -50,11 +59,14 @@ a value in this repository (`.env.example` lists them).
 - **`yarn db:apply`** applies `db/schema.sql` to `DATABASE_URL`: the release step on every deploy (`Procfile`).
   Every statement in it is safe to run again. It connects through the same function the web process does, so the
   two verify the same authority.
-- **`yarn check:node`** makes each request the pre-check will make three ways against `POLYGON_RPC_URL`: at the
-  latest block's hash, at the hash of a block 50 back, and at a hash no block has, which must be refused; it also
-  overrides one balance and reads it back. It prints the verdicts, writes them to `runs/`, and exits 1 when the
-  node fails a request the pre-check needs. The web process runs the same check at every start and serves the
-  verdicts on the status address.
+- **`yarn check:node`** makes each request a bet's check will make three ways against `POLYGON_RPC_URL`: at the
+  latest block's hash, at the hash of a block 50 back, and at a hash no block has, which must be refused. It also
+  reads the relay's storage slot 0 and holds it to the relay's sender; overrides that slot and reads the sender
+  back; and runs a call whose answer depends on the block's time at two hashes of two times, so a node that ran a
+  call at the wrong block's time is caught. Its calls are made from `COURIER_ADDRESS`, or, where that is not set,
+  from the relay's sender, and it records which. It prints the verdicts, writes them to `runs/`, and exits 1 when
+  the node fails a request the check needs. The web process runs the same check at every start and serves the
+  verdicts on the status address; while its node fails one, the door takes no order (`NODE_UNUSABLE`).
 - **`yarn typecheck`**, **`yarn build:contracts`** (the set the tests deploy, from the pinned contracts) and
   **`yarn test`** (below).
 
@@ -65,7 +77,10 @@ six modules through the core's registry, the relay as the one listed contract th
 refuses to start unless the entry is a betting entry that is not retired; each listed address holds code that
 hashes as the entry says, now and not only when the entry was written; the core is finalized and names the entry's
 coin; the relay passes to the set's matching contract and answers the matching contract's own timelock. It then
-proves what its node can do, writes its run, and listens.
+proves what its node can do, writes its run, takes the lane of its key, and listens. The take raises the lane's
+epoch, so a process started earlier stops taking bets; a bet that process held goes back to waiting, and one a
+stop came for while held is closed `STOPPED`. The take waits behind any door still holding its share of the lane,
+so a bet the earlier process admitted is checked by one of the two.
 
 ## The door: `POST /v1/orders`
 
@@ -86,8 +101,9 @@ in the lower half of the curve's order. `role` is not signed:
 `take` is a bet, to be filled against the book in one Cross and kept no further. An order hash has one role at this
 courier, the first one posted.
 
-Sixteen checks, in order; the first that fails is the answer. Before admission (no row, no line; counted by code
-on the status address): the body's shape and its size (8 KB), the caller's minute, the order's own rules as the
+The checks, in order; the first that fails is the answer. Before admission (no row, no line; counted by code
+on the status address): the body's shape and its size (8 KB), the caller's minute, the node's gate (`503
+NODE_UNUSABLE` while the node failed the check made at this process's start), the order's own rules as the
 contract has them (`PRICE_OUT_OF_RANGE`, `STAKE_NOT_IN_LOTS`, `MIN_FILL_ABOVE_STAKE`, `UNKNOWN_MARKET_CONTRACT`,
 `INVALID_LINE`), the signature (`BAD_SIGNATURE`: not in the form the contract takes, or, for an order the account
 signs itself, not the account's), the hash on record (a repeat is answered from the record, the
@@ -103,7 +119,8 @@ whatever becomes of it is a line:
 the contract's own `getOrderHash` must equal the hash computed here (else `INTERNAL_ERROR`, recorded as the
 courier's own fault); a stop on record for the hash, which a stop recorded ahead of the order is (`STOPPED`); the
 game, whose start must be written, whose reporters must
-be exactly the published list, which must not have ended and whose close must not have passed (`UNKNOWN_GAME`,
+be exactly the published list, which must not have ended and whose close must be above the chain's time plus one,
+for a quote and a bet alike, since the contract refuses a fill from the second of the close (`UNKNOWN_GAME`,
 `NO_WRITTEN_START`, `REPORTERS_NOT_THE_PUBLISHED_LIST`, `GAME_ENDED`, `BETS_CLOSED`); the order's standing on chain
 (`CANCELLED`: cancelled, at a version the account has left, or under its floor at its version; an order signed for
 a version the account is not yet at is refused the same way, and can be posted once the account is there;
@@ -115,12 +132,15 @@ that is gone are marked `cancelled` in the records at the block read,
 and the count is read once more, so one post is one page and at most one read of the chain for the quotes whatever
 the account has posted before (each read of the chain is tried once more when it fails, so a post makes at most six
 requests to the node: the header, its own read and the quotes' read, twice each; a game's page at most four, its two
-headers; a market's page at most six, its two headers and the quotes' read); for a bet, the signed stake not above the cap until the lift, both read from the matching contract at the
-block (`ABOVE_CAP`), the expiry at most 30 seconds past the chain's time (`EXPIRY_TOO_FAR`), and fewer than two of
-the account's bets, and 32 in all, waiting their turn (`QUEUE_FULL`). Checks 5 and 8 to 16 run in one database
-transaction under the order's hash lock. A quote accepted is `201 resting`; a bet accepted is `202 queued`, recorded
-and waiting, and in this build nothing examines or sends it. Either answer is the order's record, which carries the
-chain's time it was taken at as `chainTime`; a repeat post is answered with the same record.
+headers; a market's page at most eight, its two headers, the quotes' read and, where the market is drawn, the
+positions' read); for a bet, the signed stake not above the cap until the lift, both read from the matching contract at the
+block (`ABOVE_CAP`), the expiry at most 30 seconds past the chain's time (`EXPIRY_TOO_FAR`), fewer than two of
+the account's bets, and 32 in all, waiting their turn (`QUEUE_FULL`), and this process owning the lane and taking
+bets (`503 NOT_TAKING_BETS`, read under a share lock that a starting process waits behind). Checks 5 and 8 to 17 run
+in one database transaction under the order's hash lock. A quote accepted is `201 resting`; a bet accepted is `202
+queued`, recorded and waiting its turn, and the lane is woken. Either answer is the order's record, which carries the
+chain's time it was taken at as `chainTime`; a repeat post is answered with the same record, a judged bet's with its
+verdict or its Cross.
 
 The two budgets are rows in the database, one count for every process and across a restart: an account's 240
 admitted requests at once and 12 a minute after; the courier's 2,400 at once and 60 a minute after, for all
@@ -128,9 +148,10 @@ accounts together. Their clock is the chain's time, read at the block the door n
 not admitted, and the row counts how many and when last.
 
 `GET /v1/orders/{hash}` is the courier's record of one order. Its `state` is `resting` for a quote the courier has
-not marked ended, `queued` for a bet waiting its turn, else how the order ended here: `stopped`, `expired`,
-`filled`, or `cancelled`, with `endedAt` and, for `cancelled`, `endedBlock`, the block the chain was read at. An
-order that ended twice keeps the first end. For a hash stopped ahead of its order, which holds no order here, the
+not marked ended, else how the order ended here: `stopped`, `expired`, `filled`, or `cancelled`, with `endedAt` and,
+for `cancelled`, `endedBlock`, the block the chain was read at. A bet's is `queued` while it waits (`turn: waiting`)
+or is being checked (`turn: checking`), and then its first end: `refused` or `lapsed` with its verdict, `not sent`
+with its Cross, or `stopped`. An order that ended twice keeps the first end. For a hash stopped ahead of its order, which holds no order here, the
 answer is `state: "stopped ahead"` with `stoppedAt` and no field of the order: the signed original a stop ahead
 was recorded with is served on no route.
 
@@ -171,7 +192,9 @@ courier waits on; Node's own default is five minutes.
 - `GET /v1/status`: what stands now. This run; the open conditions; the number of the newest report line; the last
   block the courier read, and when (a quiet courier reads no chain, so an old one means a quiet courier and nothing
   more); the set, every address, as read from the signpost at start, and the block it was read at; the relay's
-  sender, and the key's address (none in this build); what the node can do; the published bounds; the settings;
+  sender, the key's address (`COURIER_ADDRESS`), and the lane: the run that owns it, its epoch, and whether this
+  process takes bets; what the node can do; the published bounds, and the chain's limits (the most gas one
+  transaction may carry); the settings;
   this run's counts of requests refused before admission, by code; the database's size; and what is not yet built.
   If the database cannot be read it answers `503` and says that: it does not serve what it last knew as if it were
   now. A condition listed means the last state-changing decision the records made for it was an opening; one not
@@ -237,9 +260,11 @@ lines are the writing transaction's, diagnostics: neither is proof of the order 
 ## The database
 
 The courier's own Postgres, `db/schema.sql`: eleven tables (orders, stop_messages, stops, lanes, crosses, legs,
-events, conditions, accounts, runs, games) and the indexes the book, the door and the stop read along. The process
-holds two pools on it: four
-connections for the reads and the records, and one for the door, on which a post's admission transaction (the
+events, conditions, accounts, runs, games) and the indexes the book, the door and the stop read along. A bet's
+check writes `lanes` (which run owns the lane, its epoch, the bet it holds) and, for a bet found ready, `crosses`
+and `legs`: the Cross it would have sent, `not sent` with its reason, and what the check found. The process holds
+three pools on it: four
+connections for the reads and the records, one for the lane's steps, and one for the door, on which a post's admission transaction (the
 budgets' rows locked, through the record's commit, a read of the chain inside it) runs one post at a time in the
 process; the posts waiting hold nothing, so a reader and another account are answered while a burst of posts runs,
 and the courier's row serializes the posts across processes anyway. A stop that is under the budgets runs on the
@@ -276,9 +301,14 @@ databases there; the cost test lays 500,000 rows and needs the `pgstattuple` ext
 modules provide); `anvil` and `forge` on the PATH, with the contracts built once by `yarn build:contracts`; and
 `openssl` on the PATH, for the TLS test's authorities. CI (`.github/workflows/ci.yml`) provides all three.
 
-The orders, the stops, the book and the budgets are tested from a user's side: orders and stop messages signed
-with real keys, posted over HTTP to the courier running as its own process, and judged by the answer, the rows
-and the lines. The stop's cases are `tests/stops.test.ts`, numbered as its plan numbers them; several start a
+The orders, the stops, the book, the budgets and a bet's check are tested from a user's side: orders and stop
+messages signed with real keys, posted over HTTP to the courier running as its own process, and judged by the
+answer, the rows and the lines. A bet's check is `tests/precheck.test.ts`; the lane, its take, its reservation and
+what a lost database or a stop does to it, `tests/lane.test.ts`; and `tests/differential.test.ts` holds the
+courier's record of a Cross against what the contract does with the same orders in the next block, from the same
+state. Where a case must hold the lane at a known step, the courier is started through the tests' own start file
+(`tests/support/hooked-server.ts`), the production start with a test's hold points passed in; the production start
+file has none. The stop's cases are `tests/stops.test.ts`, numbered as its plan numbers them; several start a
 second courier process on the same chain and database, and the ones that need two requests in a known order hold
 a lock of the test's own in the database, or one request at the proxy, and watch the other arrive. The rig's final block
 is named by the test through the proxy where a test needs it: anvil's own answer for the `finalized` tag is the
@@ -308,12 +338,13 @@ courier/
   http/      service.ts  routes.ts  limits.ts
   chain/     abi.ts  set.ts  snapshot.ts  rpc.ts  node.ts  reads.ts
   orders/    order.ts  door.ts  standing.ts  budgets.ts  published.ts  stop.ts  stops.ts
-  records/   store.ts  orders.ts  stops.ts  events.ts  runs.ts  conditions.ts
+  check/     lane.ts  precheck.ts  walk.ts  pull.ts  decode.ts  sentences.ts  hooks.ts
+  records/   store.ts  orders.ts  stops.ts  lanes.ts  events.ts  runs.ts  conditions.ts
   status/    status.ts
   book/      read.ts
 scripts/     apply-schema.ts  check-node.ts
 docs/        API.md  INCIDENT_NOTES.md  FILL_PRIORITY.md  COST.md
-tests/       the suite, its support (the rig, the proxy, the TLS front) and fixtures
+tests/       the suite, its support (the rig, the proxy, the TLS front, the tests' start file) and fixtures
 contracts/   a submodule: the contracts repository at the pinned commit, for the tests only
 ```
 

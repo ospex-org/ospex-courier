@@ -1,8 +1,10 @@
 import type { Address } from 'viem';
 import type { NodeCheck } from '../chain/node';
+import type { Lane } from '../check/lane';
 import type { BettingSet } from '../chain/set';
 import type { ChainReader } from '../chain/snapshot';
-import { BOUNDS, TIMEOUTS, type AddressLimiter, type Counters } from '../http/limits';
+import { BOUNDS, CHAIN_LIMITS, TIMEOUTS, type AddressLimiter, type Counters } from '../http/limits';
+import { laneNow } from '../records/lanes';
 import type { Store } from '../records/store';
 import type { Run } from '../records/runs';
 
@@ -23,6 +25,8 @@ export interface StatusDeps {
   chain: ChainReader;
   set: BettingSet;
   node: NodeCheck;
+  /** This process's lane: the key's address, the epoch it took, and whether it has stopped taking bets. */
+  lane: Lane;
   run: Run;
   counters: Counters;
   /** The limit kept in memory: each address's minute, for every request but a stop. */
@@ -51,14 +55,16 @@ export async function status(deps: StatusDeps): Promise<Record<string, unknown>>
   let run;
   let maintenance;
   let growth;
+  let lane;
   try {
-    [conditions, newestReportLine, databaseSize, run, maintenance, growth] = await Promise.all([
+    [conditions, newestReportLine, databaseSize, run, maintenance, growth, lane] = await Promise.all([
       deps.store.conditions.open_(),
       deps.store.newestReportLine(),
       deps.store.databaseSize(),
       deps.store.runs.get(deps.run.id),
       deps.store.maintenance(),
       deps.store.growth(),
+      laneNow(deps.store.pool, deps.lane.key),
     ]);
   } catch (err) {
     throw new DatabaseUnreadable(err);
@@ -96,9 +102,21 @@ export async function status(deps: StatusDeps): Promise<Record<string, unknown>>
       timelock: set.timelock,
       readAt: { number: set.readAt.number.toString(), hash: set.readAt.hash },
     },
-    sender: { relay: set.sender, key: null },
+    sender: {
+      relay: set.sender,
+      key: deps.lane.key,
+      // The lane as its row stands, not as this process last knew it: a later start's take makes another run the
+      // owner. This process takes bets where the lane's epoch is the one it took and it has not stopped: check 17's rule.
+      lane: {
+        ownerRun: lane?.ownerRun ?? null,
+        epoch: lane?.epoch.toString() ?? null,
+        takingBets: lane !== null && deps.lane.epoch() === lane.epoch && deps.lane.takingBets(),
+      },
+    },
     node: deps.node,
     bounds: BOUNDS,
+    /** What the chain itself allows, pinned from its client's source: the most gas one transaction may carry. */
+    chainLimits: CHAIN_LIMITS,
     /** How long the server waits for a request to arrive whole, in milliseconds. */
     timeouts: TIMEOUTS,
     published: { reporters: deps.published },

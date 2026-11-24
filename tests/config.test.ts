@@ -9,6 +9,7 @@ const GOOD = {
   POLYGON_RPC_URL: 'https://node.example/v1/provider-key-abc',
   SIGNPOST_ADDRESS: '0x9A676e781A523b5d0C0e43731313A708CB607508',
   BETTING_ENTRY_ID: '1',
+  COURIER_ADDRESS: '0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65',
   PORT: '3000',
 };
 
@@ -19,6 +20,7 @@ test('a good environment is read, with the low-wallet mark at its default', () =
   assert.equal(read.config.rpcUrl, GOOD.POLYGON_RPC_URL);
   assert.equal(read.config.signpostAddress, GOOD.SIGNPOST_ADDRESS);
   assert.equal(read.config.bettingEntryId, 1n);
+  assert.equal(read.config.courierAddress, GOOD.COURIER_ADDRESS);
   assert.equal(read.config.port, 3000);
   assert.equal(read.config.lowPol, DEFAULT_LOW_POL);
   assert.equal(read.config.databaseCaFile, undefined);
@@ -28,7 +30,7 @@ test('an empty environment names every missing setting, once each, at once', () 
   const read = readCourierConfig({});
   assert.ok(!read.ok);
   const named = read.problems.map((p) => p.split(' ')[0]).sort();
-  assert.deepEqual(named, ['BETTING_ENTRY_ID', 'DATABASE_URL', 'POLYGON_RPC_URL', 'PORT', 'SIGNPOST_ADDRESS']);
+  assert.deepEqual(named, ['BETTING_ENTRY_ID', 'COURIER_ADDRESS', 'DATABASE_URL', 'POLYGON_RPC_URL', 'PORT', 'SIGNPOST_ADDRESS']);
 });
 
 test('a wrong value is named by its setting, and the value itself is never echoed', () => {
@@ -37,15 +39,16 @@ test('a wrong value is named by its setting, and the value itself is never echoe
     POLYGON_RPC_URL: 'http://node.example/provider-key-abc',
     SIGNPOST_ADDRESS: '0x1234',
     BETTING_ENTRY_ID: 'one',
+    COURIER_ADDRESS: '0xabcd',
     COURIER_LOW_POL: 'three',
     PORT: '70000',
   });
   assert.ok(!read.ok);
   const text = read.problems.join('\n');
-  for (const setting of ['DATABASE_URL', 'POLYGON_RPC_URL', 'SIGNPOST_ADDRESS', 'BETTING_ENTRY_ID', 'COURIER_LOW_POL', 'PORT']) {
+  for (const setting of ['DATABASE_URL', 'POLYGON_RPC_URL', 'SIGNPOST_ADDRESS', 'BETTING_ENTRY_ID', 'COURIER_ADDRESS', 'COURIER_LOW_POL', 'PORT']) {
     assert.equal(read.problems.filter((p) => p.startsWith(setting)).length, 1, `one problem for ${setting}: ${text}`);
   }
-  for (const secret of ['hunter2-the-password', 'provider-key-abc', 'db.example', 'node.example', '0x1234', 'one', 'three', '70000']) {
+  for (const secret of ['hunter2-the-password', 'provider-key-abc', 'db.example', 'node.example', '0x1234', 'one', '0xabcd', 'three', '70000']) {
     assert.ok(!text.includes(secret), `the value ${secret} was echoed: ${text}`);
   }
 });

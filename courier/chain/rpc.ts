@@ -18,6 +18,12 @@ export interface Header {
   hash: Hex;
   parentHash: Hex;
   timestamp: bigint;
+  /**
+   * The block's gas limit, which every block a node serves carries and which a header read from the node always
+   * holds (a block without it is an answer the read cannot use). Optional only so a header written by hand, with no
+   * node behind it, need not invent one; the bet's check refuses to go on from a header without it.
+   */
+  gasLimit?: bigint;
 }
 
 export type NodeFailureKind = 'refused' | 'unreachable' | 'timeout' | 'malformed';
@@ -35,6 +41,39 @@ export class NodeFailure extends Error {
   }
 }
 
+/**
+ * The node ran the call and the EVM refused it: the JSON-RPC error of a reverted execution (code 3), with the
+ * revert's bytes, checked to be whole bytes of hex and kept apart from the node's text. `data` is `0x` for a revert
+ * that gave no reason. It is a NodeFailure of the `refused` kind, so every read that is not the bet's check treats it
+ * as it treated any refusal before; the bet's check alone reads it as the contract's verdict on the call.
+ */
+export class ExecutionReverted extends NodeFailure {
+  constructor(
+    method: string,
+    readonly data: Hex,
+    detail: string,
+  ) {
+    super('refused', method, 3, detail);
+    this.name = 'ExecutionReverted';
+  }
+}
+
+/**
+ * The node's answer that the call ran out of the gas it was allowed, with no revert data: the out-of-gas error an
+ * estimate gives at the node's own cap. A NodeFailure of the `refused` kind for every other reader, as above.
+ */
+export class OutOfGas extends NodeFailure {
+  constructor(method: string, code: number | null, detail: string) {
+    super('refused', method, code, detail);
+    this.name = 'OutOfGas';
+  }
+}
+
+/** The node's words for a call that ran out of gas: geth's and Bor's "gas required exceeds allowance", anvil's "Out of gas". */
+const OUT_OF_GAS = /gas required exceeds allowance|out of gas/i;
+/** Revert data: whole bytes of hex. */
+const REVERT_DATA = /^0x(?:[0-9a-fA-F]{2})*$/;
+
 /** Removes anything that looks like a URL or a host from a node's text, so a log line cannot carry the provider's address. */
 function withheld(text: string): string {
   return text.replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, '[url withheld]').slice(0, 200);
@@ -44,43 +83,62 @@ export interface JsonRpc {
   request<T = unknown>(method: string, params: unknown[]): Promise<T>;
 }
 
-/** A client on one URL. The time-out is per request. */
+/**
+ * A client on one URL. The time-out is per request, and it runs through the whole request: the headers, the body
+ * and its decoding. It is cleared only when the request has its answer or has failed, so a node that sends its
+ * headers and then holds the body is a failure of the request at the time-out, as one that sends nothing is.
+ */
 export function createJsonRpc(url: string, timeoutMs = 10_000): JsonRpc {
   let id = 0;
   return {
     async request<T>(method: string, params: unknown[]): Promise<T> {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
-      let response: Response;
+      const aborted = (err: unknown) => controller.signal.aborted || (err as { name?: unknown })?.name === 'AbortError';
       try {
-        response = await fetch(url, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }),
-          signal: controller.signal,
-        });
-      } catch (err) {
-        const aborted = (err as { name?: unknown })?.name === 'AbortError';
-        throw new NodeFailure(aborted ? 'timeout' : 'unreachable', method, aborted ? null : ((err as { cause?: { code?: string } })?.cause?.code ?? null), '');
+        let response: Response;
+        try {
+          response = await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }),
+            signal: controller.signal,
+          });
+        } catch (err) {
+          throw new NodeFailure(aborted(err) ? 'timeout' : 'unreachable', method, aborted(err) ? null : ((err as { cause?: { code?: string } })?.cause?.code ?? null), '');
+        }
+        if (!response.ok) {
+          // The body is not read; the request is done with.
+          controller.abort();
+          throw new NodeFailure('refused', method, response.status, '');
+        }
+        let body: unknown;
+        try {
+          body = await response.json();
+        } catch (err) {
+          if (aborted(err)) throw new NodeFailure('timeout', method, null, 'the answer\'s body did not arrive whole in time');
+          throw new NodeFailure('malformed', method, null, 'the answer was not JSON');
+        }
+        if (typeof body !== 'object' || body === null) throw new NodeFailure('malformed', method, null, 'the answer was not an object');
+        const { error, result } = body as { error?: { code?: unknown; message?: unknown; data?: unknown }; result?: unknown };
+        if (error !== undefined && error !== null) {
+          const code = typeof error.code === 'number' ? error.code : null;
+          const message = typeof error.message === 'string' ? withheld(error.message) : '';
+          // The EVM's refusal of the call: code 3, with its revert data as whole bytes of hex, kept apart from the text.
+          if (code === 3 && typeof error.data === 'string' && REVERT_DATA.test(error.data)) {
+            throw new ExecutionReverted(method, error.data.toLowerCase() as Hex, message);
+          }
+          // The call ran out of the gas it was allowed, and no revert data came back.
+          if ((error.data === undefined || error.data === null) && typeof error.message === 'string' && OUT_OF_GAS.test(error.message)) {
+            throw new OutOfGas(method, code, message);
+          }
+          throw new NodeFailure('refused', method, code, message);
+        }
+        if (!('result' in (body as object))) throw new NodeFailure('malformed', method, null, 'the answer had no result');
+        return result as T;
       } finally {
         clearTimeout(timer);
       }
-      if (!response.ok) throw new NodeFailure('refused', method, response.status, '');
-      let body: unknown;
-      try {
-        body = await response.json();
-      } catch {
-        throw new NodeFailure('malformed', method, null, 'the answer was not JSON');
-      }
-      if (typeof body !== 'object' || body === null) throw new NodeFailure('malformed', method, null, 'the answer was not an object');
-      const { error, result } = body as { error?: { code?: unknown; message?: unknown }; result?: unknown };
-      if (error !== undefined && error !== null) {
-        const code = typeof error.code === 'number' ? error.code : null;
-        const message = typeof error.message === 'string' ? withheld(error.message) : '';
-        throw new NodeFailure('refused', method, code, message);
-      }
-      if (!('result' in (body as object))) throw new NodeFailure('malformed', method, null, 'the answer had no result');
-      return result as T;
     },
   };
 }
@@ -99,10 +157,14 @@ function toHeader(raw: unknown, method: string): Header {
   const hash = block?.hash;
   const parentHash = block?.parentHash;
   const timestamp = block?.timestamp;
-  if (typeof number !== 'string' || !QUANTITY.test(number) || typeof timestamp !== 'string' || !QUANTITY.test(timestamp) || typeof hash !== 'string' || !HASH.test(hash) || typeof parentHash !== 'string' || !HASH.test(parentHash)) {
+  const gasLimit = block?.gasLimit;
+  if (
+    typeof number !== 'string' || !QUANTITY.test(number) || typeof timestamp !== 'string' || !QUANTITY.test(timestamp) || typeof hash !== 'string' || !HASH.test(hash) ||
+    typeof parentHash !== 'string' || !HASH.test(parentHash) || typeof gasLimit !== 'string' || !QUANTITY.test(gasLimit)
+  ) {
     throw new NodeFailure('malformed', method, null, 'the block lacks a field the header needs, or one does not decode');
   }
-  return { number: BigInt(number), hash: hash as Hex, parentHash: parentHash as Hex, timestamp: BigInt(timestamp) };
+  return { number: BigInt(number), hash: hash as Hex, parentHash: parentHash as Hex, timestamp: BigInt(timestamp), gasLimit: BigInt(gasLimit) };
 }
 
 /** The header of the block a tag names. */
@@ -145,18 +207,39 @@ export async function codeAt(rpc: JsonRpc, address: Address, ref: BlockRef): Pro
   return rpc.request<Hex>('eth_getCode', [address, ref]);
 }
 
+/**
+ * A call, as eth_call and eth_estimateGas take it. The fields a transaction signs that a call can carry: the sender,
+ * the target, the calldata, the value and the gas limit. `gas` is the exact limit a transaction would be signed with,
+ * so a call made at that limit runs as the transaction would; absent, the node chooses. The nonce and the fees are
+ * not a call's to carry: the nonce is read at the block, and the fees are the sender's.
+ */
 export interface Call {
   to: Address;
   data: Hex;
   from?: Address;
+  value?: bigint;
+  gas?: bigint;
 }
 
-/** One state override, as eth_call takes it: an account's balance set for this call only. */
+/** One state override, as eth_call takes it: an account's balance, its nonce, its code, or slots of its storage, set for this call only. */
 export type StateOverride = Record<Address, { balance?: Hex; nonce?: Hex; code?: Hex; stateDiff?: Record<Hex, Hex> }>;
+
+const quantity = (n: bigint): Hex => `0x${n.toString(16)}`;
+
+/** The call as the node takes it: every field the call carries, the numbers as hex quantities. */
+function callObject(call: Call): Record<string, string> {
+  return {
+    ...(call.from === undefined ? {} : { from: call.from }),
+    to: call.to,
+    data: call.data,
+    ...(call.value === undefined ? {} : { value: quantity(call.value) }),
+    ...(call.gas === undefined ? {} : { gas: quantity(call.gas) }),
+  };
+}
 
 /** eth_call at a named block, with an optional state override. */
 export async function callAt(rpc: JsonRpc, call: Call, ref: BlockRef, override?: StateOverride): Promise<Hex> {
-  const tx = { to: call.to, data: call.data, ...(call.from === undefined ? {} : { from: call.from }) };
+  const tx = callObject(call);
   return rpc.request<Hex>('eth_call', override === undefined ? [tx, ref] : [tx, ref, override]);
 }
 
@@ -164,9 +247,18 @@ export async function transactionCountAt(rpc: JsonRpc, address: Address, ref: Bl
   return BigInt(await rpc.request<string>('eth_getTransactionCount', [address, ref]));
 }
 
+/** eth_estimateGas of the call, at a named block: by its hash, as every request for a value is made. */
 export async function estimateGasAt(rpc: JsonRpc, call: Call, ref: BlockRef): Promise<bigint> {
-  const tx = { to: call.to, data: call.data, ...(call.from === undefined ? {} : { from: call.from }) };
-  return BigInt(await rpc.request<string>('eth_estimateGas', [tx, ref]));
+  const answer = await rpc.request<unknown>('eth_estimateGas', [callObject(call), ref]);
+  if (typeof answer !== 'string' || !QUANTITY.test(answer)) throw new NodeFailure('malformed', 'eth_estimateGas', null, 'the estimate is not a hex quantity');
+  return BigInt(answer);
+}
+
+/** One storage slot of an account, at a named block. */
+export async function storageAt(rpc: JsonRpc, address: Address, slot: bigint, ref: BlockRef): Promise<Hex> {
+  const answer = await rpc.request<unknown>('eth_getStorageAt', [address, quantity(slot), ref]);
+  if (typeof answer !== 'string' || !HASH.test(answer)) throw new NodeFailure('malformed', 'eth_getStorageAt', null, 'the slot is not one word of hex');
+  return answer.toLowerCase() as Hex;
 }
 
 /** A contract read at a named block, encoded and decoded through its ABI. */
@@ -197,7 +289,7 @@ export interface MulticallResult {
  * prove the node ran the call on that block; it catches a node that ignored
  * the hash and answered at its head.
  */
-export async function multicallAt(rpc: JsonRpc, header: Header, calls: Array<{ target: Address; callData: Hex; allowFailure?: boolean }>): Promise<MulticallResult[]> {
+export async function multicallAt(rpc: JsonRpc, header: Header, calls: Array<{ target: Address; callData: Hex; allowFailure?: boolean }>, override?: StateOverride): Promise<MulticallResult[]> {
   const probes = [
     { target: MULTICALL_ADDRESS, allowFailure: false, callData: encodeFunctionData({ abi: MULTICALL_ABI, functionName: 'getBlockNumber' }) },
     { target: MULTICALL_ADDRESS, allowFailure: false, callData: encodeFunctionData({ abi: MULTICALL_ABI, functionName: 'getCurrentBlockTimestamp' }) },
@@ -208,7 +300,7 @@ export async function multicallAt(rpc: JsonRpc, header: Header, calls: Array<{ t
     functionName: 'aggregate3',
     args: [[...probes, ...calls.map((c) => ({ target: c.target, allowFailure: c.allowFailure ?? false, callData: c.callData }))]],
   });
-  const out = await callAt(rpc, { to: MULTICALL_ADDRESS, data }, byHash(header.hash));
+  const out = await callAt(rpc, { to: MULTICALL_ADDRESS, data }, byHash(header.hash), override);
   const results = decoded('the multicall envelope', () => decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', data: out }) as readonly MulticallResult[]);
   if (results.length !== probes.length + calls.length) throw new NodeFailure('malformed', 'eth_call', null, 'the multicall answered the wrong number of results');
   // A result marked failed where the call allowed no failure is an answer the read cannot use, whatever its bytes

@@ -2,7 +2,8 @@
 
 What one request to the book costs the database, measured against the three books the plan names, two of them at
 two sizes, each in two maintenance states; and the orders table's maintenance settings, chosen with the figures in
-view.
+view. Then what one bet's check costs: its requests to the node and its commands to the database, counted by path,
+and its candidate statement, measured on the same books ("A bet's check", below).
 The statement measured is the one the courier runs (`SCAN_SQL` in `courier/records/orders.ts`): the book's index
 walked in its order for one side of one market, at most 2,000 rows returned, the expired among them marked where the
 final block's time plus one has reached their expiry, the live among them passed. The test is `tests/cost.test.ts`;
@@ -111,6 +112,87 @@ the 5,000 pairs of the other game enter none of the four. The test asserts the p
 the index by name. Before this index the walk was along the book's index over every unmarked pair the whole book
 held, the game kept afterwards: a probe for every pair in the book, whatever game was asked for.
 
+## A bet's check
+
+What one bet's check costs, counted by path. The counts of requests and commands below are the design's, and the
+tests hold the build to them where a test says so; the candidate statement's work is measured, as the book's scan's
+is above.
+
+### Requests to the node, one round
+
+Counted at the proxy between the courier and the chain, from the moment a held check is let go to its outcome
+(`tests/lane.test.ts`, "the cost, in requests to the node"; the gas cases in `tests/precheck.test.ts`).
+
+| the path | requests | held to it by |
+| -- | -- | -- |
+| Lapsed | 1: the header of H | the lane's cost case |
+| Refused at read A (the sender, the bet's grant, registration, the game, its standing, the cap) | 2: H, read A | the lane's cost case |
+| Refused after the walk, nothing listed | 3: H, read A, the final block | the lane's cost case |
+| Refused after the walk with quotes read (`NOT_ENOUGH_DEPTH`, `DEPTH_BEYOND_BOUND`, `CANNOT_PAY`) | 4 to 6: and read B, one call a 100 quotes, and read C | the design |
+| Refused by the simulation | 5 to 7 | the design |
+| Ready, not trimmed | 9 to 12 | the lane's cost case: 10 in its run |
+| Each listed leg the comparison shows unfilled, with a pull | 1 more: the probe | the design |
+| The one re-walk after a coin's refusal | 1 to 2 more | the design |
+| Over a ceiling, the search finding no fit | 6 to 9, and 0 to 6 estimates | the gas cases: 8, and 9 |
+| Over a ceiling, a step refused | 6 to 9, and 1 to 6 estimates | the gas cases |
+| Trimmed for gas, and ready | up to 6 estimates more, and 1 to 2 for the chosen prefix | the gas cases |
+
+A round that passes makes at most 20 requests with no coin refusal, and 22 + s with s legs probed. Each request is
+tried once more on a failure and the round once more, so a check makes at most four times one round's count. Each
+request ends within ten seconds, its body included.
+
+### Commands to the database
+
+Counted as the commands the courier sends, `BEGIN`, `COMMIT` and `ROLLBACK` included, at the relay its connections
+pass through in the tests (`tests/lane.test.ts`, "the cost, in commands to the database").
+
+| the step | commands | held to it by |
+| -- | -- | -- |
+| One reservation, won | 6: `BEGIN`, the lane's lock, the find, the guarded update of the bet, the lane's write, `COMMIT` | the lane's cost case |
+| One reservation, lost to a stop | 5: `BEGIN`, the lane's lock, the find, the update that matches no row, `ROLLBACK` | the lane's cost case |
+| One reservation, the queue empty | 4 | the design |
+| One reservation, the lane not this process's | 3 | the design |
+| One loss and then a win | 11; r losses and then a win, 5r + 6; at the queue's bound, 32 losses and a win, 166 | the lane's cost case: 11 |
+| The candidate statement | 1 | the design |
+| The marks | 0 or 1 | the design |
+| An outcome: a lapse or a refusal | 7: `BEGIN`, the lane's lock, the bet read again, the line, the bet's state, the lane freed, `COMMIT` | the lane's cost case |
+| An outcome: ready | 9, with the Cross and its legs in one insert | the design |
+
+With the door's, about 19 for a bet, the ordinary path in all is about 33 for a lapse, 34 for a refusal at read A,
+and 44 to 48 for a ready bet. Each attempt lost to a stop adds 5. A second round adds its own requests' bookkeeping,
+one candidate statement and 0 or 1 marks.
+
+### The candidate statement, measured
+
+`CANDIDATES_SQL` in `courier/records/orders.ts`: the book's index walked for the other side of the bet's market up to
+the highest tick that meets the bet's price, at most 2,000 rows, the expired among them marked against the final
+block, the live among them counted as the bettor's own or others', and the first 200 of the others returned. Measured
+by `tests/cost.test.ts` as the book's scan is, on two of the books at the two sizes, from the statement's own
+`EXPLAIN (ANALYZE, BUFFERS)`: the scan node's rows and shared buffer accesses, and the update's rows.
+
+| book | size | state | rows: inner / marked | buffers |
+| -- | -- | -- | -- | -- |
+| ended by the mark, ahead of ten live quotes | 50,000 | before vacuum, 50,000 dead planted | 10 / 0 | 1,253 |
+| | 50,000 | after vacuum | 10 / 0 | 2 |
+| | 500,000 | before vacuum, 500,000 dead planted | 10 / 0 | 12,504 |
+| | 500,000 | after vacuum | 10 / 0 | 2 |
+| expired, not yet marked, ahead of one live quote | 50,000 | the final block held behind them: nothing marked | 2,000 / 0 | 164 |
+| | 50,000 | the final block past them: the statement marks what it was returned | 2,000 / 2,000 | 164 |
+| | 500,000 | held behind | 2,000 / 0 | 165 |
+| | 500,000 | past | 2,000 / 2,000 | 165 |
+
+On the book ended by the mark, after vacuum, the statement's own answer is ten rows scanned, none marked, none the
+bettor's own, ten others, ten returned. The figures are the book's scan's, row for row: the statement walks the same
+index the same way, and the bet's price stops it past every row of these books. The index's depth is two levels at
+50,000 and three at 500,000; the test holds the after-vacuum figures, and each of the backlog's, equal across the two
+sizes within one page a level of the index plus one, and they differ by zero and by one. Before vacuum they are
+reported and held to nothing, as the scan's are.
+
+### Idle
+
+Nothing. With no request, an hour of blocks writes no row and no line and makes no request to the node (the lane's
+idle case).
+
 ## The growth
 
 From the same run: an orders row with its indexes is about 1,000 bytes (927 before the index on the game's markets
@@ -171,8 +253,8 @@ a hundred hashes.
 
 ### The shape this build does not yet write
 
-A Cross and its legs are written by no build yet. Measured from fixture rows the same test lays in the schema's
-shape: every column as the schema has it, and the free parts (a line's `facts`, a Cross's `node_answer`, both
+A Cross sent, with its transaction, its receipt and its lines, is written by no build yet: this build closes a Cross
+not sent, with its legs and one line. Measured from fixture rows the same test lays in the schema's shape: every column as the schema has it, and the free parts (a line's `facts`, a Cross's `node_answer`, both
 `jsonb`) holding what this fixture puts there, small objects of a few fields. These are fixture figures, to be read
 again from real rows once the sender's build writes them.
 

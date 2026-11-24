@@ -676,3 +676,27 @@ test("a read of a game touches that game's markets only, and a page's work is bo
   assert.deepEqual({ rows: second.rows, loops: second.loops }, { rows: bound, loops: bound }, 'from the cursor, the same work');
   console.log(`# markets of a game: ${JSON.stringify({ thisGame: ours, emptyGame: nothing, otherGamePageOf7: big, fromCursor: second })}`);
 });
+
+test("payable is netted: a maker that holds the other side of a market (3,000 at risk on side B against 2,500, held 3,000), its wallet left at 1,000, quotes 100,000 on side A at tick 200 and is payable 6,500, more than its wallet holds. The positions contract's own preview pulls 1,000 for a fill of 65 lots, no more than the wallet, and 1,100 for 66, more", async () => {
+  const M = rig.account(301);
+  const X = rig.account(302);
+  for (const who of [M, X]) await rig.fund(who);
+  const spread = { scorer: rig.addresses.spread, lineTicks: 145 };
+  const T = await rig.time();
+  // M takes side B, 3,000 against X's 2,500 at tick 220, by a Cross the test sends.
+  const x: Order = { ...orderOn(rig, X, { expiry: T + 600n, oddsTick: 220, riskAmount: 2_500n, ...spread }), positionType: 0 };
+  const m: Order = { ...orderOn(rig, M, { expiry: T + 25n, oddsTick: 180, riskAmount: 3_000n, ...spread }), positionType: 1 };
+  const sent = await crossFromTheTest(rig, { order: m, signature: await sign(M, m, 31337, rig.addresses.matching) }, [{ order: x, signature: await sign(X, x, 31337, rig.addresses.matching) }]);
+  assert.equal(sent.filled, true, JSON.stringify(sent));
+  const coin = rig.abis.TestCoin as Abi;
+  const balance = await rig.read<bigint>(rig.addresses.coin, coin, 'balanceOf', [M.address]);
+  await rig.write(M, rig.addresses.coin, coin, 'transfer', [rig.accounts.stranger.address, balance - 1_000n]);
+  const quote = orderOn(rig, M, { expiry: T + 3_600n, oddsTick: 200, riskAmount: 100_000n, ...spread });
+  assert.equal((await postOrder(url(), rig, M, 'rest', quote)).status, 201);
+  const page = (await market(url(), spread.scorer, spread.lineTicks, '&side=A')).sides.A as Page;
+  const listed = page.quotes.find((q) => q.account.toLowerCase() === M.address.toLowerCase());
+  assert.deepEqual({ remaining: listed?.remaining, payable: listed?.payable }, { remaining: '100000', payable: '6500' });
+  const id = await rig.read<bigint>(rig.addresses.markets, rig.abis.OspexMarkets as Abi, 'getMarketId', [rig.gameId, spread.scorer, spread.lineTicks]);
+  const preview = async (lots: bigint) => (await rig.read<[bigint, bigint]>(rig.addresses.positions, rig.abis.OspexPositions as Abi, 'previewFill', [id, M.address, 0, lots * 100n, lots * 100n]))[0];
+  assert.deepEqual({ at: await preview(65n), past: await preview(66n) }, { at: 1_000n, past: 1_100n });
+});

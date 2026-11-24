@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { keccak256, toBytes, type Abi, type AbiFunction, type AbiParameter } from 'viem';
-import { COIN_ABI, CORE_ABI, GAMES_ABI, MATCHING_ABI, MODULE_TYPES, MULTICALL_ABI, RELAY_ABI, SIGNPOST_ABI } from '../courier/chain/abi';
+import { COIN_ABI, CORE_ABI, GAMES_ABI, MARKETS_ABI, MATCHING_ABI, MODULE_TYPES, MULTICALL_ABI, POSITIONS_ABI, RELAY_ABI, SIGNPOST_ABI } from '../courier/chain/abi';
+import { DECODED_ERRORS } from '../courier/check/decode';
 import { artifact } from './support/rig';
 
 // The courier's written-out interface against the contracts' build at the
 // pinned commit: every function the courier calls is in the artifact's ABI
-// with the same inputs and outputs, so a pin that moves the interface turns
+// with the same inputs and outputs, and every error the bet's check decodes is
+// in it by its name and its arguments, so a pin that moves the interface turns
 // this red and not a live call.
 
 function typeOf(p: AbiParameter): string {
@@ -17,12 +19,17 @@ function typeOf(p: AbiParameter): string {
 /** A read (view or pure) or a write (nonpayable or payable): what a caller depends on; the finer word is the compiler's. */
 const kind = (f: AbiFunction) => (f.stateMutability === 'view' || f.stateMutability === 'pure' ? 'read' : 'write');
 
+/** The functions, by their signature, to their outputs and kind; and the errors, by their signature (`error` and the name and argument types). */
 function signatures(abi: Abi): Map<string, string> {
   const out = new Map<string, string>();
   for (const entry of abi) {
-    if (entry.type !== 'function') continue;
-    const f = entry as AbiFunction;
-    out.set(`${f.name}(${f.inputs.map(typeOf).join(',')})`, `${f.outputs.map(typeOf).join(',')}|${kind(f)}`);
+    if (entry.type === 'function') {
+      const f = entry as AbiFunction;
+      out.set(`${f.name}(${f.inputs.map(typeOf).join(',')})`, `${f.outputs.map(typeOf).join(',')}|${kind(f)}`);
+    } else if (entry.type === 'error') {
+      const e = entry as { name: string; inputs: readonly AbiParameter[] };
+      out.set(`error ${e.name}(${e.inputs.map(typeOf).join(',')})`, 'error');
+    }
   }
   return out;
 }
@@ -66,4 +73,33 @@ test('the coin, as a six-decimal ERC-20 is built', () => {
 
 test('the multicall contract, as forge-std declares it', () => {
   assertSubset(MULTICALL_ABI, artifact('IMulticall3.sol', 'IMulticall3').abi, 'the multicall contract');
+});
+
+test('the positions contract, as built: its reads of a position, of what is held and of a fill\'s preview, and its refusals of a Cross', () => {
+  assertSubset(POSITIONS_ABI, artifact('OspexPositions.sol', 'OspexPositions').abi, 'the positions contract');
+});
+
+test('the markets contract, as built: a market\'s id, its count and its record, and the close gate\'s four refusals', () => {
+  assertSubset(MARKETS_ABI, artifact('OspexMarkets.sol', 'OspexMarkets').abi, 'the markets contract');
+});
+
+test('every error the bet\'s check decodes is in the courier\'s interface, and so in the build, by its name and its arguments', () => {
+  const sources: Record<keyof typeof DECODED_ERRORS, { abi: Abi; built: Abi }> = {
+    matching: { abi: MATCHING_ABI, built: artifact('OspexMatching.sol', 'OspexMatching').abi },
+    positions: { abi: POSITIONS_ABI, built: artifact('OspexPositions.sol', 'OspexPositions').abi },
+    markets: { abi: MARKETS_ABI, built: artifact('OspexMarkets.sol', 'OspexMarkets').abi },
+    relay: { abi: RELAY_ABI, built: artifact('OspexCourierRelay.sol', 'OspexCourierRelay').abi },
+  };
+  let named = 0;
+  for (const [where, names] of Object.entries(DECODED_ERRORS) as Array<[keyof typeof DECODED_ERRORS, readonly string[]]>) {
+    const ours = [...signatures(sources[where].abi).keys()].filter((k) => k.startsWith('error '));
+    const built = new Set([...signatures(sources[where].built).keys()].filter((k) => k.startsWith('error ')));
+    for (const name of names) {
+      const sig = ours.find((k) => k.startsWith(`error ${name}(`));
+      assert.ok(sig !== undefined, `the decoder names ${name}, which the courier's ${where} interface does not hold`);
+      assert.ok(built.has(sig), `${where}: ${sig} is not in the build`);
+      named++;
+    }
+  }
+  assert.equal(named, 29, 'the decoder names twenty-nine errors: the matching contract\'s twenty-one, the positions contract\'s three, the close gate\'s four and the relay\'s one');
 });
