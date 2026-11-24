@@ -279,12 +279,8 @@ test("two waiting bets of one account, the first recorded with the higher hash, 
   const market = ownMarket();
   const T = await rig.time();
   // Two bets signed, the first with the higher hash: the record's order and the hashes' order run contrary.
-  const signed: Order[] = [];
-  for (let n = 0; signed.length < 2 && n < 64; n++) {
-    const o: Order = { ...orderOn(rig, W, { expiry: T + 28n, oddsTick: 196, riskAmount: 10_000n, ...market }), positionType: 1 };
-    if (signed.length === 0) signed.push(o);
-    else if (orderHash(o, 31337n, rig.addresses.matching).toLowerCase() < orderHash(signed[0] as Order, 31337n, rig.addresses.matching).toLowerCase()) signed.push(o);
-  }
+  const pair = [0, 1].map((): Order => ({ ...orderOn(rig, W, { expiry: T + 28n, oddsTick: 196, riskAmount: 10_000n, ...market }), positionType: 1 }));
+  const signed = pair.sort((a, b) => (orderHash(a, 31337n, rig.addresses.matching).toLowerCase() < orderHash(b, 31337n, rig.addresses.matching).toLowerCase() ? 1 : -1));
   assert.equal(signed.length, 2, 'a second bet with a lower hash among 64 signed');
   const [first, second] = signed as [Order, Order];
   const firstHash = orderHash(first, 31337n, rig.addresses.matching).toLowerCase() as Hex;
