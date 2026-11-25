@@ -44,6 +44,18 @@ let unhash = false;
 let signerFault: SignerFault = {};
 /** The sealed sends the signer was handed, in order: the earlier one a substitution hands on. */
 const handed: unknown[] = [];
+/** The send the signer goes on with in its current attempt, as the seam handed it on: what that attempt's bytes are compared with. */
+let signing: unknown = null;
+
+/** The fields of a sealed send that its signed bytes must carry, as text, or null where the object has none of that shape. */
+function sealedFields(x: unknown): { nonce: string; gasLimit: string; maxFeePerGas: string; maxPriorityFeePerGas: string } | null {
+  const s = x as { nonce?: unknown; gas?: { limit?: unknown }; maxFeePerGas?: unknown; maxPriorityFeePerGas?: unknown } | null;
+  if (s === null || typeof s !== 'object') return null;
+  const { nonce, maxFeePerGas, maxPriorityFeePerGas } = s;
+  const limit = s.gas?.limit;
+  if (typeof nonce !== 'bigint' || typeof limit !== 'bigint' || typeof maxFeePerGas !== 'bigint' || typeof maxPriorityFeePerGas !== 'bigint') return null;
+  return { nonce: nonce.toString(), gasLimit: limit.toString(), maxFeePerGas: maxFeePerGas.toString(), maxPriorityFeePerGas: maxPriorityFeePerGas.toString() };
+}
 
 process.on('message', (raw: unknown) => {
   const m = raw as Message;
@@ -111,18 +123,19 @@ const hooks: LaneHooks = {
       handed.push(checked);
       const f = signerFault;
       if (f.tamper !== undefined && f.tamper !== null) send({ type: 'tampered', how: f.tamper, result: tamperWith(checked, f.tamper) });
-      if (f.substitute === 'look-alike') return structuredClone(checked);
-      if (f.substitute === 'earlier') return handed.length >= 2 ? handed[handed.length - 2] : checked;
-      return checked;
+      signing = f.substitute === 'look-alike' ? structuredClone(checked) : f.substitute === 'earlier' && handed.length >= 2 ? handed[handed.length - 2] : checked;
+      return signing;
     },
     envelope: (e) => {
       const f = signerFault.envelope;
       if (f === undefined || f === null) return e;
       return { ...e, ...(f.to === undefined ? {} : { to: f.to as `0x${string}` }), ...(f.value === undefined ? {} : { value: BigInt(f.value) }) };
     },
-    // Every signed attempt, at once: its bytes go to the test over the channel, never to the process's output.
+    // Every signed attempt, at once: its bytes go to the test over the channel, never to the process's output, beside
+    // the fields of the sealed send the signer was handed for it, read as it signs.
     signed: (raw) => {
-      send({ type: 'signed', raw });
+      send({ type: 'signed', raw, sealed: sealedFields(signing) });
+      signing = null;
     },
   },
 };

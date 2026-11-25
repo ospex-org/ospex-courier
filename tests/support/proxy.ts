@@ -20,6 +20,8 @@ export interface Counted {
   answerBytes: number;
   /** How the proxy dealt with it: `arrived` until it has been answered. */
   how: 'arrived' | 'passed' | 'refused' | 'answered' | 'held' | 'dropped' | 'withheld';
+  /** A raw transaction's own bytes, as the request carried them, so that one transaction's requests are counted by its bytes. */
+  sent?: string;
 }
 
 /** The courier's sends, which this build must never make: counted at the proxy as they arrive. */
@@ -53,6 +55,8 @@ export type Rule =
   | { kind: 'hold'; released: Promise<void>; arrived: () => void; when?: (params: unknown[]) => boolean }
   /** Answer nothing: the connection is closed with no answer, as a node that dropped the request. */
   | { kind: 'drop' }
+  /** The next request only: its connection closed before the request reaches the node, with no answer; the rule goes as it arrives. */
+  | { kind: 'dropOnce' }
   /**
    * Pass the request on at once, and hold the chain's answer until released: the node has the request, and the
    * courier does not hear what it said. Released with `drop`, the connection is closed with no answer.
@@ -93,6 +97,11 @@ export interface ChainProxy {
   hold(method: string, when?: (params: unknown[]) => boolean): { arrived: Promise<void>; release(then?: Rule | null): void };
   /** Every request of the method, from now until the rule is lifted, is dropped: its connection closed with no answer. */
   drop(method: string): void;
+  /**
+   * The next request of the method is refused its connection: closed before the request reaches the node, with no
+   * answer. The rule is lifted as that request arrives, so a later one passes as usual.
+   */
+  dropNext(method: string): void;
   /**
    * The next request of the method is passed on to the chain at once and its answer held: `passed` resolves once the
    * chain has the request; `release()` answers with what the chain said, `release({ drop: true })` closes the
@@ -157,6 +166,11 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
     const params = req.params ?? [];
     const rule = rules.get(req.method);
     if (rule?.kind === 'drop') return { text: null, how: 'dropped' };
+    if (rule?.kind === 'dropOnce') {
+      // One request only, never passed on: the rule goes as it arrives, so the next of the method passes as usual.
+      rules.delete(req.method);
+      return { text: null, how: 'dropped' };
+    }
     if (rule?.kind === 'passHold') {
       // One request only: the rule goes as this one arrives, so the next of the method passes as usual. `passed` once
       // the chain has answered it: the chain has the request; its answer waits here.
@@ -223,7 +237,13 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       }
       const list = Array.isArray(parsed) ? parsed : [parsed];
       // Counted now, as they arrive: what the courier asked is on record before the node has said anything.
-      const arrived: Counted[] = list.map((r) => ({ method: r.method, requestBytes: Buffer.byteLength(raw), answerBytes: 0, how: 'arrived' as const }));
+      const arrived: Counted[] = list.map((r) => ({
+        method: r.method,
+        requestBytes: Buffer.byteLength(raw),
+        answerBytes: 0,
+        how: 'arrived' as const,
+        ...(r.method === 'eth_sendRawTransaction' && typeof r.params?.[0] === 'string' ? { sent: r.params[0] } : {}),
+      }));
       counted.push(...arrived);
       Promise.all(list.map((r) => answerOne(r, JSON.stringify(r)))).then(
         (answers) => {
@@ -300,6 +320,10 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
     },
     drop(method) {
       rules.set(method, { kind: 'drop' });
+      arrivedAtRule.set(method, count(method));
+    },
+    dropNext(method) {
+      rules.set(method, { kind: 'dropOnce' });
       arrivedAtRule.set(method, count(method));
     },
     passAndHold(method) {

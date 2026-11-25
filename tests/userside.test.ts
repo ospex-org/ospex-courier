@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, before, beforeEach, test } from 'node:test';
-import { encodeFunctionData, type Abi, type Hex } from 'viem';
+import { encodeFunctionData, keccak256, type Abi, type Hex } from 'viem';
 import type { HDAccount } from 'viem/accounts';
 import pg from 'pg';
 import { get as getFrom, type HookControl } from './support/courier';
@@ -21,6 +21,11 @@ const url = () => stack.courier.url;
 const hooks = () => stack.courier.hooks as HookControl;
 const handOffs = () => stack.proxy.count('eth_sendRawTransaction');
 const signed = () => stack.courier.hooks?.signed.length ?? 0;
+/** One transaction's requests: those at the proxy that carried its own bytes. None for a Cross with no transaction. */
+const requestsOf = (txHash: string | null | undefined): number =>
+  txHash === null || txHash === undefined ? 0 : stack.proxy.counted.filter((r) => r.sent !== undefined && keccak256(r.sent as Hex).toLowerCase() === txHash.toLowerCase()).length;
+/** The signatures that carry this account's order: one bet's, where the account is that bet's alone. */
+const signedFor = (who: string): number => (stack.courier.hooks?.signed ?? []).filter((raw) => raw.toLowerCase().includes(who.slice(2).toLowerCase())).length;
 
 let from: Record<string, string> = {};
 let nextAddress = 0;
@@ -265,4 +270,62 @@ test("the pause's carries: the reserved code is on the page and issued by no pat
     await hooks().go(held);
   }
   await final(first.hash);
+});
+
+test("the bettor's record of not sent's third reason: the node refuses the one hand-off by name, and the record reads not sent NODE_REFUSED with the refusal's words, handed once and never again, and nothing of the bet filled; the next bet is sent and fills the same quote", async () => {
+  // A game of its own, so the bet lists this quote and no other case's.
+  const gameId = await stack.rig.createGame({ startWritten: true });
+  const quote = await postQuote(await fresh(), { gameId });
+  const B = await fresh();
+  const paid = await balance(B.address);
+  // The node refuses, by one of the named refusals, the hand-off of the one transaction that carries B's order.
+  const ofB = B.address.slice(2).toLowerCase();
+  stack.proxy.rule('eth_sendRawTransaction', { kind: 'refuseIf', refuse: (params) => typeof params[0] === 'string' && params[0].toLowerCase().includes(ofB), code: -32000, message: 'txpool is full' });
+  let hash: string;
+  try {
+    const bet = await postBet(B, { gameId });
+    assert.equal(bet.status, 202, JSON.stringify(bet.body));
+    hash = bet.hash;
+    await final(hash);
+  } finally {
+    stack.proxy.rule('eth_sendRawTransaction', null);
+  }
+  const record = await get(`/v1/orders/${hash}`);
+  assert.equal(record.status, 200);
+  assert.equal(record.body.state, 'not sent', JSON.stringify(record.body));
+  const cross = record.body.cross as { state: string; reason: string | null; handOffs: number; answer: unknown; message: string; txHash: string };
+  assert.deepEqual([cross.state, cross.reason, cross.handOffs], ['not sent', 'NODE_REFUSED', 1]);
+  assert.deepEqual(cross.answer, { kind: 'refused', words: 'txpool is full' });
+  assert.match(cross.message, /^The courier handed this bet's fill to the chain once, and the node refused it: txpool is full\. It was not handed again, and this courier filled nothing of it\./);
+  // What the record says, held to: one signature of B's order, one request carrying its bytes, nothing of the bet filled.
+  assert.deepEqual({ signed: signedFor(B.address), requests: requestsOf(cross.txHash) }, { signed: 1, requests: 1 });
+  assert.equal(await balance(B.address), paid, 'the bettor paid nothing in');
+  // The lane goes on: the next bet is sent and fills the quote the refused one listed, and the refused transaction is not handed again.
+  const next = await postBet(await fresh(), { gameId });
+  const filled = await final(next.hash);
+  assert.equal(filled?.state, 'confirmed', JSON.stringify(filled));
+  const legs = await pool.query<{ order_hash: string }>('SELECT order_hash FROM legs WHERE bet_hash = $1 ORDER BY position', [next.hash.toLowerCase()]);
+  assert.deepEqual(legs.rows.map((l) => l.order_hash), [quote.hash.toLowerCase()]);
+  assert.equal(requestsOf(cross.txHash), 1, 'the refused transaction, never handed again');
+});
+
+test("the maker's side: a quote stopped while no Cross lists it reads stopped with no handOff; the replacement posted at once is filled by the next bet, and the stopped quote fills nothing", async () => {
+  // A game of its own, so the bet lists this maker's quotes and no other case's.
+  const gameId = await stack.rig.createGame({ startWritten: true });
+  const M = await fresh();
+  const old = await postQuote(M, { gameId });
+  const stop = await postStop(url(), stack.rig, M, stopMessage(M.address, [old.hash as Hex]));
+  assert.equal(stop.status, 200, JSON.stringify(stop.body));
+  assert.deepEqual(outcomes(stop), ['stopped']);
+  assert.equal('handOff' in (resultsOf(stop)[0] as object), false, 'stopped, with no handOff');
+  // At once, on that answer: the replacement, at the same price and size.
+  const replacement = await postQuote(M, { gameId });
+  const bet = await postBet(await fresh(), { gameId });
+  const c = await final(bet.hash);
+  assert.equal(c?.state, 'confirmed', JSON.stringify(c));
+  const legs = await pool.query<{ order_hash: string }>('SELECT order_hash FROM legs WHERE bet_hash = $1 ORDER BY position', [bet.hash.toLowerCase()]);
+  assert.deepEqual(legs.rows.map((l) => l.order_hash), [replacement.hash.toLowerCase()], 'the next bet lists the replacement, and not the stopped quote');
+  const filledRisk = (h: string) => stack.rig.read<bigint>(stack.rig.addresses.matching, stack.rig.abis.OspexMatching as Abi, 's_filledRisk', [h]);
+  assert.ok((await filledRisk(replacement.hash)) > 0n, 'the replacement filled');
+  assert.equal(await filledRisk(old.hash), 0n, 'the stopped quote filled nothing');
 });

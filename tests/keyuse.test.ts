@@ -29,6 +29,10 @@ const allSigned = (): Hex[] => {
   lives.add(stack.courier);
   return [...lives].flatMap((c) => c.hooks?.signed ?? []);
 };
+const allAttempts = (): HookControl['attempts'] => {
+  lives.add(stack.courier);
+  return [...lives].flatMap((c) => c.hooks?.attempts ?? []);
+};
 const handOffs = () => stack.proxy.count('eth_sendRawTransaction');
 const answers: string[] = [];
 
@@ -169,11 +173,23 @@ test("a Cross's row written straight into the database, as intent and as signed,
   assert.deepEqual({ s: allSigned().length - before.s, h: handOffs() - before.h }, { s: 0, h: 0 });
 });
 
-test('after every other case: every signed attempt, refused and unmined ones included, and every transaction the key sent on the chain, is to the relay with the Cross\'s selector and no value, on the set\'s chain, at the recorded nonce, gas and fees, and decodes to a bet and quotes the records hold', async () => {
+test('after every other case: every signed attempt, refused and unmined ones included, and every transaction the key sent on the chain, is to the relay with the Cross\'s selector and no value, on the set\'s chain, at the nonce, gas and fees of the sealed send the signer was handed and of the record that holds it, and decodes to a bet and quotes the records hold', async () => {
   const relay = stack.rig.addresses.relay.toLowerCase();
   const key = stack.rig.accounts.sender.address.toLowerCase();
-  for (const raw of allSigned()) {
+  const attempts = allAttempts();
+  assert.equal(attempts.length, allSigned().length, 'every signed attempt, beside the sealed send the signer was handed for it');
+  assert.ok(attempts.length > 0);
+  for (const { raw, sealed } of attempts) {
     const tx = parseTransaction(raw);
+    // The signed fields are the checked ones: those of the sealed send the signer was handed, read at the seam the
+    // tests already have, whether or not the attempt was then refused, recorded or handed off.
+    assert.notEqual(sealed, null, 'a signed attempt with no sealed send read at the seam');
+    const s = sealed as NonNullable<typeof sealed>;
+    assert.deepEqual(
+      [BigInt(tx.nonce ?? -1), tx.gas, tx.maxFeePerGas, tx.maxPriorityFeePerGas],
+      [BigInt(s.nonce), BigInt(s.gasLimit), BigInt(s.maxFeePerGas), BigInt(s.maxPriorityFeePerGas)],
+      'the nonce, gas limit, fee cap and tip signed are those of the sealed send the signer was handed',
+    );
     assert.equal(tx.to?.toLowerCase(), relay);
     assert.equal(tx.value ?? 0n, 0n);
     assert.equal(tx.chainId, 31337);

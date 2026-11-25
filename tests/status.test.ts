@@ -865,7 +865,7 @@ test('with the database stopped, the status answers 503 and claims nothing; /rea
     const posted = await postOrder(url, stack.rig, stack.rig.accounts.maker, 'rest', orderOn(stack.rig, stack.rig.accounts.maker, { expiry: T + 600n }));
     assert.equal(posted.status, 503, JSON.stringify(posted.body));
     assert.equal(posted.body.code, 'DATABASE_UNREADABLE');
-    assert.match(String(posted.body.error), /nothing was recorded/);
+    assert.match(String(posted.body.error), /can leave acceptance uncertain/);
   } finally {
     stack.dbRelay.restore();
   }

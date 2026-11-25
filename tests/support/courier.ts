@@ -84,6 +84,11 @@ export interface HookControl {
   observed: Array<{ what: 'candidates' | 'walk input'; hashes: string[] }>;
   /** Every transaction the signer signed in this process, refused, dropped and unmined ones included, in the order signed: its bytes, held in this memory only. */
   signed: Hex[];
+  /**
+   * The same attempts, each beside the fields of the sealed send the signer was handed for it (its nonce, gas limit,
+   * fee cap and tip, as text), as the signer's seams saw them; null where what it was handed had no such fields.
+   */
+  attempts: Array<{ raw: Hex; sealed: { nonce: string; gasLimit: string; maxFeePerGas: string; maxPriorityFeePerGas: string } | null }>;
   /** Each try the signer's seam made at changing a sealed send in place, and what came of it. */
   tampered: Array<{ how: string; result: string }>;
 }
@@ -165,6 +170,7 @@ function control(child: ChildProcess, lines: () => readonly string[]): HookContr
   const waiters: Array<{ point: HoldPoint | undefined; resolve: (h: Held) => void; reject: (err: Error) => void }> = [];
   const observed: HookControl['observed'] = [];
   const signed: Hex[] = [];
+  const attempts: HookControl['attempts'] = [];
   const tampered: HookControl['tampered'] = [];
   // A courier that exits while the test waits on it fails the wait at once, saying how it exited and its last lines:
   // a hold it can no longer reach, or an acknowledgement it can no longer send, is never waited for.
@@ -177,9 +183,22 @@ function control(child: ChildProcess, lines: () => readonly string[]): HookContr
     acks.clear();
   });
   child.on('message', (raw: unknown) => {
-    const m = raw as { type: string; id?: number; held?: number; point?: HoldPoint; bet?: Hex | null; what?: 'candidates' | 'walk input'; hashes?: string[]; raw?: Hex; how?: string; result?: string };
+    const m = raw as {
+      type: string;
+      id?: number;
+      held?: number;
+      point?: HoldPoint;
+      bet?: Hex | null;
+      what?: 'candidates' | 'walk input';
+      hashes?: string[];
+      raw?: Hex;
+      sealed?: HookControl['attempts'][number]['sealed'];
+      how?: string;
+      result?: string;
+    };
     if (m.type === 'signed' && m.raw !== undefined) {
       signed.push(m.raw);
+      attempts.push({ raw: m.raw, sealed: m.sealed ?? null });
     } else if (m.type === 'tampered') {
       tampered.push({ how: m.how ?? '', result: m.result ?? '' });
     } else if (m.type === 'ack' && m.id !== undefined) {
@@ -237,6 +256,7 @@ function control(child: ChildProcess, lines: () => readonly string[]): HookContr
       }),
     observed,
     signed,
+    attempts,
     tampered,
   };
 }

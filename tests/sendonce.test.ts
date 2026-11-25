@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, before, beforeEach, test } from 'node:test';
+import { keccak256, type Hex } from 'viem';
 import type { HDAccount } from 'viem/accounts';
 import pg from 'pg';
 import type { HoldPoint } from '../courier/check/hooks';
@@ -33,6 +34,9 @@ let pastSigned = 0;
 const signed = () => pastSigned + (stack.courier.hooks?.signed.length ?? 0);
 const handOffs = () => stack.proxy.count('eth_sendRawTransaction');
 const hooks = () => stack.courier.hooks as HookControl;
+/** One bet's requests: those at the proxy, across every life, that carried its transaction's own bytes. None for a Cross with no transaction. */
+const requestsOf = (txHash: string | null | undefined): number =>
+  txHash === null || txHash === undefined ? 0 : stack.proxy.counted.filter((r) => r.sent !== undefined && keccak256(r.sent as Hex).toLowerCase() === txHash.toLowerCase()).length;
 
 before(async () => {
   stack = await startStack('sendonce', { hooked: true, blockTime: 2, sending: true });
@@ -160,8 +164,35 @@ for (const at of [
   });
 }
 
+test("the node's answer lost, then a restart, with the proxy refusing the first attempt's connection: one request for the bet, by its own bytes, and no second; the Cross settles from the chain, expired unmined, before the lane reserves anything", async () => {
+  // F held at the head as it stands, so the first life records no answer and cannot settle.
+  stack.proxy.finalFollows(null);
+  stack.proxy.setFinal(BigInt((await stack.rig.rpc('eth_blockNumber', [])) as string));
+  // The first attempt's connection refused: closed before the request reaches the node, with no answer.
+  stack.proxy.dropNext('eth_sendRawTransaction');
+  const c = await quoteAndBet(14n);
+  await until(() => crossRow(c.betHash), (r) => r !== null && ['unknown', 'sent', 'pending'].includes(r.state), 30_000, 'the hand-off made');
+  // A second bet waits behind it, and is reserved only after the first is settled.
+  const second = await quoteAndBet();
+  await killAndRestart();
+  stack.proxy.setFinal(null);
+  stack.proxy.finalFollows(1n);
+  // Both bets final before anything is counted, so no request of either is still to come.
+  const row = await final(c.betHash);
+  const row2 = await final(second.betHash);
+  assert.deepEqual({ first: requestsOf(row?.tx_hash), second: requestsOf(row2?.tx_hash) }, { first: 1, second: 1 }, 'one request for each bet: the first never sent again');
+  // Its transaction never reached the node: in no block up to a final block at or past the bet's expiry.
+  assert.equal(row?.state, 'expired unmined', JSON.stringify(row));
+  const settled = await pool.query<{ outcome: Date; intent: Date | null }>(
+    `SELECT a.outcome_at AS outcome, b.intent_at AS intent FROM crosses a LEFT JOIN crosses b ON b.bet_hash = $2 WHERE a.bet_hash = $1`,
+    [c.betHash.toLowerCase(), second.betHash.toLowerCase()],
+  );
+  const t = settled.rows[0] as { outcome: Date; intent: Date | null };
+  assert.ok(t.intent === null || t.intent >= t.outcome, 'the lane reserved the second bet only after the first was settled');
+  await noForeignTransactions();
+});
+
 test('the node\'s answer lost, then a restart: the Cross settles confirmed from the chain before the lane reserves anything, with no second request', async () => {
-  const before = { s: signed(), h: handOffs() };
   // F held at the head as it stands, so the first life records the answer lost and cannot settle.
   stack.proxy.finalFollows(null);
   stack.proxy.setFinal(BigInt((await stack.rig.rpc('eth_blockNumber', [])) as string));
@@ -175,7 +206,10 @@ test('the node\'s answer lost, then a restart: the Cross settles confirmed from 
   await killAndRestart();
   stack.proxy.setFinal(null);
   stack.proxy.finalFollows(1n);
+  // Both bets final before anything is counted, so no request of either is still to come.
   const row = await final(c.betHash);
+  const row2 = await final(second.betHash);
+  assert.deepEqual({ first: requestsOf(row?.tx_hash), second: requestsOf(row2?.tx_hash) }, { first: 1, second: 1 }, 'one request for each bet: the first never sent again');
   assert.equal(row?.state, 'confirmed', JSON.stringify(row));
   const order = await pool.query<{ bet: string }>(`SELECT bet_hash AS bet FROM crosses WHERE bet_hash IN ($1, $2) ORDER BY intent_at`, [c.betHash.toLowerCase(), second.betHash.toLowerCase()]);
   assert.equal(order.rows[0]?.bet, c.betHash.toLowerCase());
@@ -185,8 +219,6 @@ test('the node\'s answer lost, then a restart: the Cross settles confirmed from 
   );
   const t = settled.rows[0] as { outcome: Date; intent: Date | null };
   assert.ok(t.intent === null || t.intent >= t.outcome, 'the lane reserved the second bet only after the first was settled');
-  assert.equal(handOffs() - before.h, 2, 'one request for each bet: the first never sent again');
-  await final(second.betHash);
   await noForeignTransactions();
 });
 
