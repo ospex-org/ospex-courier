@@ -518,6 +518,12 @@ CREATE INDEX IF NOT EXISTS events_report_lines
   ON events (number)
   WHERE kind IN ('condition opened', 'condition cleared', 'incident');
 
+-- The restore's lines: the database-wide hold the operator's shut writes, read before every reservation, at the door
+-- and at the take. Empty on a database never restored, so the read stays one lookup however long the history.
+CREATE INDEX IF NOT EXISTS events_restore_shut
+  ON events (number)
+  WHERE kind = 'incident' AND reason = 'RESTORE_SHUT';
+
 -- A bet's lines, by the bet's hash and in order: what GET /v1/orders/{hash} reads a bet's verdict along. The lines the
 -- bet's check writes carry the bet's hash in bet_hash.
 CREATE INDEX IF NOT EXISTS events_bet_lines

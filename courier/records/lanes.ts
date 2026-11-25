@@ -29,14 +29,15 @@ export interface Taken {
 }
 
 /**
- * The database-wide restore hold: the restore's incident line, where a lane is shut by one, or null. Once written it
- * holds every lane, old or new: a lane made later is shut by the same line, and nothing in this build lifts it. One
- * statement over the lanes, which are few, and the line each names.
+ * The database-wide restore hold: the restore's incident line, or null. Once written it holds the whole database,
+ * every lane old or new and none at all: a lane made later is shut by the same line, and nothing in this build lifts
+ * it. It is read from the line itself, not from a lane it shut: a shut that could not read the relay's sender makes
+ * no lane, and the hold stands all the same. One lookup in the index of those lines, which is empty on a database never
+ * restored.
  */
 export async function restoreHold(on: Client): Promise<number | null> {
   const { rows } = await on.query<{ number: string }>(
-    `SELECT e.number::text AS number FROM lanes l JOIN events e ON e.number = l.shut_line
-     WHERE e.kind = 'incident' AND e.reason = 'RESTORE_SHUT' ORDER BY e.number LIMIT 1`,
+    `SELECT e.number::text AS number FROM events e WHERE e.kind = 'incident' AND e.reason = 'RESTORE_SHUT' ORDER BY e.number LIMIT 1`,
   );
   return rows[0] === undefined ? null : Number(rows[0].number);
 }
@@ -149,7 +150,7 @@ export async function lockLaneToReserve(on: Client, key: Address): Promise<(Lane
   const { rows } = await on.query(
     `SELECT ${LANE_COLUMNS},
        EXISTS (SELECT 1 FROM lanes o WHERE o.open_cross IS NOT NULL AND o.sender <> $1) AS others_open,
-       (SELECT e.number::text FROM lanes h JOIN events e ON e.number = h.shut_line WHERE e.kind = 'incident' AND e.reason = 'RESTORE_SHUT' ORDER BY e.number LIMIT 1) AS restore_hold
+       (SELECT e.number::text FROM events e WHERE e.kind = 'incident' AND e.reason = 'RESTORE_SHUT' ORDER BY e.number LIMIT 1) AS restore_hold
      FROM lanes WHERE sender = $1 FOR UPDATE`,
     [key.toLowerCase()],
   );

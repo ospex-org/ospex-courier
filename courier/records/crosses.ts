@@ -229,13 +229,19 @@ export interface BlockNamed {
 }
 
 /** The open states a look can move from: at or past the gate, not final. */
-const OPEN_STATES = `('handing off', 'sent', 'pending', 'unknown')`;
+/**
+ * The states an outcome is written from. A Cross past its gate; and, under a restore's hold only, one retained at its
+ * signed record. A restore can erase the gate passed and the hand-off made after the copy, so the take leaves a retained
+ * signed row open there, and it is reconciled by its hash from the chain. Anywhere else a signed row never reached the
+ * gate, and the take closes it as never sent.
+ */
+const OPEN_STATES = `(state IN ('handing off', 'sent', 'pending', 'unknown') OR (state = 'signed' AND EXISTS (SELECT 1 FROM events e WHERE e.kind = 'incident' AND e.reason = 'RESTORE_SHUT')))`;
 
 /** A receipt seen above F: pending, from an open state. True where the row moved. */
 export async function writePending(on: Client, betHash: Hex, receipt: BlockNamed): Promise<boolean> {
   const { rowCount } = await on.query(
     `UPDATE crosses SET state = 'pending', receipt_block_number = $2, receipt_block_hash = $3, receipt_seen_at = coalesce(receipt_seen_at, now()), updated_at = now()
-     WHERE bet_hash = $1 AND state IN ${OPEN_STATES}
+     WHERE bet_hash = $1 AND ${OPEN_STATES}
        AND (state <> 'pending' OR receipt_block_hash IS DISTINCT FROM $3)`,
     [betHash.toLowerCase(), receipt.number.toString(), receipt.hash.toLowerCase()],
   );
@@ -285,7 +291,7 @@ export async function writeFinal(on: Client, betHash: Hex, o: FinalOutcome, from
        gas_used = $7, effective_gas_price = $8, replaced_by = $9, replaced_by_ours = $10,
        revert_reason = $11, revert_evidence = $12, revert_data = $13, recorded = $14, outcome_at = now(), updated_at = now(),
        sender = coalesce($15, sender), nonce = coalesce($16::bigint, nonce), tx_hash = coalesce($17, tx_hash)
-     WHERE bet_hash = $1 AND ${from === 'open' ? `state IN ${OPEN_STATES}` : from === 'intent' ? `state = 'intent'` : `state = 'expired unmined'`}`,
+     WHERE bet_hash = $1 AND ${from === 'open' ? OPEN_STATES : from === 'intent' ? `state = 'intent'` : `state = 'expired unmined'`}`,
     [
       betHash.toLowerCase(),
       o.state,
