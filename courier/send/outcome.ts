@@ -184,7 +184,8 @@ async function ran(deps: OutcomeDeps, F: Header, cross: CrossRow, expected: Expe
   const f = await filled(deps, F, expected.betHash, quoteHashes);
   // The bet's filled amount at F: at least the receipt's total taking stake, plus the amount at H where H is an ancestor of F.
   let baseline = 0n;
-  if (expected.atH !== null) {
+  // Nothing filled at H adds nothing, wherever H stands: its place on F's chain is read only where there is an amount to add.
+  if (expected.atH !== null && expected.atH.betFilled > 0n) {
     const [hShown] = await onFinalChain(deps.chain, deps.rpc, F, [expected.atH.block]);
     if (hShown === true) baseline = expected.atH.betFilled;
   }
