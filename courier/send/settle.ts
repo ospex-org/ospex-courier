@@ -283,7 +283,7 @@ export function createSettler(deps: SettleDeps): Settler {
       if (bet === null) throw new Error('an expired unmined Cross has no bet');
       if (receipt.status !== 'reverted') {
         // Expired unmined says it can no longer fill; a successful receipt says it did: a contradiction.
-        await store.conditions.raise('courier-fault', { lane: key, betHash: c.betHash, why: 'a Cross closed expired unmined has a successful receipt on the final chain', txHash: c.txHash, final: finalNamed(F) }, deps.run.id);
+        await store.events.write({ run: deps.run.id, kind: 'incident', orderHash: bet.hash, betHash: bet.hash, account: bet.order.account.toLowerCase(), gameId: bet.order.gameId, reason: 'CHAIN_CONTRADICTS_RECORDS', facts: { lane: key, betHash: c.betHash, why: 'a Cross closed expired unmined has a successful receipt on the final chain', txHash: c.txHash, final: finalNamed(F) } });
         deps.stopSending('a Cross closed expired unmined has a successful receipt on the final chain');
         return 'stop';
       }
@@ -398,7 +398,7 @@ export function createSettler(deps: SettleDeps): Settler {
           if (l.facts.search === 'unanswered') await holdKey({ why: 'the node could not answer the search for what used the nonce', nonce: cross.nonce === null ? null : s(cross.nonce), found: 'the node could not answer', missing: l.missing, final: finalNamed(l.F), betHash: bet.hash });
           break;
         case 'contradiction':
-          await store.conditions.raise('courier-fault', { lane: key, betHash: bet.hash, ...l.facts }, deps.run.id);
+          await store.events.write({ run: deps.run.id, kind: 'incident', orderHash: bet.hash, betHash: bet.hash, account: bet.order.account.toLowerCase(), gameId: bet.order.gameId, reason: 'CHAIN_CONTRADICTS_RECORDS', facts: { lane: key, betHash: bet.hash, ...l.facts } });
           deps.stopSending(`a Cross's outcome contradicts the chain's own state (${String(l.facts.why)})`);
           return 'stop';
         case 'not comparable':

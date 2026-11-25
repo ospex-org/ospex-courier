@@ -466,9 +466,12 @@ export function createLane(deps: LaneDeps): Lane {
     return 'stop';
   }
 
-  /** The records and the chain disagree: courier-fault opened with the reads judged, and this process sends nothing more. The bet goes back to waiting. */
+  /**
+   * The records and the chain disagree: an incident line holds the reads judged, and this process sends nothing more.
+   * The bet goes back to waiting.
+   */
   async function contradiction(res: Reserved, facts: Record<string, unknown>): Promise<Carried> {
-    await store.conditions.raise('courier-fault', { lane: key, betHash: res.bet.hash, ...facts }, run.id);
+    await store.events.write({ run: run.id, kind: 'incident', orderHash: res.bet.hash, betHash: res.bet.hash, account: res.bet.order.account.toLowerCase(), gameId: res.bet.order.gameId, reason: 'CHAIN_CONTRADICTS_RECORDS', facts: { lane: key, betHash: res.bet.hash, ...facts } });
     await backToWaiting(res);
     stopSending('the records and the chain disagree at the same final block');
     return 'stop';
