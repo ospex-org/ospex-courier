@@ -538,3 +538,32 @@ export function describeNodeFailure(err: unknown): { kind: string; code: number 
   const name = err instanceof Error ? err.name : typeof err;
   return { kind: name, code: null, method: null };
 }
+
+/** A mined or pending transaction as the recovery under a restore's hold reads it: its sender, its nonce, its target and its input, and its block where it has one. */
+export interface TransactionSeen {
+  hash: Hex;
+  from: Address;
+  nonce: bigint;
+  to: Address | null;
+  input: Hex;
+  block: { number: bigint; hash: Hex } | null;
+}
+
+/** The transaction with this hash, or null where the node has none. An answer that does not decode is the node's `malformed` failure. */
+export async function transactionOf(rpc: JsonRpc, hash: Hex): Promise<TransactionSeen | null> {
+  const raw = await rpc.request<unknown>('eth_getTransactionByHash', [hash]);
+  if (raw === null) return null;
+  const t = typeof raw === 'object' ? (raw as Record<string, unknown>) : null;
+  const bad = () => new NodeFailure('malformed', 'eth_getTransactionByHash', null, 'the transaction lacks a field, or one does not decode');
+  if (t === null || typeof t.hash !== 'string' || !HASH.test(t.hash) || typeof t.from !== 'string' || !ADDRESS.test(t.from) || typeof t.nonce !== 'string' || !QUANTITY.test(t.nonce)) throw bad();
+  if (!(t.to === null || (typeof t.to === 'string' && ADDRESS.test(t.to))) || typeof t.input !== 'string' || !BYTES.test(t.input)) throw bad();
+  const mined = typeof t.blockNumber === 'string' && QUANTITY.test(t.blockNumber) && typeof t.blockHash === 'string' && HASH.test(t.blockHash);
+  return {
+    hash: t.hash.toLowerCase() as Hex,
+    from: t.from as Address,
+    nonce: BigInt(t.nonce),
+    to: t.to === null ? null : (t.to as Address),
+    input: t.input.toLowerCase() as Hex,
+    block: mined ? { number: BigInt(t.blockNumber as string), hash: (t.blockHash as string).toLowerCase() as Hex } : null,
+  };
+}

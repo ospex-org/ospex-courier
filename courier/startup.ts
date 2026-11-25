@@ -7,6 +7,7 @@ import { createChainReader, type ChainReader } from './chain/snapshot';
 import { createLane } from './check/lane';
 import { NO_HOOKS, type LaneHooks } from './check/hooks';
 import { isSealedSend } from './check/precheck';
+import { closeByRotation } from './send/operator';
 import { KeystoreRefused, openSigner, type Signer } from './send/signer';
 import { readCourierConfig, type CourierConfig } from './config';
 import { BOUNDS, createAddressLimiter, createCounters, TIMEOUTS } from './http/limits';
@@ -178,6 +179,15 @@ export async function startService(env: Record<string, string | undefined>, opti
     throw new StartupRefused(`the lane could not be taken: ${databaseRefusal(err)}`);
   }
   log(`courier: lane ${config.courierAddress} taken at epoch ${taken.epoch}; ${taken.returned.length} held bet${taken.returned.length === 1 ? '' : 's'} back to waiting, ${taken.stopped.length} finished as stopped`);
+
+  // A rotation, read at the final block: a lane whose key is no longer the relay's sender is retired, and never
+  // reserves again; an ordinary hold on it closes with its line. A read that fails retires nothing now.
+  try {
+    const retired = await closeByRotation({ store, rpc, chain, set, run: run.id });
+    if (retired.length > 0) log(`courier: ${retired.length} lane${retired.length === 1 ? '' : 's'} retired: the relay's sender at the final block is another key`);
+  } catch (err) {
+    log(`courier: the read for retired lanes failed (${err instanceof Error ? err.name : typeof err}); none retired now`);
+  }
 
   const counters = createCounters(now);
   const limiter = createAddressLimiter(BOUNDS.requestsPerAddressPerMinute);

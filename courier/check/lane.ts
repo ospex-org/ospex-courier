@@ -7,11 +7,13 @@ import { coinAmount } from '../orders/order';
 import { inLockOrder } from '../orders/stops';
 import { closeBeforeGate, crossesOfKey, crossRow, freeLaneOfCross, lockCross, markHandingOff, writeAnswer, writeIntent, writeSigned } from '../records/crosses';
 import { firstWaitingBet, type OrderRow } from '../records/orders';
-import { free, holdBet, lockBet, lockLane, putBack, raiseWatermark, readLane, reserve, setBetState, shareLane, shutLane, take, type LaneRow, type Taken } from '../records/lanes';
+import { free, holdBet, lockBet, lockLane, otherOpenCrosses, putBack, raiseWatermark, readLane, reserve, restoreHold, setBetState, shareLane, shutLane, take, type LaneRow, type Taken } from '../records/lanes';
 import type { Run } from '../records/runs';
 import { failureCode, type Store } from '../records/store';
-import { onFinalChain } from '../send/chain';
-import { createSettler } from '../send/settle';
+import { onFinalChain, type Named } from '../send/chain';
+import { searchNonce } from '../send/outcome';
+import { reconcileRestored, unresolvedWaiting } from '../send/recovery';
+import { createSettler, type Settler } from '../send/settle';
 import { blocksToShow, chooseFees, proveNonce, walletCovers, type NonceProof } from '../send/checks';
 import { SignatureRefused, type Signer, type SignedCross } from '../send/signer';
 import type { LaneHooks } from './hooks';
@@ -146,19 +148,100 @@ export function createLane(deps: LaneDeps): Lane {
 
   const checkDeps: CheckDeps = { ...deps.check, courier: key, lane: store.lane, orders: store.orders, hooks };
 
-  const settler = createSettler({
-    store,
-    key,
-    run,
-    chain: deps.check.chain,
-    rpc: deps.check.rpc,
-    set: deps.check.set,
-    epoch: () => epoch,
-    sending: () => !stopped,
-    stopSending: (why) => stopSending(why),
-    log: deps.log,
-    gap: LOOK_GAP,
-  });
+  const settlerFor = (laneKey: Address): Settler =>
+    createSettler({
+      store,
+      key: laneKey,
+      run,
+      chain: deps.check.chain,
+      rpc: deps.check.rpc,
+      set: deps.check.set,
+      epoch: () => epoch,
+      sending: () => !stopped,
+      stopSending: (why) => stopSending(why),
+      log: deps.log,
+      gap: LOOK_GAP,
+    });
+  const settler = settlerFor(key);
+  const others = new Map<string, Settler>();
+
+  /**
+   * Before the lane reserves anything: its own open Cross settled from the chain, and every other lane's, a retired
+   * key's included, since no lane reserves while another holds an open Cross (the drain). Settling reads and records;
+   * it signs and sends nothing. 'stop' where this process stopped sending or no longer owns a lane.
+   */
+  async function settleOpen(): Promise<'clear' | 'stop'> {
+    const { client, done } = await laneClient(store.lane);
+    let own: Hex | null;
+    let rest: Array<{ sender: Address; betHash: Hex }>;
+    let hold: number | null;
+    try {
+      own = (await readLane(client, key))?.openCross ?? null;
+      rest = await otherOpenCrosses(client, key);
+      hold = await restoreHold(client);
+    } finally {
+      done();
+    }
+    if (hold !== null) return recoverUnderHold(hold);
+    for (const open of [...(own === null ? [] : [{ sender: key, betHash: own }]), ...rest]) {
+      const bet = await store.orders.get(open.betHash, store.lane);
+      if (bet === null) throw new Error('an open Cross has no bet');
+      let s = open.sender.toLowerCase() === key.toLowerCase() ? settler : others.get(open.sender.toLowerCase());
+      if (s === undefined) {
+        s = settlerFor(open.sender);
+        others.set(open.sender.toLowerCase(), s);
+      }
+      deps.log(`lane: settling the open Cross of lane ${open.sender} from the chain before anything is reserved`);
+      const r = await s.settle(bet);
+      if (r !== 'done') return 'stop';
+    }
+    return 'clear';
+  }
+
+  const recoveryDeps = { store, chain: deps.check.chain, rpc: deps.check.rpc, set: deps.check.set, run, epoch: () => epoch, log: deps.log };
+
+  /**
+   * Under a restore's hold: every lane's nonce use reconciled and its retained intent closed where the chain allows;
+   * each signed or later Cross settled by its own hash; each retained bet with no Cross given its ACTION once its
+   * expiry is past a final block. Looked at again at the gap until every lane is reconciled. Nothing is reserved,
+   * signed or handed off, and the hold stands: always 'stop'.
+   */
+  async function recoverUnderHold(hold: number): Promise<'stop'> {
+    let gap: number = LOOK_GAP.firstMs;
+    for (;;) {
+      if (stopped) return 'stop';
+      const { rows } = await store.lane.query<{ sender: Address; open_cross: Hex | null }>('SELECT sender, open_cross FROM lanes ORDER BY sender');
+      let all = true;
+      for (const lane of rows) {
+        const r = await reconcileRestored(recoveryDeps, lane.sender, hold);
+        if (!r.done) {
+          all = false;
+          deps.log(`lane: under the restore's hold, lane ${lane.sender} is not yet reconciled: ${r.missing}`);
+        }
+        if (lane.open_cross === null) continue;
+        const cross = await store.lane.query<{ state: string }>('SELECT state FROM crosses WHERE bet_hash = $1', [lane.open_cross]);
+        const state = cross.rows[0]?.state;
+        if (state === undefined || state === 'intent') continue;
+        const bet = await store.orders.get(lane.open_cross, store.lane);
+        if (bet === null) throw new Error('an open Cross has no bet');
+        let sr = lane.sender.toLowerCase() === key.toLowerCase() ? settler : others.get(lane.sender.toLowerCase());
+        if (sr === undefined) {
+          sr = settlerFor(lane.sender);
+          others.set(lane.sender.toLowerCase(), sr);
+        }
+        if ((await sr.settle(bet)) !== 'done') all = false;
+      }
+      try {
+        await unresolvedWaiting(recoveryDeps, await deps.check.chain.finalHeader());
+      } catch (err) {
+        if (!(err instanceof ChainUnreachable)) throw err;
+        all = false;
+      }
+      if (all) return 'stop';
+      await sleep(gap);
+      gap = Math.min(gap * 2, LOOK_GAP.lastMs);
+    }
+  }
 
   /** The database failed under a lane step: this process takes no more bets until it restarts. */
   const failStop = (err: unknown, where: string) => {
@@ -184,6 +267,11 @@ export function createLane(deps: LaneDeps): Lane {
           return 'stop';
         }
         if (lane.heldBet !== null || lane.openCross !== null || lane.shutLine !== null) {
+          await client.query('ROLLBACK');
+          return 'stop';
+        }
+        // The database-wide restore hold, and the drain: no lane reserves while another lane holds an open Cross.
+        if ((await restoreHold(client)) !== null || (await otherOpenCrosses(client, key)).length > 0) {
           await client.query('ROLLBACK');
           return 'stop';
         }
@@ -332,9 +420,16 @@ export function createLane(deps: LaneDeps): Lane {
     return { proof: proveNonce({ F, countAtFinal: c.send.countAtFinal, countAtH: c.nonce, watermark: lane.watermark, crosses, onF }), lane };
   }
 
-  /** The key's nonce used and not explained: cross-unreconciled opened with the reads, the lane shut by its line, the bet back to waiting. Nothing is signed. */
-  async function shutForNonce(res: Reserved, facts: Record<string, unknown>): Promise<Carried> {
-    const { line: opened } = await store.conditions.raise('cross-unreconciled', { lane: key, ...facts }, run.id);
+  /**
+   * The key's nonce used and not explained: the search for what used it runs from the watermark's anchor, the
+   * recorded height at which the nonce was unused; cross-unreconciled opens with the reads and what the search found,
+   * or that the node could not answer; the lane is shut by its line, and the bet goes back to waiting. Nothing is
+   * signed.
+   */
+  async function shutForNonce(res: Reserved, facts: Record<string, unknown>, F: Header, nonce: bigint, unusedAt: Named | null): Promise<Carried> {
+    const hit = await searchNonce({ chain: deps.check.chain, rpc: deps.check.rpc, set: deps.check.set, key }, F, nonce, unusedAt);
+    const found = 'missing' in hit ? { found: 'the node could not answer', missing: hit.missing } : { found: { hash: hit.found.hash, block: { number: hit.found.block.number.toString(), hash: hit.found.block.hash } } };
+    const { line: opened } = await store.conditions.raise('cross-unreconciled', { lane: key, why: "the key's nonce was used at a final block and nothing the records hold explains it", ...facts, ...found, searchReads: hit.reads }, run.id);
     const { client, done } = await laneClient(store.lane);
     try {
       await client.query('BEGIN');
@@ -393,7 +488,7 @@ export function createLane(deps: LaneDeps): Lane {
       // An `expired unmined` Cross at a used nonce: its receipt is read by its hash first, with the outcome's reads.
       return settleExpiredAgain(ready, proof);
     }
-    if (proof.kind === 'unexplained') return shutForNonce(res, proof.facts);
+    if (proof.kind === 'unexplained') return shutForNonce(res, proof.facts, c.send.final, proof.nonce, lane.watermark.anchor);
     if (proof.kind === 'contradiction') return contradiction(res, proof.facts);
 
     const crosses = await crossesOfKey(store.lane, key);
@@ -438,7 +533,7 @@ export function createLane(deps: LaneDeps): Lane {
     try {
       await client.query('BEGIN');
       const lane = await lockLane(client, key);
-      if (!holds(lane, res) || lane.openCross !== null || lane.shutLine !== null) {
+      if (!holds(lane, res) || lane.openCross !== null || lane.shutLine !== null || (await restoreHold(client)) !== null) {
         await client.query('ROLLBACK');
         return 'lost';
       }
@@ -558,7 +653,7 @@ export function createLane(deps: LaneDeps): Lane {
       let gate: 'marked' | 'stopped' | 'lost';
       try {
         const lane = await lockLane(client, key);
-        const cross = holds(lane, res) && lane.openCross?.toLowerCase() === bet ? await lockCross(client, bet) : null;
+        const cross = holds(lane, res) && lane.openCross?.toLowerCase() === bet && (await restoreHold(client)) === null ? await lockCross(client, bet) : null;
         if (cross === null || cross.state !== 'signed' || cross.txHash?.toLowerCase() !== signed.hash.toLowerCase()) {
           gate = 'lost';
         } else {
@@ -715,6 +810,7 @@ export function createLane(deps: LaneDeps): Lane {
       for (;;) {
         if (stopped) break;
         flag = false;
+        if ((await settleOpen()) === 'stop') break;
         const r = await reserveOne();
         if (r === 'stop') break;
         if (r === null) {
@@ -753,12 +849,18 @@ export function createLane(deps: LaneDeps): Lane {
         await client.query('BEGIN');
         const taken = await take(client, key, run.id);
         await store.events.write(
-          { run: run.id, kind: 'run started', facts: { ...runFacts, key, epoch: taken.epoch.toString(), lanes: taken.lanes, heldReturnedToWaiting: taken.returned.length, heldFinishedStopped: taken.stopped.length } },
+          { run: run.id, kind: 'run started', facts: { ...runFacts, key, epoch: taken.epoch.toString(), lanes: taken.lanes, heldReturnedToWaiting: taken.returned.length, heldFinishedStopped: taken.stopped.length, crossesClosedRestarted: taken.closed.length, restoreHold: taken.restoreHold } },
           client,
         );
         for (const s of taken.stopped) {
           await store.events.write(
             { run: run.id, kind: 'bet refused', orderHash: s.hash, betHash: s.hash, account: s.account, gameId: BigInt(s.gameId), reason: 'STOPPED', facts: { code: 'STOPPED', error: VERDICT.STOPPED, block: null, run: run.id, byTheTake: true } },
+            client,
+          );
+        }
+        for (const c of taken.closed) {
+          await store.events.write(
+            { run: run.id, kind: 'cross not sent', orderHash: c.hash, betHash: c.hash, account: c.account, gameId: BigInt(c.gameId), reason: 'COURIER_RESTARTED', facts: { lane: c.lane, was: c.state, txHash: c.txHash, nonce: c.nonce, handOffs: 0, byTheTake: true } },
             client,
           );
         }
@@ -774,7 +876,7 @@ export function createLane(deps: LaneDeps): Lane {
     },
     async admits(client) {
       const e = await shareLane(client, key);
-      return e !== null && epoch !== null && e === epoch && !stopped;
+      return e !== null && epoch !== null && e.epoch === epoch && e.shutLine === null && !stopped && (await restoreHold(client)) === null;
     },
     wake() {
       if (epoch === null || stopped) return;

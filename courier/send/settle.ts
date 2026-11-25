@@ -227,6 +227,23 @@ export function createSettler(deps: SettleDeps): Settler {
     }
   }
 
+  /**
+   * A read closes an ordinary hold that a search the node could not answer opened for this Cross: the search has now
+   * answered with the courier's own transaction, and the Cross is settled. The lane opens, and the condition closes
+   * once no lane stays shut by a line of its own. A hold for a transaction the records do not hold is never closed so.
+   */
+  async function openOnRead(bet: OrderRow): Promise<void> {
+    const { rows } = await store.lane.query<{ shut_line: string; facts: Record<string, unknown>; kind: string; reason: string | null }>(
+      `SELECT l.shut_line::text AS shut_line, e.facts, e.kind, e.reason FROM lanes l JOIN events e ON e.number = l.shut_line WHERE l.sender = $1`,
+      [key.toLowerCase()],
+    );
+    const r = rows[0];
+    if (r === undefined || r.kind !== 'condition opened' || r.reason !== 'cross-unreconciled' || r.facts.found !== 'the node could not answer' || String(r.facts.betHash).toLowerCase() !== bet.hash.toLowerCase()) return;
+    await store.lane.query('UPDATE lanes SET shut_line = NULL WHERE sender = $1 AND shut_line = $2', [key.toLowerCase(), r.shut_line]);
+    const still = await store.lane.query(`SELECT 1 FROM lanes l JOIN events e ON e.number = l.shut_line WHERE e.kind = 'condition opened' AND e.reason = 'cross-unreconciled'`);
+    if ((still.rowCount ?? 0) === 0) await store.conditions.applySuccess('cross-unreconciled', { how: "a read: the search answered with the courier's own transaction", lane: key.toLowerCase(), betHash: bet.hash }, deps.run.id);
+  }
+
   async function readExpiredAgain(F: Header): Promise<'none' | 'written' | 'stop'> {
     const expired = (await crossesOfKey(store.lane, key)).filter((c) => c.state === 'expired unmined' && c.txHash !== null && c.nonce !== null);
     if (expired.length === 0) return 'none';
@@ -326,7 +343,10 @@ export function createSettler(deps: SettleDeps): Settler {
           break;
         case 'ran':
           result = await writeRan(bet, cross, legs, l);
-          if (result === 'written') return 'done';
+          if (result === 'written') {
+            await openOnRead(bet);
+            return 'done';
+          }
           break;
         case 'expired unmined':
           result = await guarded(cross, async (client) => {
@@ -349,7 +369,10 @@ export function createSettler(deps: SettleDeps): Settler {
             await freeLaneOf(client, key, bet.hash);
             return true;
           });
-          if (result === 'written') return 'done';
+          if (result === 'written') {
+            if (l.ours !== null) await openOnRead(bet);
+            return 'done';
+          }
           break;
         }
         case 'unavailable':

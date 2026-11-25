@@ -256,13 +256,15 @@ export interface FinalOutcome {
   recorded: Record<string, unknown>;
   /** The legs as the chain recorded them, by position: filled with the two stakes, or skipped with the contract's reason. */
   legs?: Array<{ position: number; makerRisk: bigint | null; takerRisk: bigint | null; skip: string | null }>;
+  /** A restored intent's transaction, found by the recovery's search: the key, the nonce and the hash, written with the outcome. */
+  associate?: { sender: Address; nonce: bigint; txHash: Hex };
 }
 
 /** The longest revert data kept: whole bytes, 32,768 hex digits. */
 const REVERT_DATA_DIGITS = 32_768;
 
 /** The outcome written: the Cross's row from an open state (or, for `reverted` alone, from `expired unmined`), and its legs. True where the row moved. */
-export async function writeFinal(on: Client, betHash: Hex, o: FinalOutcome, from: 'open' | 'expired unmined' = 'open'): Promise<boolean> {
+export async function writeFinal(on: Client, betHash: Hex, o: FinalOutcome, from: 'open' | 'expired unmined' | 'intent' = 'open'): Promise<boolean> {
   const data = o.revert?.data ?? null;
   const digits = data === null ? '' : data.slice(2, 2 + REVERT_DATA_DIGITS);
   const kept = data === null ? null : (`0x${digits.slice(0, digits.length - (digits.length % 2))}` as Hex);
@@ -271,8 +273,9 @@ export async function writeFinal(on: Client, betHash: Hex, o: FinalOutcome, from
        receipt_block_number = coalesce($5::numeric, receipt_block_number), receipt_block_hash = coalesce($6::text, receipt_block_hash),
        receipt_seen_at = CASE WHEN $5::numeric IS NULL THEN receipt_seen_at ELSE coalesce(receipt_seen_at, now()) END,
        gas_used = $7, effective_gas_price = $8, replaced_by = $9, replaced_by_ours = $10,
-       revert_reason = $11, revert_evidence = $12, revert_data = $13, recorded = $14, outcome_at = now(), updated_at = now()
-     WHERE bet_hash = $1 AND ${from === 'open' ? `state IN ${OPEN_STATES}` : `state = 'expired unmined'`}`,
+       revert_reason = $11, revert_evidence = $12, revert_data = $13, recorded = $14, outcome_at = now(), updated_at = now(),
+       sender = coalesce($15, sender), nonce = coalesce($16::bigint, nonce), tx_hash = coalesce($17, tx_hash)
+     WHERE bet_hash = $1 AND ${from === 'open' ? `state IN ${OPEN_STATES}` : from === 'intent' ? `state = 'intent'` : `state = 'expired unmined'`}`,
     [
       betHash.toLowerCase(),
       o.state,
@@ -288,6 +291,9 @@ export async function writeFinal(on: Client, betHash: Hex, o: FinalOutcome, from
       o.revert?.evidence ?? null,
       kept,
       JSON.stringify(o.recorded),
+      o.associate?.sender.toLowerCase() ?? null,
+      o.associate?.nonce.toString() ?? null,
+      o.associate?.txHash.toLowerCase() ?? null,
     ],
   );
   if ((rowCount ?? 0) !== 1) return false;
