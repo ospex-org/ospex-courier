@@ -140,7 +140,7 @@ test('the control: a bet the book can fill is signed once, handed to the node on
   assert.equal(record.status, 200);
 });
 
-test('N-C1 (a): a listed quote stopped at the last moment, after the signed record and before the gate: one signature, no hand-off, the key\'s nonce unchanged on the chain, the Cross not sent STOPPED_AT_GATE with no hand-off, and no USDC moved; the control, the same hold and no stop, is handed off once and fills', async () => {
+test('a listed quote stopped at the last moment, after the signed record and before the gate: one signature, no hand-off, the key\'s nonce unchanged on the chain, the Cross not sent STOPPED_AT_GATE with no hand-off, and no USDC moved; the control, the same hold and no stop, is handed off once and fills', async () => {
   const hooks = stack.courier.hooks as NonNullable<Stack['courier']['hooks']>;
   for (const stopIt of [true, false]) {
     await laneFree();
@@ -175,7 +175,7 @@ test('N-C1 (a): a listed quote stopped at the last moment, after the signed reco
   }
 });
 
-test('N-C1 (b): the bet itself stopped after the signed record: one signature, no hand-off, the Cross closed not sent with no hand-off, and the bet\'s record reads stopped', async () => {
+test('the bet itself stopped after the signed record: one signature, no hand-off, the Cross closed not sent with no hand-off, and the bet\'s record reads stopped', async () => {
   const hooks = stack.courier.hooks as NonNullable<Stack['courier']['hooks']>;
   await laneFree();
   const before = counts();
@@ -196,7 +196,7 @@ test('N-C1 (b): the bet itself stopped after the signed record: one signature, n
   assert.deepEqual(outcomes(await postStop(url(), stack.rig, c.M, stopMessage(c.M.address, [c.quoteHash as `0x${string}`]))), ['stopped']);
 });
 
-test('N-C1 (c): a stop between the intent and the signature: the signature is allowed and the hand-off is not; the Cross not sent STOPPED_AT_GATE', async () => {
+test('a stop between the intent and the signature: the signature is allowed and the hand-off is not; the Cross not sent STOPPED_AT_GATE', async () => {
   const hooks = stack.courier.hooks as NonNullable<Stack['courier']['hooks']>;
   await laneFree();
   const before = counts();
@@ -211,7 +211,7 @@ test('N-C1 (c): a stop between the intent and the signature: the signature is al
   assert.deepEqual({ signed: counts().signed - before.signed, handOffs: counts().handOffs - before.handOffs }, { signed: 1, handOffs: 0 });
 });
 
-test('N-C1 (d): a stop during the hand-off waits on the hash locks through the node\'s answer and its record, then reads stopped with handOff { txHash, state: "sent", bet }; the Cross fills the quote; the stop commits after the gate and after the answer', async () => {
+test('a stop during the hand-off waits on the hash locks through the node\'s answer and its record, then reads stopped with handOff { txHash, state: "sent", bet }; the Cross fills the quote; the stop commits after the gate and after the answer', async () => {
   await laneFree();
   const before = counts();
   const held = stack.proxy.hold('eth_sendRawTransaction');
@@ -242,7 +242,7 @@ test('N-C1 (d): a stop during the hand-off waits on the hash locks through the n
   assert.deepEqual({ signed: counts().signed - before.signed, handOffs: counts().handOffs - before.handOffs }, { signed: 1, handOffs: 1 });
 });
 
-test('N-C1 (e): the node\'s answer lost: the request passed to the chain and its answer withheld until the client\'s ten seconds run out; the stop reads stopped with handOff state "uncertain"; the Cross fills and settles confirmed', async () => {
+test('the node\'s answer lost: the request passed to the chain and its answer withheld until the client\'s ten seconds run out; the stop reads stopped with handOff state "uncertain"; the Cross fills and settles confirmed', async () => {
   await laneFree();
   const before = counts();
   const kept = stack.proxy.passAndHold('eth_sendRawTransaction');
@@ -260,7 +260,7 @@ test('N-C1 (e): the node\'s answer lost: the request passed to the chain and its
   assert.deepEqual({ signed: counts().signed - before.signed, handOffs: counts().handOffs - before.handOffs }, { signed: 1, handOffs: 1 });
 });
 
-test('N-C1 (g): a stop sent again after its answer was lost: the first commits after the gate and its answer goes unread; the second is answered already stopped with the same handOff, once with the Cross pending and once with it unknown', async () => {
+test('a stop sent again after its answer was lost: the first commits after the gate and its answer goes unread; the second is answered already stopped with the same handOff, once with the Cross pending and once with it unknown', async () => {
   for (const how of ['pending', 'unknown'] as const) {
     await laneFree();
     let c: Awaited<ReturnType<typeof quoteAndBet>>;
@@ -292,7 +292,7 @@ test('N-C1 (g): a stop sent again after its answer was lost: the first commits a
   }
 });
 
-test('N-C3 (f): the gate\'s acknowledgement lost, with no restart: the commit of handing off reaches the database and its answer is dropped; nothing is handed over, the uncertain session goes with its locks, a stop of a listed quote succeeds, the Cross settles from the final block, and the next new bet fills', async () => {
+test('the gate\'s acknowledgement lost, with no restart: the commit of handing off reaches the database and its answer is dropped; nothing is handed over, the uncertain session goes with its locks, a stop of a listed quote succeeds, the Cross settles from the final block, and the next new bet fills', async () => {
   await laneFree();
   const before = counts();
   const cut = stack.dbRelay.dropCommitAfter("SET state = 'handing off'");
@@ -309,7 +309,7 @@ test('N-C3 (f): the gate\'s acknowledgement lost, with no restart: the commit of
   assert.equal(row?.state, 'confirmed', JSON.stringify(row));
 });
 
-test('N-C4 (j), on the stack: a nonce of the key used at a final block by a transaction the records do not hold. The next bet signs nothing: cross-unreconciled opens with the nonce, the lane is shut by its line, and the bet waits; the watermark stays where the records proved it', async () => {
+test('on the stack: a nonce of the key used at a final block by a transaction the records do not hold. The next bet signs nothing: cross-unreconciled opens with the nonce, the lane is shut by its line, and the bet waits; the watermark stays where the records proved it', async () => {
   await laneFree();
   const before = counts();
   const key = stack.rig.accounts.sender.address;
