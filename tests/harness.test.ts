@@ -112,22 +112,22 @@ test('on its clock the chain mines a block every two seconds with its pool open:
     const [a, b] = [await receipt(low), await receipt(high)];
     assert.equal(a.blockNumber, b.blockNumber, 'one block');
     assert.ok(Number(b.transactionIndex) < Number(a.transactionIndex), 'the higher tip first');
-    // The clock: the blocks after it come on the clock, not on a transaction. A block's time is the wall clock's
-    // second when it was mined, so one gap can read a second either side of two; three gaps in a row read two each
-    // on average.
-    const n = BigInt(a.blockNumber);
+    // The clock: the blocks after it come on the clock, not on a transaction, each seen as it appears by the wall
+    // clock. A block's own time is the chain's, which an anvil may advance by its own rule, so it is held only to rise.
+    // From the block after the head as it stands now, so each block is seen as it appears and none is found already made.
+    const n = BigInt((await clocked.rpc('eth_blockNumber', [])) as string);
     const next = async (number: bigint) => {
-      for (let i = 0; i < 100; i++) {
+      for (let i = 0; i < 200; i++) {
         const blk = (await clocked.rpc('eth_getBlockByNumber', [`0x${number.toString(16)}`, false])) as { timestamp: Hex } | null;
-        if (blk !== null) return BigInt(blk.timestamp);
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        if (blk !== null) return { time: BigInt(blk.timestamp), seen: Date.now() };
+        await new Promise((resolve) => setTimeout(resolve, 50));
       }
       throw new Error(`no block ${number} within ten seconds`);
     };
-    const ts = [await next(n), await next(n + 1n), await next(n + 2n), await next(n + 3n)];
-    for (let i = 1; i < ts.length; i++) assert.ok((ts[i] as bigint) > (ts[i - 1] as bigint), `block ${n + BigInt(i)} after the one before it: ${ts.join(', ')}`);
-    const span = (ts[3] as bigint) - (ts[0] as bigint);
-    assert.ok(span >= 5n && span <= 7n, `three gaps of about two seconds: ${ts.join(', ')}`);
+    const blocks = [await next(n + 1n), await next(n + 2n), await next(n + 3n), await next(n + 4n)];
+    for (let i = 1; i < blocks.length; i++) assert.ok((blocks[i] as { time: bigint }).time > (blocks[i - 1] as { time: bigint }).time, `block ${n + BigInt(i + 1)} after the one before it`);
+    const span = (blocks[3] as { seen: number }).seen - (blocks[0] as { seen: number }).seen;
+    assert.ok(span >= 4_500 && span <= 7_500, `three gaps of about two seconds by the wall clock: ${span} ms`);
   } finally {
     await clocked.close();
   }
