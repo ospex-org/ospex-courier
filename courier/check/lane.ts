@@ -12,6 +12,7 @@ import type { Run } from '../records/runs';
 import { failureCode, type Store } from '../records/store';
 import { onFinalChain, type Named } from '../send/chain';
 import { searchNonce } from '../send/outcome';
+import { repairMarks } from '../send/marks';
 import { reconcileRestored, unresolvedWaiting } from '../send/recovery';
 import { createSettler, type Settler } from '../send/settle';
 import { blocksToShow, chooseFees, proveNonce, walletCovers, type NonceProof } from '../send/checks';
@@ -149,7 +150,11 @@ export function createLane(deps: LaneDeps): Lane {
   let laneEpochs = new Map<string, bigint>();
   const epochOf = (laneKey: Address): bigint | null => (laneKey.toLowerCase() === key.toLowerCase() ? epoch : (laneEpochs.get(laneKey.toLowerCase()) ?? null));
 
-  const checkDeps: CheckDeps = { ...deps.check, courier: key, lane: store.lane, orders: store.orders, hooks };
+  /** The marks' repair at a read of F, on the pool, in a transaction of its own. */
+  const marksAt = async (F: Header): Promise<void> => {
+    await repairMarks({ pool: store.pool, chain: deps.check.chain, rpc: deps.check.rpc, set: deps.check.set }, F);
+  };
+  const checkDeps: CheckDeps = { ...deps.check, courier: key, lane: store.lane, orders: store.orders, hooks, repairMarks: marksAt };
 
   const settlerFor = (laneKey: Address): Settler =>
     createSettler({
@@ -164,6 +169,7 @@ export function createLane(deps: LaneDeps): Lane {
       stopSending: (why) => stopSending(why),
       log: deps.log,
       gap: LOOK_GAP,
+      repairMarks: marksAt,
     });
   const settler = settlerFor(key);
   const others = new Map<string, Settler>();

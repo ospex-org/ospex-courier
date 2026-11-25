@@ -49,6 +49,8 @@ export interface CheckDeps {
   lane: pg.Pool;
   orders: Orders;
   hooks: LaneHooks;
+  /** The marks made at a block not yet shown final, read again at F before the candidate query; the check waits for it. */
+  repairMarks?: (F: Header) => Promise<void>;
 }
 
 /** A header as a record names it. */
@@ -247,8 +249,10 @@ async function oneRound(deps: CheckDeps, bet: OrderRow, held: { epoch: bigint; r
   const judged = await judgeBet(deps, bet, A, H);
   if (judged !== null) return judged;
 
-  // 4. F, the final header: the candidate query's mark needs its time.
+  // 4. F, the final header: the candidate query's mark needs its time. The marks made at a block not yet final are
+  // read again at F first, so a quote marked at an orphaned block is listed again for this very bet.
   const F = await deps.chain.finalHeader();
+  if (deps.repairMarks !== undefined) await deps.repairMarks(F);
   // 5. The candidate query, one statement, alone, on the lane's connection.
   const betSide = order.positionType;
   const quoteSide = (1 - betSide) as Side;

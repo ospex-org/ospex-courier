@@ -36,6 +36,8 @@ export interface SettleDeps {
   log(line: string): void;
   /** The look's gap: the first and the last. */
   gap: { firstMs: number; lastMs: number };
+  /** The marks made at a block not yet shown final, read again at each look's F. */
+  repairMarks?: (F: Header) => Promise<void>;
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -319,6 +321,13 @@ export function createSettler(deps: SettleDeps): Settler {
       const ours = new Map((await crossesOfKey(store.lane, key)).filter((c) => c.nonce === cross.nonce && c.txHash !== null && c.betHash.toLowerCase() !== cross.betHash.toLowerCase()).map((c) => [(c.txHash as Hex).toLowerCase(), c.betHash]));
       const l = await look(outcomeDeps, cross, expected, lastF, ours);
       if (l.kind !== 'not comparable' && (lastF === null || l.F.number > lastF.number)) lastF = l.F;
+      if (l.kind !== 'not comparable' && l.kind !== 'contradiction' && deps.repairMarks !== undefined) {
+        try {
+          await deps.repairMarks(l.F);
+        } catch (err) {
+          if (!(err instanceof ChainUnreachable)) throw err;
+        }
+      }
       if (l.kind !== 'not comparable' && l.kind !== 'contradiction') {
         const again = await readExpiredAgain(l.F);
         if (again === 'stop') return 'stop';

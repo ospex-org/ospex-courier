@@ -7,6 +7,7 @@ import { createChainReader, type ChainReader } from './chain/snapshot';
 import { createLane } from './check/lane';
 import { NO_HOOKS, type LaneHooks } from './check/hooks';
 import { isSealedSend } from './check/precheck';
+import { repairMarks } from './send/marks';
 import { closeByRotation } from './send/operator';
 import { KeystoreRefused, openSigner, type Signer } from './send/signer';
 import { readCourierConfig, type CourierConfig } from './config';
@@ -187,6 +188,13 @@ export async function startService(env: Record<string, string | undefined>, opti
     if (retired.length > 0) log(`courier: ${retired.length} lane${retired.length === 1 ? '' : 's'} retired: the relay's sender at the final block is another key`);
   } catch (err) {
     log(`courier: the read for retired lanes failed (${err instanceof Error ? err.name : typeof err}); none retired now`);
+  }
+  // The marks made at a block not yet final, read again at the take's F.
+  try {
+    const r = await repairMarks({ pool: store.pool, chain, rpc, set }, await chain.finalHeader());
+    if (r.final + r.rewritten + r.lifted + r.stopped > 0) log(`courier: marks read again at the final block: ${r.final} final, ${r.rewritten} written again, ${r.lifted} lifted, ${r.stopped} stopped`);
+  } catch (err) {
+    log(`courier: the marks could not be read again at the start (${err instanceof Error ? err.name : typeof err}); the next read of the final block reads them`);
   }
 
   const counters = createCounters(now);
