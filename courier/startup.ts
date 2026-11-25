@@ -166,6 +166,7 @@ export async function startService(env: Record<string, string | undefined>, opti
     run,
     check: { chain, rpc, set, published, overrideTaken: node.overrideTaken.ok },
     hooks: options.hooks ?? NO_HOOKS,
+    signer,
     log,
   });
   laneHeld = () => lane.held();

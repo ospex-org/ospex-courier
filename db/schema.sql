@@ -524,6 +524,12 @@ CREATE INDEX IF NOT EXISTS events_bet_lines
   ON events (bet_hash, number)
   WHERE bet_hash IS NOT NULL;
 
+-- An ACTION line once for each bet and case: the durable guard of the once-only rule. A line that asks for a person's
+-- look carries its case in facts.action.case; a second line of the same bet and case is refused, whatever wrote it.
+CREATE UNIQUE INDEX IF NOT EXISTS events_one_action_per_bet_and_case
+  ON events (bet_hash, ((facts->'action'->>'case')))
+  WHERE facts ? 'action';
+
 -- Nothing changes or removes a line once written.
 CREATE OR REPLACE FUNCTION events_append_only() RETURNS trigger
 LANGUAGE plpgsql AS $$

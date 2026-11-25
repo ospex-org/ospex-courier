@@ -163,6 +163,36 @@ export const COIN_ABI = parseAbi([
 ]);
 
 /**
+ * The events of a Cross's receipt, each read at the module that emits it and never at the core's hub as well: the
+ * matching contract's leg filled (`OrderMatched`), leg skipped (`OrderSkipped`) and Cross done (`Crossed`); the
+ * positions contract's fill, its pulls and pay-backs (`HeldChanged`) and a pay-back the coin refused; the markets
+ * contract's first fill of a market. Enums are their uint8.
+ */
+export const CROSS_EVENTS_ABI = parseAbi([
+  'event OrderMatched(bytes32 indexed orderHash, address indexed maker, address indexed taker, uint256 gameId, uint256 marketId, address scorer, int32 lineTicks, uint8 makerPositionType, uint16 oddsTick, uint256 makerRisk, uint256 takerRisk, uint256 orderRiskAmount, uint256 nonce, uint256 expiry, uint256 orderMinFill)',
+  'event OrderSkipped(bytes32 indexed orderHash, address indexed account, bytes32 indexed takingOrderHash, uint8 reason)',
+  'event Crossed(address indexed courier, bytes32 indexed takingOrderHash, address indexed taker, uint256 marketId, uint256 totalMakerRisk, uint256 totalTakerRisk)',
+  'event PositionFilled(uint256 indexed marketId, address indexed maker, address indexed taker, uint8 makerSide, uint8 takerSide, uint256 makerRisk, uint256 takerRisk)',
+  'event HeldChanged(uint256 indexed marketId, address indexed account, uint256 pulled, uint256 paidBack, uint256 held)',
+  'event PayBackRefused(uint256 indexed marketId, address indexed account, uint256 amount, uint256 held)',
+  'event MarketCreated(uint256 indexed marketId, uint256 indexed gameId, address scorer, int32 lineTicks, address maker, address taker)',
+]);
+
+/**
+ * The coin's own refusals, as a trace's frame of the coin's call shows them: the ERC-20 errors a balance or an
+ * allowance too low gives, and the two rules of the rig's refusing coin. The deployed coin's string reasons are
+ * read as `Error(string)`.
+ */
+export const COIN_REFUSALS_ABI = parseAbi([
+  'error ERC20InsufficientBalance(address sender, uint256 balance, uint256 needed)',
+  'error ERC20InsufficientAllowance(address spender, uint256 allowance, uint256 needed)',
+  'error Paused()',
+  'error Blocked(address account)',
+  'function transferFrom(address from, address to, uint256 value) returns (bool)',
+  'function transfer(address to, uint256 value) returns (bool)',
+]);
+
+/**
  * The chain's multicall contract, present on Polygon at this address. The
  * courier asks it, in the same call as each read of state, for the block's
  * number, its time and its parent's hash, and compares them with the header

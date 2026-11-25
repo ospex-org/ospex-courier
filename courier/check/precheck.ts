@@ -2,7 +2,7 @@ import type pg from 'pg';
 import { encodeFunctionData, getAddress, type Address, type Hex } from 'viem';
 import { COIN_ABI, MATCHING_ABI, POSITIONS_ABI, RELAY_ABI, MULTICALL_ADDRESS, RELAY_SENDER_SLOT } from '../chain/abi';
 import { readForBet, readPositions, readQuotes, floorKey, grantKey, type BetRead, type PositionRead, type QuotesRead } from '../chain/reads';
-import { callAt, describeNodeFailure, estimateGasAt, ExecutionReverted, multicallAt, OutOfGas, transactionCountAt, byHash, type Header, type JsonRpc, type MulticallResult, type StateOverride } from '../chain/rpc';
+import { callAt, describeNodeFailure, estimateGasAt, ExecutionReverted, maxPriorityFee, multicallAt, NodeFailure, OutOfGas, transactionCountAt, byHash, type Header, type JsonRpc, type MulticallResult, type StateOverride } from '../chain/rpc';
 import type { BettingSet } from '../chain/set';
 import { ChainUnreachable, type ChainReader } from '../chain/snapshot';
 import { BOUNDS, CHAIN_LIMITS } from '../http/limits';
@@ -89,6 +89,12 @@ export interface ReadyCross {
   checked: Record<string, unknown>;
   /** The snapshot the signer signs from, sealed here: the only thing it signs from. */
   sealed: SealedCross;
+  /**
+   * What the send's own checks read in the check, each under its rule for a read: the final block F, read before
+   * the candidate statement; the key's count at F, by F's hash; the tip the node suggests; H's base fee; and the
+   * key's POL at H.
+   */
+  send: { final: Header; countAtFinal: bigint; tip: bigint; baseFee: bigint; keyPol: bigint };
 }
 
 /** One order of a sealed Cross: its ten fields, its signature and the hash it is kept under, as the pre-check verified them. */
@@ -634,6 +640,13 @@ async function finishReady(
   }
   // The key's count at H, as the node check asks for it.
   const nonce = await deps.chain.ask(H, () => transactionCountAt(deps.rpc, deps.courier, byHash(H.hash)));
+  // The sender's three reads: the key's count at F, by F's hash; the tip the node suggests, with H's base fee, which a
+  // block the node serves must carry here. Each under the rule for a read: tried twice, then the round is thrown away.
+  const countAtFinal = await deps.chain.ask(F, () => transactionCountAt(deps.rpc, deps.courier, byHash(F.hash)));
+  const fees = await deps.chain.ask(H, async () => {
+    if (H.baseFee === undefined) throw new NodeFailure('malformed', 'eth_getBlockByNumber', null, "the check's block carries no base fee");
+    return { tip: await maxPriorityFee(deps.rpc), baseFee: H.baseFee };
+  });
   // H again, by number: a changed hash starts the check again.
   const again = await deps.chain.headerAt(H.number);
   if (again === null || again.hash.toLowerCase() !== H.hash.toLowerCase()) throw new RoundAgain({ kind: 'reorg', code: null, method: 'eth_getBlockByNumber' });
@@ -686,8 +699,13 @@ async function finishReady(
         paysBackRefused,
         leftOutAfterCoinRefusal: [...skipped],
         unfilled: unfilled.toString(),
+        countAtFinal: countAtFinal.toString(),
+        betFilled: A.filled.toString(),
+        tip: fees.tip.toString(),
+        baseFee: fees.baseFee.toString(),
       },
       sealed,
+      send: { final: F, countAtFinal, tip: fees.tip, baseFee: fees.baseFee, keyPol: A.keyPol },
     },
   };
 }

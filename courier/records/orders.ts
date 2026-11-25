@@ -382,6 +382,8 @@ export interface Orders {
    * Returns what it marked.
    */
   markEnded(on: Writer, marks: ReadonlyArray<MarkEnded>, block: BlockRead): Promise<MarkEnded[]>;
+  /** The same marks, made at a final block: final at once, since no reorg can take that block back. */
+  markEndedAtFinal(on: Writer, marks: ReadonlyArray<MarkEnded>, block: BlockRead): Promise<MarkEnded[]>;
   /** The book's scan with the mark, one statement. */
   scan(on: Writer, args: ScanArgs): Promise<ScanResult>;
   /**
@@ -444,7 +446,7 @@ export function marketsOfGameParams(gameId: bigint, after: MarketCursor | null, 
 export const MARK_ENDED_SQL = `WITH held AS (
   SELECT o.hash FROM orders o WHERE o.hash = ANY($1::text[]) ORDER BY o.hash FOR NO KEY UPDATE
 )
-UPDATE orders AS o SET ended = m.how, ended_at = now(), ended_block = $3::numeric, ended_block_hash = $4
+UPDATE orders AS o SET ended = m.how, ended_at = now(), ended_block = $3::numeric, ended_block_hash = $4, ended_final = $5::boolean
 FROM unnest($1::text[], $2::text[]) AS m(hash, how)
 WHERE o.hash = m.hash AND o.hash IN (SELECT h.hash FROM held h) AND o.ended IS NULL RETURNING o.hash, o.ended`;
 
@@ -506,7 +508,13 @@ export function createOrders(pool: pg.Pool): Orders {
     },
     async markEnded(on, marks, block) {
       if (marks.length === 0) return [];
-      const { rows } = await on.query<{ hash: Hex; ended: EndSeen }>(MARK_ENDED_SQL, [marks.map((m) => m.hash.toLowerCase()), marks.map((m) => m.how), block.number.toString(), block.hash.toLowerCase()]);
+      const { rows } = await on.query<{ hash: Hex; ended: EndSeen }>(MARK_ENDED_SQL, [marks.map((m) => m.hash.toLowerCase()), marks.map((m) => m.how), block.number.toString(), block.hash.toLowerCase(), false]);
+      return rows.map((r) => ({ hash: r.hash, how: r.ended }));
+    },
+
+    async markEndedAtFinal(on, marks, block) {
+      if (marks.length === 0) return [];
+      const { rows } = await on.query<{ hash: Hex; ended: EndSeen }>(MARK_ENDED_SQL, [marks.map((m) => m.hash.toLowerCase()), marks.map((m) => m.how), block.number.toString(), block.hash.toLowerCase(), true]);
       return rows.map((r) => ({ hash: r.hash, how: r.ended }));
     },
     async scan(on, args) {
