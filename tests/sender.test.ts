@@ -138,6 +138,12 @@ test('the control: a bet the book can fill is signed once, handed to the node on
   assert.equal(stack.proxy.count('eth_sendRawTransaction') - sendsBefore, 2);
   const record = await get(url(), `/v1/orders/${second.betHash}`);
   assert.equal(record.status, 200);
+  assert.equal(record.body.state, 'confirmed', JSON.stringify(record.body));
+  const cross = record.body.cross as { message: string; txHash: string; betFilled: string; final: { number: string }; reconciled: boolean };
+  assert.equal(cross.txHash, row2?.tx_hash);
+  assert.ok(cross.message.startsWith(`Transaction ${cross.txHash} is in final block `), cross.message);
+  assert.ok(cross.message.includes(`as of final block ${cross.final.number}.`), cross.message);
+  assert.equal(cross.reconciled, true);
 });
 
 test('a listed quote stopped at the last moment, after the signed record and before the gate: one signature, no hand-off, the key\'s nonce unchanged on the chain, the Cross not sent STOPPED_AT_GATE with no hand-off, and no USDC moved; the control, the same hold and no stop, is handed off once and fills', async () => {
