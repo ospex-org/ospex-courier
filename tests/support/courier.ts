@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import type { Hex } from 'viem';
+import { isAddress, type Hex } from 'viem';
 import type { HoldPoint } from '../../courier/check/hooks';
+import { testKeystoreFor } from './keystore';
 
 // The courier under test, started as its own process through its real entry
 // (courier/server.ts), against the chain and the database the test names. The
@@ -27,6 +28,24 @@ export interface CourierEnv {
   PORT?: string;
   COURIER_LOW_POL?: string;
   PUBLISHED_REPORTERS_FILE?: string;
+  /**
+   * The key's two settings. Left out, the child is given the run's test keystore for COURIER_ADDRESS, where that is
+   * one of the local chain's test accounts (tests/support/keystore.ts); given, even empty, they are used as given.
+   */
+  COURIER_KEYSTORE_JSON?: string;
+  COURIER_KEYSTORE_PASSWORD?: string;
+}
+
+/** The key's two settings for the child alone: the run's test keystore for the courier's address, unless the test gave its own. */
+function keystoreSettings(env: CourierEnv): Record<string, string> {
+  if ('COURIER_KEYSTORE_JSON' in env || 'COURIER_KEYSTORE_PASSWORD' in env) return {};
+  let store: ReturnType<typeof testKeystoreFor> = null;
+  try {
+    store = isAddress(env.COURIER_ADDRESS) ? testKeystoreFor(env.COURIER_ADDRESS) : null;
+  } catch {
+    store = null;
+  }
+  return store === null ? {} : { COURIER_KEYSTORE_JSON: store.json, COURIER_KEYSTORE_PASSWORD: store.password };
 }
 
 /** Starts the courier; resolves when it listens, or rejects with its refusal line when it does not start. */
@@ -50,10 +69,23 @@ export interface HookControl {
   reached(point?: HoldPoint): Promise<Held>;
   /** Lets the check held there go on. */
   go(held: Held): Promise<void>;
-  /** Plants the test faults: a skew of one quote's predicted pull, quotes taken as live, a lower ceiling on one transaction's gas. */
-  fault(f: { skewPull?: Record<string, bigint>; listAsLive?: string[]; transactionGasCap?: bigint | null }): Promise<void>;
+  /**
+   * Plants the test faults: a skew of one quote's predicted pull, quotes taken as live, a lower ceiling on one
+   * transaction's gas; an order of the ready Cross changed before it is sealed; and the signer's seams.
+   */
+  fault(f: {
+    skewPull?: Record<string, bigint>;
+    listAsLive?: string[];
+    transactionGasCap?: bigint | null;
+    unhashBeforeSeal?: boolean;
+    signer?: { substitute?: 'look-alike' | 'earlier' | null; tamper?: 'reorder' | 'swap' | 'gas' | null; envelope?: { to?: string; value?: bigint } | null };
+  }): Promise<void>;
   /** What the check observed at the boundary between the candidates and the listing, in order. */
   observed: Array<{ what: 'candidates' | 'walk input'; hashes: string[] }>;
+  /** Every transaction the signer signed in this process, refused, dropped and unmined ones included, in the order signed: its bytes, held in this memory only. */
+  signed: Hex[];
+  /** Each try the signer's seam made at changing a sealed send in place, and what came of it. */
+  tampered: Array<{ how: string; result: string }>;
 }
 
 /**
@@ -69,7 +101,8 @@ export async function startHookedCourier(env: CourierEnv, holds = ''): Promise<C
 async function launch(entry: string, env: CourierEnv & { COURIER_TEST_HOLDS?: string }, ipc: boolean): Promise<CourierProcess> {
   const child = spawn(process.execPath, ['--import', 'tsx', entry], {
     cwd: ROOT,
-    env: { PATH: process.env.PATH, SYSTEMROOT: process.env.SYSTEMROOT, PORT: '0', ...env },
+    // The key's two settings are set here, for this child alone: never from this machine's environment.
+    env: { PATH: process.env.PATH, SYSTEMROOT: process.env.SYSTEMROOT, PORT: '0', ...keystoreSettings(env), ...env },
     stdio: ipc ? ['ignore', 'pipe', 'pipe', 'ipc'] : ['ignore', 'pipe', 'pipe'],
   });
   const lines: string[] = [];
@@ -131,6 +164,8 @@ function control(child: ChildProcess, lines: () => readonly string[]): HookContr
   const helds: Held[] = [];
   const waiters: Array<{ point: HoldPoint | undefined; resolve: (h: Held) => void; reject: (err: Error) => void }> = [];
   const observed: HookControl['observed'] = [];
+  const signed: Hex[] = [];
+  const tampered: HookControl['tampered'] = [];
   // A courier that exits while the test waits on it fails the wait at once, saying how it exited and its last lines:
   // a hold it can no longer reach, or an acknowledgement it can no longer send, is never waited for.
   let gone: Error | null = null;
@@ -142,8 +177,12 @@ function control(child: ChildProcess, lines: () => readonly string[]): HookContr
     acks.clear();
   });
   child.on('message', (raw: unknown) => {
-    const m = raw as { type: string; id?: number; held?: number; point?: HoldPoint; bet?: Hex | null; what?: 'candidates' | 'walk input'; hashes?: string[] };
-    if (m.type === 'ack' && m.id !== undefined) {
+    const m = raw as { type: string; id?: number; held?: number; point?: HoldPoint; bet?: Hex | null; what?: 'candidates' | 'walk input'; hashes?: string[]; raw?: Hex; how?: string; result?: string };
+    if (m.type === 'signed' && m.raw !== undefined) {
+      signed.push(m.raw);
+    } else if (m.type === 'tampered') {
+      tampered.push({ how: m.how ?? '', result: m.result ?? '' });
+    } else if (m.type === 'ack' && m.id !== undefined) {
       acks.get(m.id)?.resolve();
       acks.delete(m.id);
     } else if (m.type === 'held') {
@@ -183,8 +222,22 @@ function control(child: ChildProcess, lines: () => readonly string[]): HookContr
         ...(f.skewPull === undefined ? {} : { skewPull: Object.fromEntries(Object.entries(f.skewPull).map(([k, v]) => [k, v.toString()])) }),
         ...(f.listAsLive === undefined ? {} : { listAsLive: f.listAsLive }),
         ...(f.transactionGasCap === undefined ? {} : { transactionGasCap: f.transactionGasCap === null ? null : f.transactionGasCap.toString() }),
+        ...(f.unhashBeforeSeal === undefined ? {} : { unhashBeforeSeal: f.unhashBeforeSeal }),
+        ...(f.signer === undefined
+          ? {}
+          : {
+              signer: {
+                ...(f.signer.substitute === undefined ? {} : { substitute: f.signer.substitute }),
+                ...(f.signer.tamper === undefined ? {} : { tamper: f.signer.tamper }),
+                ...(f.signer.envelope === undefined
+                  ? {}
+                  : { envelope: f.signer.envelope === null ? null : { ...(f.signer.envelope.to === undefined ? {} : { to: f.signer.envelope.to }), ...(f.signer.envelope.value === undefined ? {} : { value: f.signer.envelope.value.toString() }) } }),
+              },
+            }),
       }),
     observed,
+    signed,
+    tampered,
   };
 }
 

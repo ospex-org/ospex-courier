@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { testServer } from './database';
 import { startCourier, startHookedCourier, type CourierProcess, type HookControl } from './courier';
+import { testKeystoreFor } from './keystore';
 export type { CourierProcess };
 import { startProxy, type ChainProxy } from './proxy';
 import { startRig, type Rig } from './rig';
@@ -35,7 +36,7 @@ export interface Stack {
    * service starts.
    */
   restartCourier(options?: { hooked?: boolean; holds?: string }): Promise<CourierProcess & { hooks?: HookControl }>;
-  env: { DATABASE_URL: string; POLYGON_RPC_URL: string; SIGNPOST_ADDRESS: string; BETTING_ENTRY_ID: string; PUBLISHED_REPORTERS_FILE: string; COURIER_ADDRESS: string };
+  env: { DATABASE_URL: string; POLYGON_RPC_URL: string; SIGNPOST_ADDRESS: string; BETTING_ENTRY_ID: string; PUBLISHED_REPORTERS_FILE: string; COURIER_ADDRESS: string; COURIER_KEYSTORE_JSON: string; COURIER_KEYSTORE_PASSWORD: string };
   /** A published list naming the rig's reporter: what the courier under test is given. */
   publishedListFile: string;
   close(): Promise<void>;
@@ -65,14 +66,19 @@ export async function startStack(prefix: string, options: { hooked?: boolean; ho
   relayed.hostname = '127.0.0.1';
   relayed.port = String(dbRelay.port);
   const publishedListFile = publishedList([rig.addresses.reporter]);
+  // The key: the relay's sender on the rig, account 4 of the local chain's published test accounts, in the run's test
+  // keystore, made in memory and handed to the courier's own process alone.
+  const keystore = testKeystoreFor(rig.accounts.sender.address);
+  if (keystore === null) throw new Error("the relay's sender on the rig is not one of the local chain's test accounts");
   const env = {
     DATABASE_URL: relayed.toString(),
     POLYGON_RPC_URL: proxy.url,
     SIGNPOST_ADDRESS: rig.addresses.signpost,
     BETTING_ENTRY_ID: rig.bettingEntryId.toString(),
     PUBLISHED_REPORTERS_FILE: publishedListFile,
-    // The key's address: the relay's sender on the rig, account 4, which this build holds no key for.
     COURIER_ADDRESS: rig.accounts.sender.address,
+    COURIER_KEYSTORE_JSON: keystore.json,
+    COURIER_KEYSTORE_PASSWORD: keystore.password,
   };
   let courier: CourierProcess & { hooks?: HookControl };
   try {

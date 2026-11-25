@@ -54,6 +54,8 @@ export interface Lane {
   wake(): void;
   /** Whether the runner is running now. */
   running(): boolean;
+  /** The lane's epoch and the reservation this process holds now, from its own memory: null where it holds none. What the signer holds a sealed send to. */
+  held(): { epoch: bigint; reservation: bigint } | null;
 }
 
 /**
@@ -101,6 +103,8 @@ export function createLane(deps: LaneDeps): Lane {
   let stopped = false;
   let flag = false;
   let running = false;
+  /** The reservation the runner is working on now, from its reservation to its outcome. */
+  let current: Reserved | null = null;
 
   const checkDeps: CheckDeps = { ...deps.check, courier: key, lane: store.lane, orders: store.orders, hooks };
 
@@ -149,9 +153,10 @@ export function createLane(deps: LaneDeps): Lane {
   }
 
   /** The check, its own faults recorded as COURIER_FAULT; the database's failures thrown on, to stop the process. */
-  async function checked(bet: OrderRow): Promise<CheckOutcome> {
+  async function checked(res: Reserved): Promise<CheckOutcome> {
+    const bet = res.bet;
     try {
-      return await checkBet(checkDeps, bet);
+      return await checkBet(checkDeps, bet, { epoch: epoch as bigint, reservation: res.reservation });
     } catch (err) {
       if (isDatabaseFailure(err)) throw err;
       deps.log(`lane: the check of a bet failed inside the courier (${err instanceof Error ? err.name : typeof err})`);
@@ -228,10 +233,13 @@ export function createLane(deps: LaneDeps): Lane {
           if (!flag) break;
           continue;
         }
+        current = r;
         await hooks.at('after-reservation', r.bet.hash);
-        const outcome = await checked(r.bet);
+        const outcome = await checked(r);
         await hooks.at('before-result', r.bet.hash);
-        if ((await writeOutcome(r, outcome)) === 'lost') {
+        const written = await writeOutcome(r, outcome);
+        current = null;
+        if (written === 'lost') {
           deps.log('lane: the outcome of a bet was not written: this process no longer holds its lane or its reservation');
           break;
         }
@@ -239,6 +247,7 @@ export function createLane(deps: LaneDeps): Lane {
     } catch (err) {
       failStop(err, 'a lane step');
     } finally {
+      current = null;
       running = false;
     }
   }
@@ -248,6 +257,7 @@ export function createLane(deps: LaneDeps): Lane {
     epoch: () => epoch,
     takingBets: () => epoch !== null && !stopped,
     running: () => running,
+    held: () => (epoch === null || current === null ? null : { epoch, reservation: current.reservation }),
     async take(runFacts) {
       const { client, done } = await laneClient(store.lane);
       try {

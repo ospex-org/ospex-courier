@@ -87,6 +87,79 @@ export interface ReadyCross {
   gas: { estimate: bigint; limit: bigint };
   nonce: bigint;
   checked: Record<string, unknown>;
+  /** The snapshot the signer signs from, sealed here: the only thing it signs from. */
+  sealed: SealedCross;
+}
+
+/** One order of a sealed Cross: its ten fields, its signature and the hash it is kept under, as the pre-check verified them. */
+export interface SealedOrder {
+  readonly order: Readonly<OrderFields>;
+  readonly signature: Hex;
+  readonly hash: Hex;
+}
+
+/**
+ * The pre-check's sealed snapshot of a ready Cross: the taking order and every quote, each with its signature, in the
+ * listed order; the calldata the pre-check simulated and proved at H; H; the gas; and the lane's epoch and the
+ * reservation it was made under. A frozen copy made here, in this process, and marked in a set this module keeps to
+ * itself: no other module can make one, and none can change one.
+ */
+export interface SealedCross {
+  readonly taking: SealedOrder;
+  readonly resting: readonly SealedOrder[];
+  readonly calldata: Hex;
+  readonly block: { readonly number: bigint; readonly hash: Hex; readonly time: bigint };
+  readonly gas: { readonly estimate: bigint; readonly limit: bigint };
+  readonly epoch: bigint;
+  readonly reservation: bigint;
+}
+
+/** A sealed Cross with what the send step chose for it: the nonce and the two fees. Sealed here too, and only from a sealed Cross. */
+export interface SealedSend extends SealedCross {
+  readonly nonce: bigint;
+  readonly maxFeePerGas: bigint;
+  readonly maxPriorityFeePerGas: bigint;
+}
+
+/** The marks: the sealed Crosses and the sealed sends this module made. Kept here, and exported to no one. */
+const SEALED_CROSSES = new WeakSet<object>();
+const SEALED_SENDS = new WeakSet<object>();
+
+function deepFrozen<T>(value: T): T {
+  if (typeof value === 'object' && value !== null && !Object.isFrozen(value)) {
+    for (const v of Object.values(value)) deepFrozen(v);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/** The seal: a copy of its own, every level frozen, and marked. Module-private. */
+function sealCross(draft: SealedCross): SealedCross {
+  const copy: SealedCross = {
+    taking: { order: { ...draft.taking.order }, signature: draft.taking.signature, hash: draft.taking.hash },
+    resting: draft.resting.map((o) => ({ order: { ...o.order }, signature: o.signature, hash: o.hash })),
+    calldata: draft.calldata,
+    block: { number: draft.block.number, hash: draft.block.hash, time: draft.block.time },
+    gas: { estimate: draft.gas.estimate, limit: draft.gas.limit },
+    epoch: draft.epoch,
+    reservation: draft.reservation,
+  };
+  deepFrozen(copy);
+  SEALED_CROSSES.add(copy);
+  return copy;
+}
+
+/** The send step's choice sealed onto a sealed Cross: refused for anything this module did not seal. */
+export function sealSend(cross: SealedCross, chosen: { nonce: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }): SealedSend {
+  if (!SEALED_CROSSES.has(cross)) throw new Error('only a Cross the pre-check sealed is sent');
+  const send: SealedSend = deepFrozen({ ...cross, nonce: chosen.nonce, maxFeePerGas: chosen.maxFeePerGas, maxPriorityFeePerGas: chosen.maxPriorityFeePerGas });
+  SEALED_SENDS.add(send);
+  return send;
+}
+
+/** Whether an object is a send this module sealed, in this process: the mark the signer requires. */
+export function isSealedSend(x: unknown): x is SealedSend {
+  return typeof x === 'object' && x !== null && SEALED_SENDS.has(x);
 }
 
 export type CheckOutcome =
@@ -108,12 +181,12 @@ const usdc = (deps: CheckDeps, units: bigint) => coinAmount(units, deps.set.coin
  * The check of one bet, in at most two rounds. The bet's row is the one the reservation took. `observe` is told of
  * every H a round reads, so the outcome of two failed rounds can name the last one, labelled as an observation.
  */
-export async function checkBet(deps: CheckDeps, bet: OrderRow): Promise<CheckOutcome> {
+export async function checkBet(deps: CheckDeps, bet: OrderRow, held: { epoch: bigint; reservation: bigint }): Promise<CheckOutcome> {
   let lastObserved: Header | null = null;
   let failure: { kind: string; code: number | string | null; method: string | null } | null = null;
   for (let round = 1; round <= 2; round++) {
     try {
-      return await oneRound(deps, bet, (h) => (lastObserved = h));
+      return await oneRound(deps, bet, held, (h) => (lastObserved = h));
     } catch (err) {
       if (err instanceof ChainUnreachable) {
         failure = err.failure;
@@ -147,7 +220,7 @@ const refusedAt = (H: Header, code: string, error: string, fields: Record<string
   incidents,
 });
 
-async function oneRound(deps: CheckDeps, bet: OrderRow, observe: (h: Header) => void): Promise<CheckOutcome> {
+async function oneRound(deps: CheckDeps, bet: OrderRow, held: { epoch: bigint; reservation: bigint }, observe: (h: Header) => void): Promise<CheckOutcome> {
   const order = bet.order;
   // 1. H, with its gas limit.
   const H = await deps.chain.latestHeader();
@@ -251,7 +324,7 @@ async function oneRound(deps: CheckDeps, bet: OrderRow, observe: (h: Header) => 
   }
 
   const walkBet: WalkBet = { account: order.account, side: betSide, oddsTick: order.oddsTick, riskAmount: order.riskAmount, minFill: order.minFill, filled: A.filled };
-  const ctx: RoundContext = { deps, bet, A, H, F, T, n, cand, walkInput, modelState, walkBet, incidents, readB, positions, marketOpen };
+  const ctx: RoundContext = { deps, bet, held, A, H, F, T, n, cand, walkInput, modelState, walkBet, incidents, readB, positions, marketOpen };
 
   // 8. The walk.
   const first = walk(walkBet, walkInput, new PullModel(modelState, order.account, betSide), T, BOUNDS.quotesListed);
@@ -274,6 +347,8 @@ async function oneRound(deps: CheckDeps, bet: OrderRow, observe: (h: Header) => 
 interface RoundContext {
   deps: CheckDeps;
   bet: OrderRow;
+  /** The lane's epoch and the reservation this check runs under: sealed with the Cross. */
+  held: { epoch: bigint; reservation: bigint };
   A: BetRead;
   H: Header;
   F: Header;
@@ -565,6 +640,19 @@ async function finishReady(
 
   const takerRisk = legs.reduce((s, l) => s + l.takerRisk, 0n);
   const unfilled = bet.order.riskAmount - A.filled - takerRisk;
+  // The snapshot the signer signs from: the verified orders and signatures in the listed order, the calldata proved
+  // at H, H, the gas and the lane's hold, sealed. A test's fault changes one order before the seal, so that it no
+  // longer hashes to the hash it carries.
+  const draft: SealedCross = {
+    taking: { order: bet.order, signature: bet.signature, hash: bet.hash },
+    resting: legs.map((l) => ({ order: l.candidate.order, signature: l.candidate.signature, hash: l.candidate.hash })),
+    calldata: data,
+    block: { number: H.number, hash: H.hash, time: H.timestamp },
+    gas: { estimate: g, limit },
+    epoch: ctx.held.epoch,
+    reservation: ctx.held.reservation,
+  };
+  const sealed = sealCross(deps.hooks.unhashBeforeSeal?.() === true ? { ...draft, taking: { ...draft.taking, order: { ...draft.taking.order, riskAmount: draft.taking.order.riskAmount + ORDER_RULES.lot } } } : draft);
   const pullsOut: Record<string, string> = {};
   for (const [a, v] of predicted.pulled) pullsOut[getAddress(a)] = v.toString();
   const paysBackOut: Record<string, string> = {};
@@ -599,6 +687,7 @@ async function finishReady(
         leftOutAfterCoinRefusal: [...skipped],
         unfilled: unfilled.toString(),
       },
+      sealed,
     },
   };
 }

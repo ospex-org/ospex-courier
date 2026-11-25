@@ -1,10 +1,13 @@
 import { createServer, type Server } from 'node:http';
+import type { Address } from 'viem';
 import { checkNode, type NodeCheck } from './chain/node';
 import { chainId, createJsonRpc, describeNodeFailure, type JsonRpc } from './chain/rpc';
 import { readSet, SetRefused, type BettingSet } from './chain/set';
 import { createChainReader, type ChainReader } from './chain/snapshot';
 import { createLane } from './check/lane';
 import { NO_HOOKS, type LaneHooks } from './check/hooks';
+import { isSealedSend } from './check/precheck';
+import { KeystoreRefused, openSigner, type Signer } from './send/signer';
 import { readCourierConfig, type CourierConfig } from './config';
 import { BOUNDS, createAddressLimiter, createCounters, TIMEOUTS } from './http/limits';
 import { createRequestHandler } from './http/service';
@@ -22,6 +25,32 @@ export class StartupRefused extends Error {
     super(message);
     this.name = 'StartupRefused';
   }
+}
+
+/**
+ * The key's two settings and the keystore opened: the signer, or a refusal that names the settings and no value. The
+ * two settings are removed from `env` once the keystore is open, so nothing later in the process can read them.
+ */
+function openKey(
+  env: Record<string, string | undefined>,
+  at: { address: Address; relay: Address; matching: Address; chainId: bigint; laneNow: () => { epoch: bigint; reservation: bigint } | null; hooks: LaneHooks | undefined },
+): Signer {
+  const json = (env.COURIER_KEYSTORE_JSON ?? '').trim();
+  const password = env.COURIER_KEYSTORE_PASSWORD ?? '';
+  const missing = [...(json === '' ? ['COURIER_KEYSTORE_JSON is not set'] : []), ...(password === '' ? ['COURIER_KEYSTORE_PASSWORD is not set'] : [])];
+  if (missing.length > 0) throw new StartupRefused(`settings: ${missing.join('; ')}`);
+  let signer: Signer;
+  try {
+    signer = openSigner({ keystoreJson: json, keystorePassword: password, address: at.address, relay: at.relay, matching: at.matching, chainId: at.chainId, isSealed: isSealedSend, laneNow: at.laneNow, ...(at.hooks?.signer === undefined ? {} : { seams: at.hooks.signer }) });
+  } catch (err) {
+    if (!(err instanceof KeystoreRefused)) throw new StartupRefused('the key: COURIER_KEYSTORE_JSON could not be opened');
+    if (err.problem === 'wrong-password') throw new StartupRefused("the key: COURIER_KEYSTORE_PASSWORD does not open COURIER_KEYSTORE_JSON (the keystore's MAC does not match)");
+    if (err.problem === 'not-the-address') throw new StartupRefused('the key: COURIER_KEYSTORE_JSON holds a key whose address is not COURIER_ADDRESS');
+    throw new StartupRefused(`the key: COURIER_KEYSTORE_JSON could not be read as a keystore (${err.message.replace(/^keystore: /, '')})`);
+  }
+  delete env.COURIER_KEYSTORE_JSON;
+  delete env.COURIER_KEYSTORE_PASSWORD;
+  return signer;
 }
 
 /** What this build does not yet do, published on the status address. */
@@ -109,6 +138,19 @@ export async function startService(env: Record<string, string | undefined>, opti
   const node = await checkNode(rpc, { relay: set.relay, sender: config.courierAddress, ...(config.traceCheckTransaction === undefined ? {} : { traceTransaction: config.traceCheckTransaction }) }, now);
   log(`courier: the node ${node.usable ? 'honours' : 'does not honour'} every request the pre-check makes at a block's hash; override ${node.overrideTaken.ok ? 'taken' : 'not taken'}`);
 
+  // The key: its two settings, read here and nowhere else, the keystore opened at once and the key turned into the
+  // signer's account, which is all that is kept. Once it is open the two settings leave this process's environment.
+  // A refusal names the settings and never a value.
+  let signer: Signer;
+  let laneHeld: () => { epoch: bigint; reservation: bigint } | null = () => null;
+  try {
+    signer = openKey(env, { address: config.courierAddress, relay: set.relay, matching: set.matching, chainId: set.chainId, laneNow: () => laneHeld(), hooks: options.hooks });
+  } catch (err) {
+    await store.close().catch(() => undefined);
+    throw err;
+  }
+  log(`courier: the key is open; it signs for ${signer.address} alone`);
+
   // This run.
   const run = await store.runs.start();
 
@@ -126,6 +168,7 @@ export async function startService(env: Record<string, string | undefined>, opti
     hooks: options.hooks ?? NO_HOOKS,
     log,
   });
+  laneHeld = () => lane.held();
   let taken;
   try {
     taken = await lane.take({ chainId: set.chainId.toString(), entry: set.entryId.toString(), nodeUsable: node.usable });

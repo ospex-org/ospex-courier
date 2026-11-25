@@ -11,11 +11,21 @@ import { StartupRefused, startService } from '../../courier/startup';
 // is armed before the service starts, so the runner can be held at its first
 // reach of it: the take's wake. The faults are planted over the channel too.
 
+/** What the signer's seams do, as a test plants it: hand on another object, change the envelope, or nothing. */
+interface SignerFault {
+  /** Hand the signer a plain copy of the sealed send, which carries no mark; or the sealed send of an earlier reservation, kept here. */
+  substitute?: 'look-alike' | 'earlier' | null;
+  /** Try to change the sealed send in place before the signer reads it: its listed quotes reordered, one swapped for another, its gas. */
+  tamper?: 'reorder' | 'swap' | 'gas' | null;
+  /** The envelope's target or value, changed inside the signing path with every other input valid. */
+  envelope?: { to?: string; value?: string } | null;
+}
+
 type Message =
   | { type: 'arm'; id: number; point: HoldPoint; times: number | 'all' }
   | { type: 'disarm'; id: number; point: HoldPoint }
   | { type: 'go'; id: number; held: number }
-  | { type: 'fault'; id: number; skewPull?: Record<string, string>; listAsLive?: string[]; transactionGasCap?: string | null };
+  | { type: 'fault'; id: number; skewPull?: Record<string, string>; listAsLive?: string[]; transactionGasCap?: string | null; unhashBeforeSeal?: boolean; signer?: SignerFault };
 
 const send = (m: Record<string, unknown>) => process.send?.(m);
 
@@ -30,6 +40,10 @@ let heldCount = 0;
 const skew = new Map<string, bigint>();
 const live = new Set<string>();
 let gasCap: bigint | undefined;
+let unhash = false;
+let signerFault: SignerFault = {};
+/** The sealed sends the signer was handed, in order: the earlier one a substitution hands on. */
+const handed: unknown[] = [];
 
 process.on('message', (raw: unknown) => {
   const m = raw as Message;
@@ -48,9 +62,24 @@ process.on('message', (raw: unknown) => {
       for (const q of m.listAsLive) live.add(q.toLowerCase());
     }
     if (m.transactionGasCap !== undefined) gasCap = m.transactionGasCap === null ? undefined : BigInt(m.transactionGasCap);
+    if (m.unhashBeforeSeal !== undefined) unhash = m.unhashBeforeSeal;
+    if (m.signer !== undefined) signerFault = m.signer;
   }
   send({ type: 'ack', id: m.id });
 });
+
+/** A try at changing the sealed send in place: each change is made as a caller would, and a frozen object refuses it. */
+function tamperWith(checked: unknown, how: NonNullable<SignerFault['tamper']>): string {
+  const c = checked as { resting: unknown[]; gas: { limit: bigint }; taking: unknown; calldata: string };
+  try {
+    if (how === 'reorder') c.resting.reverse();
+    else if (how === 'swap') c.resting[0] = c.taking;
+    else c.gas.limit = c.gas.limit - 1n;
+    return 'changed';
+  } catch (err) {
+    return err instanceof TypeError ? 'refused: frozen' : 'refused';
+  }
+}
 
 const hooks: LaneHooks = {
   at(point: HoldPoint, bet: Hex | null): Promise<void> {
@@ -70,6 +99,26 @@ const hooks: LaneHooks = {
   },
   observe: (what, hashes) => {
     send({ type: 'observe', what, hashes });
+  },
+  unhashBeforeSeal: () => unhash,
+  signer: {
+    handed: (checked) => {
+      handed.push(checked);
+      const f = signerFault;
+      if (f.tamper !== undefined && f.tamper !== null) send({ type: 'tampered', how: f.tamper, result: tamperWith(checked, f.tamper) });
+      if (f.substitute === 'look-alike') return structuredClone(checked);
+      if (f.substitute === 'earlier') return handed.length >= 2 ? handed[handed.length - 2] : checked;
+      return checked;
+    },
+    envelope: (e) => {
+      const f = signerFault.envelope;
+      if (f === undefined || f === null) return e;
+      return { ...e, ...(f.to === undefined ? {} : { to: f.to as `0x${string}` }), ...(f.value === undefined ? {} : { value: BigInt(f.value) }) };
+    },
+    // Every signed attempt, at once: its bytes go to the test over the channel, never to the process's output.
+    signed: (raw) => {
+      send({ type: 'signed', raw });
+    },
   },
 };
 
