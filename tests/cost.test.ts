@@ -4,7 +4,7 @@ import { after, before, test } from 'node:test';
 import pg from 'pg';
 import { getAddress } from 'viem';
 import { BOUNDS } from '../courier/http/limits';
-import { CANDIDATES_SQL, candidatesParams, SCAN_SQL, scanParams, type ScanArgs } from '../courier/records/orders';
+import { SCAN_SQL, scanParams, type ScanArgs } from '../courier/records/orders';
 import { openPool } from '../courier/records/store';
 import { testServer } from './support/database';
 
@@ -17,7 +17,7 @@ import { testServer } from './support/database';
 // both sizes, within one page a level of the index, after vacuum only; before
 // vacuum they are reported, beside the dead versions planted, and held to
 // nothing. The bet's candidate statement is measured the same way, on two of
-// the books at the two sizes.
+// the books at the two sizes, in a file of its own (tests/cost-candidates.test.ts).
 
 const db = testServer();
 const SIZES = [50_000, 500_000] as const;
@@ -503,113 +503,4 @@ test('the growth: the bytes an order row and an event line take with their index
     client.release();
     await pool.end();
   }
-});
-
-// ──────────────────────────── the bet's candidate statement ────────────────────────────
-
-interface CandidateMeasured {
-  indexName: string | null;
-  /** Rows the book index's scan node returned. */
-  innerRows: number;
-  /** That node's shared buffer accesses: hit + read, index and table together. */
-  buffers: number;
-  /** Rows the statement marked expired. */
-  marked: number;
-  /** What the statement itself answered: rows scanned, the live rows of others it would hand the walk. */
-  scanned: number;
-  others: number;
-}
-
-/**
- * The bet's candidate statement, the courier's own text, under EXPLAIN (ANALYZE, BUFFERS): the book index's scan
- * node's rows and buffers, and the update's rows. It runs, and marks. Then the same statement plain, for its answer.
- */
-async function measureCandidates(client: pg.PoolClient, finalTime: bigint): Promise<CandidateMeasured> {
-  const params = candidatesParams({ marketKey: MARKET as `0x${string}`, side: 0, betTick: 200, bettor: getAddress(SENDER), blockTime: T, finalTime });
-  const { rows } = await client.query<{ 'QUERY PLAN': Array<{ Plan: PlanNode }> }>(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${CANDIDATES_SQL}`, params);
-  const root = rows[0]?.['QUERY PLAN'][0]?.Plan;
-  assert.ok(root, 'a plan');
-  const nodes = [...walk(root)];
-  const scan = nodes.find((n) => n['Relation Name'] === 'orders' && (n['Node Type'] === 'Index Scan' || n['Node Type'] === 'Seq Scan' || n['Node Type'] === 'Bitmap Heap Scan') && (n['Index Name'] === 'orders_book' || n['Node Type'] === 'Seq Scan'));
-  assert.ok(scan, `the scan of the book; nodes: ${nodes.map((n) => `${n['Node Type']}${n['Index Name'] ? ` ${n['Index Name']}` : ''}`).join(', ')}`);
-  const update = nodes.find((n) => n['Node Type'] === 'ModifyTable');
-  return {
-    indexName: (scan['Index Name'] as string | undefined) ?? null,
-    innerRows: Number(scan['Actual Rows']),
-    buffers: Number(scan['Shared Hit Blocks'] ?? 0) + Number(scan['Shared Read Blocks'] ?? 0),
-    marked: Number(update?.['Actual Rows'] ?? 0),
-    scanned: -1,
-    others: -1,
-  };
-}
-
-/** The statement plain: its own answer. */
-async function candidatesRun(client: pg.PoolClient, finalTime: bigint): Promise<{ scanned: number; marked: number; own: number; others: number; rows: number }> {
-  const params = candidatesParams({ marketKey: MARKET as `0x${string}`, side: 0, betTick: 200, bettor: getAddress(SENDER), blockTime: T, finalTime });
-  const { rows } = await client.query<{ scanned: number; marked: number; own: number; others: number; rows: unknown[] }>(CANDIDATES_SQL, params);
-  const r = rows[0];
-  assert.ok(r);
-  return { scanned: r.scanned, marked: r.marked, own: r.own, others: r.others, rows: r.rows.length };
-}
-
-test("the bet's candidate statement, measured on the two books at 50,000 and 500,000: on the book of orders ended by the mark, it reads the ten live quotes and no more, the same buffers at both sizes after vacuum; on the backlog not yet marked, it is returned the bound and no more, marks none with the final block behind and the bound with it past, the same buffers at both sizes for each", async () => {
-  const marked: Record<number, { before: CandidateMeasured; after: CandidateMeasured; level: number }> = {};
-  const backlog: Record<number, { heldBehind: CandidateMeasured; past: CandidateMeasured; level: number }> = {};
-  for (const n of SIZES) {
-    {
-      const { pool, client } = await freshBook(`cost_candidates_marked_${n}`);
-      try {
-        await lay(client, 10, 200, T + 3_600n, 1);
-        await lay(client, n, 150, EXPIRED_AT, 100);
-        await client.query('ANALYZE orders');
-        for (;;) if ((await run(client, args(0, F_PAST))).marked === 0) break;
-        await markedDead(client, n);
-        const before = await measureCandidates(client, F_PAST);
-        await vacuum(client);
-        const level = await treeLevel(client);
-        const after_ = await measureCandidates(client, F_PAST);
-        const answer = await candidatesRun(client, F_PAST);
-        for (const [state, m] of [['before', before], ['after', after_]] as Array<[string, CandidateMeasured]>) {
-          assert.deepEqual({ index: m.indexName, inner: m.innerRows, marked: m.marked }, { index: 'orders_book', inner: 10, marked: 0 }, `${n} ${state} vacuum`);
-        }
-        assert.deepEqual(answer, { scanned: 10, marked: 0, own: 0, others: 10, rows: 10 }, `${n}: the statement's own answer`);
-        assert.ok(before.buffers > after_.buffers, `${n}: the dead versions are seen before vacuum (${before.buffers}) and gone after (${after_.buffers})`);
-        marked[n] = { before, after: after_, level };
-      } finally {
-        client.release();
-        await pool.end();
-      }
-    }
-    {
-      const { pool, client } = await freshBook(`cost_candidates_backlog_${n}`);
-      try {
-        await lay(client, 4_000, 150, EXPIRED_AT, 1);
-        await lay(client, 1, 200, T + 3_600n, 5_000);
-        if (n > 4_000) await lay(client, n - 4_000, 150, EXPIRED_AT, 10_000);
-        await client.query('ANALYZE orders');
-        const heldBehind = await measureCandidates(client, F_BEHIND);
-        assert.deepEqual({ index: heldBehind.indexName, inner: heldBehind.innerRows, marked: heldBehind.marked }, { index: 'orders_book', inner: BOUNDS.scanRows, marked: 0 }, `${n}: held behind`);
-        const past = await measureCandidates(client, F_PAST);
-        assert.deepEqual({ index: past.indexName, inner: past.innerRows, marked: past.marked }, { index: 'orders_book', inner: BOUNDS.scanRows, marked: BOUNDS.scanRows }, `${n}: past`);
-        const level = await treeLevel(client);
-        backlog[n] = { heldBehind, past, level };
-      } finally {
-        client.release();
-        await pool.end();
-      }
-    }
-  }
-  const [s, l] = [SIZES[0], SIZES[1]];
-  const tolerance = (a: number, b: number) => Math.max(a, b) + 1;
-  const m0 = marked[s] as (typeof marked)[number];
-  const m1 = marked[l] as (typeof marked)[number];
-  assert.ok(Math.abs(m1.after.buffers - m0.after.buffers) <= tolerance(m0.level, m1.level), `ended by the mark, after vacuum: ${m1.after.buffers} at ${l}, ${m0.after.buffers} at ${s}`);
-  const b0 = backlog[s] as (typeof backlog)[number];
-  const b1 = backlog[l] as (typeof backlog)[number];
-  assert.ok(Math.abs(b1.heldBehind.buffers - b0.heldBehind.buffers) <= tolerance(b0.level, b1.level), `the backlog held behind: ${b1.heldBehind.buffers} at ${l}, ${b0.heldBehind.buffers} at ${s}`);
-  assert.ok(Math.abs(b1.past.buffers - b0.past.buffers) <= tolerance(b0.level, b1.level), `the backlog, the final block past: ${b1.past.buffers} at ${l}, ${b0.past.buffers} at ${s}`);
-  report.candidates = {
-    markedHistory: Object.fromEntries(Object.entries(marked).map(([n, f]) => [n, { beforeVacuum: f.before.buffers, afterVacuum: f.after.buffers, indexLevel: f.level }])),
-    backlog: Object.fromEntries(Object.entries(backlog).map(([n, f]) => [n, { heldBehind: f.heldBehind.buffers, finalPast: f.past.buffers, indexLevel: f.level }])),
-  };
 });
