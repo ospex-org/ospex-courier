@@ -160,8 +160,11 @@ async function startAnvil(genesisTime?: bigint): Promise<ChainProcess> {
 /**
  * Starts the rig. `genesisTime` starts the chain's clock at that second instead of the wall clock's: a chain a day
  * behind the wall clock is made so, since a running chain's time never goes back. `coin` chooses the set's coin.
+ * `blockTime` puts the chain on a clock once the set is deployed and the accounts funded: a block every that many
+ * seconds, with its pool open, so a transaction waits for the next block and a test can place one of its own, at a
+ * higher tip, before another in the same block. Without it every transaction is mined at once, in a block of its own.
  */
-export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin' | 'RefusingCoin' | 'FalseCoin' } = {}): Promise<Rig> {
+export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin' | 'RefusingCoin' | 'FalseCoin'; blockTime?: number } = {}): Promise<Rig> {
   const anvil = await startAnvil(options.genesisTime);
   const url = `http://127.0.0.1:${anvil.port}`;
   const transport = http(url, { retryCount: 0 });
@@ -304,6 +307,12 @@ export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin
   // Enough blocks behind the head for a read 50 back, a second apart, so the block 50 back has an earlier time than
   // the head: the node check's timed call needs two blocks of two times.
   await rpc('anvil_mine', ['0x3c', '0x1']);
+
+  // The clock, where one is asked for: from here a block every `blockTime` seconds, and no block for a transaction alone.
+  if (options.blockTime !== undefined) {
+    await rpc('evm_setAutomine', [false]);
+    await rpc('evm_setIntervalMining', [options.blockTime]);
+  }
 
   return {
     url,

@@ -1,13 +1,17 @@
 import { createServer, request as httpRequest, type Server } from 'node:http';
 import { once } from 'node:events';
+import { keccak256 } from 'viem';
 
 // A small proxy between the courier and the chain, which the tests control.
 // It counts requests and their bytes, by method, as they ARRIVE, so a request
 // the node rejects or one still being answered is in the count; it can refuse
-// one, answer one itself, hold one, or pass it on. It answers the `finalized`
-// tag itself, so the test decides which block is final. Everything the courier
-// asks of the chain goes through it, and nothing else does: the tests speak to
-// the chain on the rig's own address.
+// one, drop one with no answer, answer one itself, hold one, pass one on and
+// hold the chain's answer, keep a raw transaction from the chain while it
+// answers it taken, or pass it on. It answers the `finalized` tag itself, so
+// the test decides which block is final. Everything the courier asks of the
+// chain goes through it, and nothing else does: the tests speak to the chain on
+// the rig's own address. It outlives a courier's restart, so its counts are
+// across the lives of the process.
 
 export interface Counted {
   method: string;
@@ -15,7 +19,7 @@ export interface Counted {
   /** The answer's bytes once answered; 0 while the request is still being answered. */
   answerBytes: number;
   /** How the proxy dealt with it: `arrived` until it has been answered. */
-  how: 'arrived' | 'passed' | 'refused' | 'answered' | 'held';
+  how: 'arrived' | 'passed' | 'refused' | 'answered' | 'held' | 'dropped' | 'withheld';
 }
 
 /** The courier's sends, which this build must never make: counted at the proxy as they arrive. */
@@ -46,7 +50,19 @@ export type Rule =
    * passing as if no rule stood; `arrived` is told of the first one held. Released, a held request is answered
    * under the rule then in force.
    */
-  | { kind: 'hold'; released: Promise<void>; arrived: () => void; when?: (params: unknown[]) => boolean };
+  | { kind: 'hold'; released: Promise<void>; arrived: () => void; when?: (params: unknown[]) => boolean }
+  /** Answer nothing: the connection is closed with no answer, as a node that dropped the request. */
+  | { kind: 'drop' }
+  /**
+   * Pass the request on at once, and hold the chain's answer until released: the node has the request, and the
+   * courier does not hear what it said. Released with `drop`, the connection is closed with no answer.
+   */
+  | { kind: 'passHold'; passed: () => void; released: Promise<{ drop: boolean }> }
+  /**
+   * A raw transaction answered taken by the proxy itself, with its hash, and kept from the chain: the courier is told
+   * the node took it while the chain never sees it, until the test hands it on.
+   */
+  | { kind: 'withhold'; kept: (raw: string) => void };
 
 export interface ChainProxy {
   url: string;
@@ -70,6 +86,20 @@ export interface ChainProxy {
    * lets none go that is held already.
    */
   hold(method: string, when?: (params: unknown[]) => boolean): { arrived: Promise<void>; release(then?: Rule | null): void };
+  /** Every request of the method, from now until the rule is lifted, is dropped: its connection closed with no answer. */
+  drop(method: string): void;
+  /**
+   * The next request of the method is passed on to the chain at once and its answer held: `passed` resolves once the
+   * chain has the request; `release()` answers with what the chain said, `release({ drop: true })` closes the
+   * connection with no answer. The rule is lifted as the first such request arrives, so a later one passes as usual.
+   */
+  passAndHold(method: string): { passed: Promise<void>; release(how?: { drop?: boolean }): void };
+  /**
+   * Every raw transaction from now on is answered taken, with its own hash, by the proxy itself, and kept from the
+   * chain. `kept` holds them in the order they came; `forward` hands them to the chain, in that order, and returns
+   * the chain's answers; `stop` lifts the rule, so later ones pass as usual.
+   */
+  withhold(): { kept: string[]; arrived: Promise<void>; forward(): Promise<unknown[]>; stop(): void };
   close(): Promise<void>;
 }
 
@@ -98,9 +128,24 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
   /** How many requests of each method had arrived when its current rule was set: the nth under the rule counts from there. */
   const arrivedAtRule = new Map<string, number>();
 
-  async function answerOne(req: JsonRpcRequest, raw: string): Promise<{ text: string; how: Counted['how'] }> {
+  async function answerOne(req: JsonRpcRequest, raw: string): Promise<{ text: string | null; how: Counted['how'] }> {
     const params = req.params ?? [];
     const rule = rules.get(req.method);
+    if (rule?.kind === 'drop') return { text: null, how: 'dropped' };
+    if (rule?.kind === 'passHold') {
+      // One request only: the rule goes as this one arrives, so the next of the method passes as usual. `passed` once
+      // the chain has answered it: the chain has the request; its answer waits here.
+      rules.delete(req.method);
+      const text = await upstream(raw);
+      rule.passed();
+      const { drop } = await rule.released;
+      return drop ? { text: null, how: 'dropped' } : { text, how: 'held' };
+    }
+    if (rule?.kind === 'withhold') {
+      const rawTx = typeof params[0] === 'string' ? params[0] : '';
+      rule.kept(rawTx);
+      return { text: JSON.stringify({ jsonrpc: '2.0', id: req.id, result: keccak256(rawTx as `0x${string}`) }), how: 'withheld' };
+    }
     if (rule?.kind === 'refuse') {
       return { text: JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: rule.code, message: rule.message } }), how: 'refused' };
     }
@@ -132,7 +177,7 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       await rule.released;
       // Answered under the rule in force now: the one the release installed, or none.
       const again = await answerOne(req, raw);
-      return { text: again.text, how: 'held' };
+      return { text: again.text, how: again.text === null ? 'dropped' : 'held' };
     }
     // The finalized tag, answered here: the block the test named, read from the node by number.
     if (req.method === 'eth_getBlockByNumber' && params[0] === 'finalized' && finalNumber !== null) {
@@ -160,6 +205,14 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       counted.push(...arrived);
       Promise.all(list.map((r) => answerOne(r, JSON.stringify(r)))).then(
         (answers) => {
+          if (answers.some((a) => a.text === null)) {
+            // Dropped: the connection is closed with no answer at all.
+            arrived.forEach((entry, i) => {
+              entry.how = answers[i]?.how ?? 'dropped';
+            });
+            res.socket?.destroy();
+            return;
+          }
           const text = Array.isArray(parsed) ? `[${answers.map((a) => a.text).join(',')}]` : (answers[0]?.text ?? '');
           arrived.forEach((entry, i) => {
             entry.answerBytes = Buffer.byteLength(text);
@@ -217,6 +270,45 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
             arrivedAtRule.set(method, count(method));
           }
           release();
+        },
+      };
+    },
+    drop(method) {
+      rules.set(method, { kind: 'drop' });
+      arrivedAtRule.set(method, count(method));
+    },
+    passAndHold(method) {
+      let passedResolve = () => undefined as void;
+      let releaseResolve = (_: { drop: boolean }) => undefined as void;
+      const passed = new Promise<void>((resolve) => (passedResolve = resolve));
+      const released = new Promise<{ drop: boolean }>((resolve) => (releaseResolve = resolve));
+      rules.set(method, { kind: 'passHold', passed: () => passedResolve(), released });
+      return { passed, release: (how = {}) => releaseResolve({ drop: how.drop === true }) };
+    },
+    withhold() {
+      const kept: string[] = [];
+      let arrivedResolve = () => undefined as void;
+      const arrived = new Promise<void>((resolve) => (arrivedResolve = resolve));
+      rules.set('eth_sendRawTransaction', {
+        kind: 'withhold',
+        kept: (raw) => {
+          kept.push(raw);
+          arrivedResolve();
+        },
+      });
+      return {
+        kept,
+        arrived,
+        async forward() {
+          const answers: unknown[] = [];
+          for (const raw of kept) {
+            const text = await upstream(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_sendRawTransaction', params: [raw] }));
+            answers.push(JSON.parse(text) as unknown);
+          }
+          return answers;
+        },
+        stop() {
+          if (rules.get('eth_sendRawTransaction')?.kind === 'withhold') rules.delete('eth_sendRawTransaction');
         },
       };
     },
