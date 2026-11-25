@@ -143,7 +143,8 @@ export async function look(deps: OutcomeDeps, cross: CrossRow, expected: Expecte
       if (receipt.blockNumber > F.number) return { kind: 'pending', F, receipt };
       const [shown] = await onFinalChain(deps.chain, deps.rpc, F, [{ number: receipt.blockNumber, hash: receipt.blockHash }]);
       if (shown !== true) return { kind: 'orphan', F, receipt };
-      return ran(deps, F, cross, expected, receipt, count);
+      // Awaited here, so that a second read at F that fails twice is caught below as what it is: unavailable.
+      return await ran(deps, F, cross, expected, receipt, count);
     }
     if (count <= cross.nonce) {
       if (F.timestamp < expected.expiry) return { kind: 'nothing yet', F };

@@ -329,7 +329,18 @@ export function createSettler(deps: SettleDeps): Settler {
       if (FINAL_STATES.includes(cross.state)) return 'done';
       const { expected, legs } = await expectedOf(bet, cross);
       const ours = new Map((cross.nonce === null ? [] : await crossesAtNonce(store.lane, key, cross.nonce)).filter((c) => c.txHash !== null && c.betHash.toLowerCase() !== cross.betHash.toLowerCase()).map((c) => [(c.txHash as Hex).toLowerCase(), c.betHash]));
-      const l = await look(outcomeDeps, cross, expected, lastF, ours);
+      let l: Look;
+      try {
+        l = await look(outcomeDeps, cross, expected, lastF, ours);
+      } catch (err) {
+        // The final block itself could not be read: a transient, never a stop. No F is made up and none is kept; the
+        // Cross stays open and is looked at again at the gap.
+        if (!(err instanceof ChainUnreachable)) throw err;
+        deps.log(`lane: the final block could not be read (${err.failure.method ?? 'a read'} failed twice); the Cross stays open and is looked at again`);
+        await sleep(gap);
+        gap = Math.min(gap * 2, deps.gap.lastMs);
+        continue;
+      }
       if (l.kind !== 'not comparable' && (lastF === null || l.F.number > lastF.number)) lastF = l.F;
       if (l.kind !== 'not comparable' && l.kind !== 'contradiction' && deps.repairMarks !== undefined) {
         try {
@@ -396,6 +407,7 @@ export function createSettler(deps: SettleDeps): Settler {
         }
         case 'unavailable':
           if (l.facts.search === 'unanswered') await holdKey({ why: 'the node could not answer the search for what used the nonce', nonce: cross.nonce === null ? null : s(cross.nonce), found: 'the node could not answer', missing: l.missing, final: finalNamed(l.F), betHash: bet.hash });
+          deps.log(`lane: the Cross's outcome could not be read whole at final block ${s(l.F.number)} (${l.missing}); it is looked at again`);
           break;
         case 'contradiction':
           await store.events.write({ run: deps.run.id, kind: 'incident', orderHash: bet.hash, betHash: bet.hash, account: bet.order.account.toLowerCase(), gameId: bet.order.gameId, reason: 'CHAIN_CONTRADICTS_RECORDS', facts: { lane: key, betHash: bet.hash, ...l.facts } });

@@ -261,3 +261,94 @@ test("the pause's first carry: one cross reverted line for each failed Cross, in
   const counted = rows.flatMap((r) => (Array.isArray(r.pinned) ? (r.pinned as Array<{ account: string }>).map((p) => p.account.toLowerCase()) : []));
   assert.equal(counted.length, 1, 'one account counted: the bettor whose own act the trace shows');
 });
+
+// A read of the chain that fails twice is a transient: the Cross stays open, it is looked at again at the gap, and the
+// process goes on taking bets. Only a contradiction stops sending (the receipts file's own case). Each case below fails
+// one read twice, lifts the failure, and posts the next bet: a process that stopped answers it 503.
+const STOPPED_LINE = /takes no more bets until it restarts|sends nothing more until it restarts/;
+const stops = () => stack.courier.lines.filter((l) => STOPPED_LINE.test(l)).length;
+/** The final block a Cross was settled at, held to the chain's own block at that height. */
+async function finalOnChain(bet: string): Promise<boolean> {
+  const f = (await pool.query<{ n: string; h: string }>('SELECT final_block_number::text AS n, final_block_hash AS h FROM crosses WHERE bet_hash = $1', [bet.toLowerCase()])).rows[0];
+  if (f === undefined) return false;
+  const block = (await stack.rig.rpc('eth_getBlockByNumber', [`0x${BigInt(f.n).toString(16)}`, false])) as { hash: string } | null;
+  return block !== null && block.hash.toLowerCase() === f.h.toLowerCase();
+}
+
+test("the final block's read fails twice while a Cross is settled: the Cross stays open and is looked at again, the process goes on taking bets, and the Cross is confirmed at a final block of the chain once the node answers", async () => {
+  const before = stops();
+  await hooks().arm('after-hand-off', 1);
+  const c = await quoteAndBet();
+  const handed = await hooks().reached('after-hand-off');
+  let refused = 0;
+  stack.proxy.rule('eth_getBlockByNumber', { kind: 'refuseIf', refuse: (p) => p[0] === 'finalized' && (refused++, true), code: -32000, message: 'the node is busy' });
+  try {
+    await hooks().go(handed);
+    await until(async () => refused, (n) => n >= 2, 30_000, 'the final block refused twice');
+    await until(async () => stops() > before || stack.courier.lines.some((l) => /looked at again/.test(l)), (v) => v, 30_000, "the lane's answer to the failed read");
+  } finally {
+    stack.proxy.rule('eth_getBlockByNumber', null);
+  }
+  const next = await quoteAndBet();
+  assert.equal(stops(), before, 'the process did not stop');
+  const r = await final(c.bet);
+  assert.equal(r?.state, 'confirmed', JSON.stringify(r));
+  assert.ok(await finalOnChain(c.bet), "the outcome's final block is the chain's own block at its height");
+  assert.equal((await final(next.bet))?.state, 'confirmed');
+});
+
+test("the bet's filled amount at the final block, a ran Cross's second read, fails twice: the Cross stays open and is read again, the second reads are made, and the process goes on taking bets", async () => {
+  const before = stops();
+  await hooks().arm('after-hand-off', 1);
+  const c = await quoteAndBet();
+  const handed = await hooks().reached('after-hand-off');
+  const filledOfBet = encodeFunctionData({ abi: stack.rig.abis.OspexMatching as Abi, functionName: 's_filledRisk', args: [c.bet as Hex] }).slice(2).toLowerCase();
+  let refused = 0;
+  stack.proxy.rule('eth_call', { kind: 'refuseIf', refuse: (p) => JSON.stringify(p).toLowerCase().includes(filledOfBet) && (refused++, true), code: -32000, message: 'the node is busy' });
+  try {
+    await hooks().go(handed);
+    await until(async () => refused, (n) => n >= 2, 60_000, "the bet's filled amount refused twice");
+    await until(async () => stops() > before || stack.courier.lines.some((l) => /looked at again|failed twice/.test(l)), (v) => v, 30_000, "the lane's answer to the failed read");
+  } finally {
+    stack.proxy.rule('eth_call', null);
+  }
+  const next = await quoteAndBet();
+  assert.equal(stops(), before, 'the process did not stop');
+  const r = await final(c.bet);
+  assert.equal(r?.state, 'confirmed', JSON.stringify(r));
+  assert.equal(typeof (r?.recorded as { betFilled?: unknown } | null)?.betFilled, 'string', "the bet's filled amount at the final block is read and recorded");
+  assert.equal((await final(next.bet))?.state, 'confirmed');
+});
+
+test("the walk of the final block's parents after a quiet spell of 300 blocks: one parent the node does not return by its hash is read again, the bet is sent, and the process goes on taking bets", async () => {
+  const first = await quoteAndBet();
+  assert.equal((await final(first.bet))?.state, 'confirmed');
+  // A quiet spell longer than the chain's own hash of a height reaches back: the next bet's send checks walk to the watermark's anchor.
+  await stack.rig.rpc('anvil_mine', ['0x12c']);
+  const head = BigInt((await stack.rig.rpc('eth_blockNumber', [])) as string);
+  const before = stops();
+  let nulled = 0;
+  stack.proxy.rule('eth_getBlockByHash', {
+    kind: 'rewriteResult',
+    result: (_p, result) => {
+      const at = result === null ? null : BigInt((result as { number: Hex }).number);
+      if (nulled === 0 && at !== null && at + 260n < head) {
+        nulled++;
+        return null;
+      }
+      return result;
+    },
+  });
+  let bet = '';
+  try {
+    bet = (await quoteAndBet()).bet;
+    await until(async () => nulled, (n) => n === 1, 60_000, 'one parent not returned');
+    await until(async () => stops() > before || (await row(bet)) !== null, (v) => v, 60_000, "the lane's answer to the parent not returned");
+  } finally {
+    stack.proxy.rule('eth_getBlockByHash', null);
+  }
+  const next = await quoteAndBet();
+  assert.equal(stops(), before, 'the process did not stop');
+  assert.equal((await final(bet))?.state, 'confirmed');
+  assert.equal((await final(next.bet))?.state, 'confirmed');
+});
