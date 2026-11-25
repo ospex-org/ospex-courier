@@ -145,6 +145,9 @@ export function createLane(deps: LaneDeps): Lane {
   let running = false;
   /** The reservation the runner is working on now, from its reservation to its outcome. */
   let current: Reserved | null = null;
+  /** Every lane's epoch as this process's take set it: the owner's guard for a lane of another key, a retired one's. */
+  let laneEpochs = new Map<string, bigint>();
+  const epochOf = (laneKey: Address): bigint | null => (laneKey.toLowerCase() === key.toLowerCase() ? epoch : (laneEpochs.get(laneKey.toLowerCase()) ?? null));
 
   const checkDeps: CheckDeps = { ...deps.check, courier: key, lane: store.lane, orders: store.orders, hooks };
 
@@ -156,7 +159,7 @@ export function createLane(deps: LaneDeps): Lane {
       chain: deps.check.chain,
       rpc: deps.check.rpc,
       set: deps.check.set,
-      epoch: () => epoch,
+      epoch: () => epochOf(laneKey),
       sending: () => !stopped,
       stopSending: (why) => stopSending(why),
       log: deps.log,
@@ -198,7 +201,7 @@ export function createLane(deps: LaneDeps): Lane {
     return 'clear';
   }
 
-  const recoveryDeps = { store, chain: deps.check.chain, rpc: deps.check.rpc, set: deps.check.set, run, epoch: () => epoch, log: deps.log };
+  const recoveryDeps = { store, chain: deps.check.chain, rpc: deps.check.rpc, set: deps.check.set, run, epochOf, log: deps.log };
 
   /**
    * Under a restore's hold: every lane's nonce use reconciled and its retained intent closed where the chain allows;
@@ -867,6 +870,7 @@ export function createLane(deps: LaneDeps): Lane {
         }
         await client.query('COMMIT');
         epoch = taken.epoch;
+        laneEpochs = new Map(taken.lanes.map((l) => [l.sender.toLowerCase(), BigInt(l.epoch)]));
         return taken;
       } catch (err) {
         await client.query('ROLLBACK').catch(() => undefined);

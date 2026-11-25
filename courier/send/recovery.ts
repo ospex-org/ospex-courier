@@ -31,8 +31,8 @@ export interface RecoveryDeps {
   rpc: JsonRpc;
   set: BettingSet;
   run: { id: number };
-  /** This process's epoch now: a write under the hold still needs the lane's owner. */
-  epoch(): bigint | null;
+  /** Each lane's epoch as this process's take set it: a write under the hold still needs the lane's owner. */
+  epochOf(lane: Address): bigint | null;
   log(line: string): void;
 }
 
@@ -72,7 +72,7 @@ async function owned(deps: RecoveryDeps, key: Address, work: (client: pg.PoolCli
   try {
     await client.query('BEGIN');
     const lane = await lockLane(client, key);
-    if (lane === null || lane.epoch !== deps.epoch()) {
+    if (lane === null || lane.epoch !== deps.epochOf(key)) {
       await client.query('ROLLBACK');
       return false;
     }
