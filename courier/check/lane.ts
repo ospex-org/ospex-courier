@@ -6,7 +6,7 @@ import { free, holdBet, lockBet, lockLane, reserve, setBetState, shareLane, take
 import type { Run } from '../records/runs';
 import { failureCode, type Store } from '../records/store';
 import type { LaneHooks } from './hooks';
-import { checkBet, named, type CheckDeps, type CheckOutcome, type Incident } from './precheck';
+import { checkBet, named, type CheckDeps, type CheckOutcome, type Incident, type Verdict } from './precheck';
 import { VERDICT } from './sentences';
 
 // The lane: one per sender key, one owner by its epoch, one bet at a time.
@@ -54,6 +54,14 @@ export interface Lane {
   wake(): void;
   /** Whether the runner is running now. */
   running(): boolean;
+}
+
+/**
+ * The facts of a refusal's line: the check's own fields first, then the last header read where no check decided, then
+ * the line's own code, sentence and block, last, so that no field of the check's can replace them.
+ */
+export function refusalFacts(v: Verdict): Record<string, unknown> {
+  return { ...v.fields, ...(v.lastObservedBlock === undefined ? {} : { lastObservedBlock: v.lastObservedBlock }), code: v.code, error: v.error, block: v.block };
 }
 
 /** Whether a failure is the database's: a driver or server code, or the driver's codeless connection message. */
@@ -192,7 +200,7 @@ export function createLane(deps: LaneDeps): Lane {
         await line(client, res.bet, 'cross not sent', 'SENDER_NOT_BUILT', { message: VERDICT.NOT_SENT(c.block.number.toString()), block: named(c.block), legs: c.legs.length, takerRisk: c.takerRisk.toString() });
       } else {
         const v = outcome.verdict;
-        await line(client, res.bet, outcome.kind === 'lapsed' ? 'bet lapsed' : 'bet refused', v.code, { code: v.code, error: v.error, block: v.block, ...(v.lastObservedBlock === undefined ? {} : { lastObservedBlock: v.lastObservedBlock }), ...v.fields });
+        await line(client, res.bet, outcome.kind === 'lapsed' ? 'bet lapsed' : 'bet refused', v.code, refusalFacts(v));
         await setBetState(client, res.bet.hash, outcome.kind === 'lapsed' ? 'lapsed' : 'refused');
       }
       for (const i of incidents) await line(client, res.bet, 'incident', i.reason, i.facts, i.orderHash);

@@ -3,6 +3,7 @@ import { after, before, beforeEach, test } from 'node:test';
 import pg from 'pg';
 import type { Abi, Hex } from 'viem';
 import type { HDAccount } from 'viem/accounts';
+import { refusalFacts } from '../courier/check/lane';
 import { orderHash } from '../courier/orders/order';
 import { openPool } from '../courier/records/store';
 import { get as getFrom, startHookedCourier, type CourierProcess, type HookControl } from './support/courier';
@@ -872,4 +873,14 @@ test('idle: an hour of blocks mined with no request made: no row, no line, and n
   // Nothing runs on a schedule; a short look for anything that would.
   await new Promise((resolve) => setTimeout(resolve, 2_000));
   assert.deepEqual({ rows: await rows(), requests: stack.proxy.count(), commands: stack.dbRelay.commands() }, before);
+});
+
+test("a refusal's line keeps its own code, sentence and block, whatever fields the check gives it: a field named code, error or block is written before them and is replaced", () => {
+  // No refusal has such a field today, so the case plants them here, at the line's own builder.
+  const block = { number: '7', hash: `0x${'ab'.repeat(32)}` as Hex, time: '1700000000' };
+  const facts = refusalFacts({ code: 'NO_DEPTH', error: "At block 7 no quote on the book meets this bet's price. Nothing was sent.", block, fields: { code: 'A_FIELD_OF_THE_CHECK', error: 'a field of the check', block: 'a field of the check', other: 1 } });
+  assert.deepEqual(facts, { code: 'NO_DEPTH', error: "At block 7 no quote on the book meets this bet's price. Nothing was sent.", block, other: 1 });
+  // The last header read, where no check decided, keeps its place too.
+  const lastObservedBlock = { number: '6', hash: `0x${'cd'.repeat(32)}` as Hex, time: '1699999999' };
+  assert.deepEqual(refusalFacts({ code: 'CHAIN_UNREACHABLE', error: 'e', block: null, lastObservedBlock, fields: { code: 'x', lastObservedBlock: 'x' } }), { code: 'CHAIN_UNREACHABLE', error: 'e', block: null, lastObservedBlock });
 });

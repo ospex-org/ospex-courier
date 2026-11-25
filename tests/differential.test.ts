@@ -37,14 +37,15 @@ const url = () => stack.courier.url;
 
 /**
  * Every test, and every case of the set, sends from a network address of its own, as the courier's other tests do, so the courier's count of an
- * address's minute, 600 requests, limits none: the last value of X-Forwarded-For, an address of 198.20.0.0/16 new for
- * each. The requests below go out from it unless a case names another address.
+ * address's minute, 600 requests, limits none: the last value of X-Forwarded-For, an address of 198.19.128.0/17 new for
+ * each, a part of the range kept for benchmarking that no other test uses. The requests below go out from it unless a
+ * case names another address.
  */
 let from: Record<string, string> = {};
 let nextAddress = 0;
 const ownAddress = (): Record<string, string> => {
   const n = nextAddress++;
-  return { 'x-forwarded-for': `198.20.${1 + Math.floor(n / 250)}.${1 + (n % 250)}` };
+  return { 'x-forwarded-for': `198.19.${128 + Math.floor(n / 250)}.${1 + (n % 250)}` };
 };
 beforeEach(() => {
   from = ownAddress();
