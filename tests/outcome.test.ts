@@ -255,3 +255,11 @@ test('the bet end to end, held against an oracle of the test\'s own by log index
   const bAfter = await stack.rig.read<bigint>(stack.rig.addresses.coin, stack.rig.abis.TestCoin as Abi, 'balanceOf', [c.B.address]);
   assert.equal(bBefore - bAfter, pulls.get(c.B.address.toLowerCase()), "the bettor's balance moved by exactly its pull");
 });
+
+test("the pause's first carry: one cross reverted line for each failed Cross, in a form a count can read; a count over this file's lines gives the bettor for the revert traced to its own allowance, unknown for the one with no trace and the one with another's trace, and nobody for the one past its expiry, and never counts an account merely affected", async () => {
+  const { rows } = await pool.query<{ pinned: unknown; affected: unknown }>(`SELECT facts->'pinnedOn' AS pinned, facts->'affected' AS affected FROM events WHERE kind = 'cross reverted' ORDER BY number`);
+  const shape = rows.map((r) => (Array.isArray(r.pinned) ? (r.pinned.length === 0 ? 'nobody' : 'account') : r.pinned));
+  assert.deepEqual(shape, ['account', 'unknown', 'nobody', 'unknown']);
+  const counted = rows.flatMap((r) => (Array.isArray(r.pinned) ? (r.pinned as Array<{ account: string }>).map((p) => p.account.toLowerCase()) : []));
+  assert.equal(counted.length, 1, 'one account counted: the bettor whose own act the trace shows');
+});

@@ -68,17 +68,22 @@ process.on('message', (raw: unknown) => {
   send({ type: 'ack', id: m.id });
 });
 
-/** A try at changing the sealed send in place: each change is made as a caller would, and a frozen object refuses it. */
+/**
+ * A try at changing the sealed send in place: each change is made as a caller would, and a frozen object refuses it.
+ * Judged by its effect: 'changed' only where the send reads otherwise after the try.
+ */
 function tamperWith(checked: unknown, how: NonNullable<SignerFault['tamper']>): string {
-  const c = checked as { resting: unknown[]; gas: { limit: bigint }; taking: unknown; calldata: string };
+  const c = checked as { resting: Array<{ hash: string }>; gas: { limit: bigint }; taking: { hash: string }; calldata: string };
+  const seen = () => JSON.stringify({ resting: c.resting.map((r) => r.hash), limit: c.gas.limit.toString(), taking: c.taking.hash });
+  const before = seen();
   try {
     if (how === 'reorder') c.resting.reverse();
     else if (how === 'swap') c.resting[0] = c.taking;
     else c.gas.limit = c.gas.limit - 1n;
-    return 'changed';
   } catch (err) {
     return err instanceof TypeError ? 'refused: frozen' : 'refused';
   }
+  return seen() === before ? 'unchanged' : 'changed';
 }
 
 const hooks: LaneHooks = {

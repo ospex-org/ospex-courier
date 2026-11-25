@@ -103,7 +103,7 @@ async function balanceOf(who: HDAccount): Promise<bigint> {
 }
 
 async function linesOf(bet: string): Promise<Array<{ number: number; kind: string; reason: string | null; facts: Record<string, unknown> }>> {
-  const { rows } = await pool.query(`SELECT number::int AS number, kind, reason, facts FROM events WHERE bet_hash = $1 ORDER BY number`, [bet.toLowerCase()]);
+  const { rows } = await pool.query(`SELECT number::int AS number, kind, reason, facts FROM events WHERE bet_hash = $1 ORDER BY events.number`, [bet.toLowerCase()]);
   return rows as Array<{ number: number; kind: string; reason: string | null; facts: Record<string, unknown> }>;
 }
 
@@ -241,7 +241,7 @@ test('a stop during the hand-off waits on the hash locks through the node\'s ans
   const t = times.rows[0] as { gate: Date; stopped: Date };
   assert.ok(t.stopped > t.gate, JSON.stringify(t));
   const answerLine = (await linesOf(c.betHash)).find((l) => l.kind === 'cross sent');
-  const stopLine = await pool.query<{ number: number }>(`SELECT number::int AS number FROM events WHERE kind = 'stop received' AND account = $1 ORDER BY number DESC LIMIT 1`, [c.M.address.toLowerCase()]);
+  const stopLine = await pool.query<{ number: number }>(`SELECT number::int AS number FROM events WHERE kind = 'stop received' AND account = $1 ORDER BY events.number DESC LIMIT 1`, [c.M.address.toLowerCase()]);
   assert.ok(answerLine !== undefined && (stopLine.rows[0]?.number ?? 0) > answerLine.number, 'the stop is recorded after the answer');
   const settled = await until(() => crossRow(c.betHash), (r) => r !== null && FINAL.includes(r.state), 60_000, 'the Cross');
   assert.equal(settled?.state, 'confirmed');
