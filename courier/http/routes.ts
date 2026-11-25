@@ -170,12 +170,19 @@ export async function getBook(deps: RouteDeps, query: URLSearchParams): Promise<
   }
 }
 
+/**
+ * A database or connection failure under the door can leave acceptance uncertain: the sentence the order route answers
+ * it with, as docs/API.md states it for a code a client does not know, so the two agree.
+ */
+export const ORDER_ACCEPTANCE_UNCERTAIN =
+  'A database or connection failure can leave acceptance uncertain: read the order by hash or repost the same signed order; do not sign a new bet merely because an answer failed. Next: read the order by hash or repost the same signed order; do not sign a new bet merely because an answer failed.';
+
 /** POST /v1/orders: the door. A database that fails under it is 503, and the order's transaction was rolled back. */
 export async function postOrders(deps: RouteDeps, body: unknown): Promise<HttpAnswer> {
   try {
     return await postOrder({ store: deps.store, chain: deps.chain, set: deps.set, node: deps.node, lane: deps.lane, run: deps.run, counters: deps.counters, published: deps.published, coinDecimals: deps.set.coinDecimals, log: deps.log }, body);
   } catch (err) {
-    if (isDatabaseFailure(err)) return databaseUnreadable(deps, 'POST /v1/orders', err, 'The database could not be read; nothing was recorded for this order.');
+    if (isDatabaseFailure(err)) return databaseUnreadable(deps, 'POST /v1/orders', err, ORDER_ACCEPTANCE_UNCERTAIN);
     throw err;
   }
 }
@@ -215,7 +222,7 @@ export async function getOrder(deps: RouteDeps, hash: string): Promise<HttpAnswe
       if (stoppedAt !== null) return { status: 200, body: { orderHash: hash.toLowerCase(), state: 'stopped ahead', stoppedAt: stoppedAt.toISOString() } };
       return refusal(404, 'UNKNOWN_ORDER', 'The courier holds no order of this hash.');
     }
-    return { status: 200, body: orderRecord(row, await betOutcome(deps.store, row)) };
+    return { status: 200, body: orderRecord(row, await betOutcome(deps.store, row, { decimals: deps.set.coinDecimals, relay: deps.set.relay })) };
   } catch (err) {
     return databaseUnreadable(deps, 'GET /v1/orders/{hash}', err, 'The database could not be read.');
   }

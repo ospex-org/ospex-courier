@@ -3,7 +3,9 @@ import type { Address, Hex } from 'viem';
 import { readForDoor, readQuotes, type DoorRead } from '../chain/reads';
 import type { NodeCheck } from '../chain/node';
 import type { Lane } from '../check/lane';
-import { crossOf, verdictLine } from '../records/lanes';
+import { crossOf, restoreHold, verdictLine } from '../records/lanes';
+import { crossRow, legsForRecord, reconciledOf, type CrossRow } from '../records/crosses';
+import { crossFields, crossMessage, SENTENCE, wireState, type LegForRecord } from './wire';
 import type { BettingSet } from '../chain/set';
 import { ChainUnreachable, type ChainReader } from '../chain/snapshot';
 import { BOUNDS, type Counters } from '../http/limits';
@@ -47,10 +49,16 @@ export const GAME_STATUS = { None: 0, Unverified: 1, Verified: 2, Disputed: 3, S
 
 const refusal = (status: number, code: string, error: string, extra: Record<string, unknown> = {}): HttpAnswer => ({ status, body: { error, code, ...extra } });
 
-/** What a bet's record adds, read from its outcome's line and its Cross. */
+/** What a bet's record adds, read from its outcome's line and its Cross, and whether the database is under a restore's hold. */
 export interface BetOutcome {
   verdict: Awaited<ReturnType<typeof verdictLine>>;
   cross: Awaited<ReturnType<typeof crossOf>>;
+  /** The Cross's whole row, as the sender writes it, and its legs as the record serves them. */
+  row: CrossRow | null;
+  legs: LegForRecord[];
+  restored: boolean;
+  reconciled: boolean;
+  terms: { decimals: number; relay: string };
 }
 
 /**
@@ -61,10 +69,11 @@ export interface BetOutcome {
  */
 function betState(row: OrderRow, outcome: BetOutcome | null): string {
   const verdict = outcome?.verdict ?? null;
-  if (row.betState === 'waiting' || row.betState === 'held') return row.ended === 'stopped' ? 'stopped' : 'queued';
+  // Under a restore's hold a retained waiting or held bet is uncertain, never one being checked.
+  if (row.betState === 'waiting' || row.betState === 'held') return row.ended === 'stopped' ? 'stopped' : outcome?.restored === true ? 'unknown' : 'queued';
   if (row.betState === 'refused') return verdict?.reason === 'STOPPED' ? 'stopped' : 'refused';
   if (row.betState === 'lapsed') return 'lapsed';
-  if (row.betState === 'sent') return outcome?.cross?.state ?? 'not sent';
+  if (row.betState === 'sent') return wireState(outcome?.row ?? null, outcome?.restored ?? false).state;
   return String(row.betState);
 }
 
@@ -81,32 +90,40 @@ function verdictOf(v: NonNullable<BetOutcome['verdict']>): Record<string, unknow
   };
 }
 
-/** A bet's Cross as its record serves it. */
-function crossRecord(c: NonNullable<BetOutcome['cross']>, verdict: BetOutcome['verdict']): Record<string, unknown> {
+/**
+ * A bet's Cross as its record serves it: the state by the one name outside, the check's figures as expected at H, and
+ * what the sender adds where the record can fill it, with the sentence of its current state made from its row.
+ */
+function crossRecord(c: NonNullable<BetOutcome['cross']>, outcome: BetOutcome, bet: OrderRow): Record<string, unknown> {
   const checked = c.checked as Record<string, unknown>;
-  const gas = (checked.gas ?? {}) as Record<string, unknown>;
+  const row = outcome.row as CrossRow;
+  const terms = { expiry: bet.order.expiry, riskAmount: bet.order.riskAmount, minFill: bet.order.minFill, gameId: bet.order.gameId, relay: outcome.terms.relay, decimals: outcome.terms.decimals };
   return {
-    state: c.state,
+    state: wireState(row, outcome.restored).state,
     handOffs: c.handOffs,
     reason: c.reason,
-    message: (verdict?.facts as { message?: unknown } | undefined)?.message ?? null,
+    message: crossMessage(row, terms, outcome.legs, outcome.restored),
     block: c.block,
-    legs: c.legs.map((l) => ({ position: l.position, orderHash: l.orderHash, account: l.account, oddsTick: l.oddsTick, makerRisk: l.makerRisk, takerRisk: l.takerRisk })),
     takerRisk: checked.takerRisk ?? null,
     unfilled: checked.unfilled ?? null,
     pulls: checked.pulls ?? {},
     paysBack: checked.paysBack ?? {},
     paysBackRefused: checked.paysBackRefused ?? {},
-    gas: { estimate: gas.estimate ?? checked.estimate ?? null, limit: gas.limit ?? checked.limit ?? null },
-    nonce: checked.nonce ?? null,
+    ...crossFields(row, outcome.legs, outcome.reconciled),
   };
 }
 
-/** What a bet's record needs beyond its row: its outcome's line and its Cross. Two reads, along `events_bet_lines` and the Cross's key. */
-export async function betOutcome(store: Store, row: OrderRow): Promise<BetOutcome | null> {
-  if (row.role !== 'take' || row.betState === 'waiting' || row.betState === 'held') return null;
-  const [verdict, cross] = await Promise.all([verdictLine(store.pool, row.hash), crossOf(store.pool, row.hash)]);
-  return { verdict, cross };
+/**
+ * What a bet's record needs beyond its row: its outcome's line and its Cross, along `events_bet_lines` and the Cross's
+ * key; the Cross's whole row and its legs; whether the database is under a restore's hold; and whether a held Cross is
+ * reconciled. A waiting or held bet needs only the hold.
+ */
+export async function betOutcome(store: Store, row: OrderRow, terms: { decimals: number; relay: string }): Promise<BetOutcome | null> {
+  if (row.role !== 'take') return null;
+  const restored = (await restoreHold(store.pool)) !== null;
+  if (row.betState === 'waiting' || row.betState === 'held') return restored ? { verdict: null, cross: null, row: null, legs: [], restored, reconciled: true, terms } : null;
+  const [verdict, cross, full, legs, reconciled] = await Promise.all([verdictLine(store.pool, row.hash), crossOf(store.pool, row.hash), crossRow(store.pool, row.hash), legsForRecord(store.pool, row.hash), reconciledOf(store.pool, row.hash)]);
+  return { verdict, cross, row: full, legs, restored, reconciled, terms };
 }
 
 /** The record of an order, as POST answers it and GET /v1/orders/{hash} serves it; a bet's with what came of it. */
@@ -116,9 +133,11 @@ export function orderRecord(row: OrderRow, outcome: BetOutcome | null = null): R
   const bet =
     row.role === 'take'
       ? {
-          ...(state === 'queued' ? { turn: row.betState === 'held' ? 'checking' : 'waiting' } : {}),
+          ...(state === 'queued' ? { turn: wireState(outcome?.row ?? null, false).turn === 'sending' && row.betState === 'sent' ? 'sending' : row.betState === 'held' ? 'checking' : 'waiting' } : {}),
           ...(verdict !== null && verdict.kind !== 'cross not sent' ? { verdict: verdictOf(verdict) } : {}),
-          cross: outcome?.cross === null || outcome?.cross === undefined ? null : crossRecord(outcome.cross, verdict),
+          cross: outcome === null || outcome.cross === null || outcome.row === null ? null : crossRecord(outcome.cross, outcome, row),
+          // A retained bet with no Cross under a restore's hold: the uncertainty and the wait, and no Cross invented.
+          ...(outcome?.restored === true && (row.betState === 'waiting' || row.betState === 'held') && row.ended !== 'stopped' ? { message: SENTENCE.RESTORED(row.order.expiry.toString()) } : {}),
         }
       : {};
   return {
@@ -266,7 +285,7 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
   // 5. On record already? A repeat is answered from the record; the other role is a conflict.
   const known = await deps.store.orders.get(hash);
   if (known !== null) {
-    if (known.role === role) return { status: 200, body: orderRecord(known, await betOutcome(deps.store, known)) };
+    if (known.role === role) return { status: 200, body: orderRecord(known, await betOutcome(deps.store, known, { decimals: deps.coinDecimals, relay: deps.set.relay })) };
     return counted(refusal(409, 'ROLE_CONFLICT', `This order is on record as ${known.role === 'rest' ? 'a quote' : 'a bet'}; an order hash has one role at this courier, the first one posted.`));
   }
 
@@ -304,7 +323,7 @@ export async function postOrder(deps: DoorDeps, raw: unknown): Promise<HttpAnswe
     const again = await deps.store.orders.get(hash, client);
     if (again !== null) {
       await client.query('COMMIT');
-      if (again.role === role) return { status: 200, body: orderRecord(again, await betOutcome(deps.store, again)) };
+      if (again.role === role) return { status: 200, body: orderRecord(again, await betOutcome(deps.store, again, { decimals: deps.coinDecimals, relay: deps.set.relay })) };
       return counted(refusal(409, 'ROLE_CONFLICT', `This order is on record as ${again.role === 'rest' ? 'a quote' : 'a bet'}; an order hash has one role at this courier, the first one posted.`));
     }
 

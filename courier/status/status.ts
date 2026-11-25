@@ -48,6 +48,27 @@ export const GROWTH_RATES = {
   makerDefaultsPerDay: 13 * 3 * 2 * 144,
 } as const;
 
+/**
+ * The sender as the records stand: each lane's open Cross, with its state, transaction and nonce; each lane shut, with
+ * the line that shut it and why (a key's nonce the records could not explain, or a restore's fence); and the
+ * database-wide restore hold, where one stands.
+ */
+async function senderState(deps: StatusDeps): Promise<Record<string, unknown>> {
+  const { rows } = await deps.store.pool.query<{ sender: string; open_cross: string | null; state: string | null; tx_hash: string | null; nonce: string | null; shut_line: string | null; kind: string | null; reason: string | null }>(
+    `SELECT l.sender, l.open_cross, c.state, c.tx_hash, c.nonce::text AS nonce, l.shut_line::text AS shut_line, e.kind, e.reason
+     FROM lanes l LEFT JOIN crosses c ON c.bet_hash = l.open_cross LEFT JOIN events e ON e.number = l.shut_line ORDER BY l.sender`,
+  );
+  const restore = rows.find((r) => r.kind === 'incident' && r.reason === 'RESTORE_SHUT');
+  return {
+    lanes: rows.map((r) => ({
+      sender: r.sender,
+      openCross: r.open_cross === null ? null : { bet: r.open_cross, state: r.state, ...(r.tx_hash === null ? {} : { txHash: r.tx_hash }), ...(r.nonce === null ? {} : { nonce: r.nonce }) },
+      shut: r.shut_line === null ? null : { line: Number(r.shut_line), by: r.reason === 'RESTORE_SHUT' ? 'a restore' : r.reason === 'cross-unreconciled' ? 'a nonce of the key the records do not explain' : r.reason },
+    })),
+    restoreHold: restore === undefined ? null : { line: Number(restore.shut_line), note: 'no lane, old or new, reserves, signs or hands off on this database, and the door takes no new bet' },
+  };
+}
+
 export async function status(deps: StatusDeps): Promise<Record<string, unknown>> {
   let conditions;
   let newestReportLine;
@@ -112,6 +133,7 @@ export async function status(deps: StatusDeps): Promise<Record<string, unknown>>
         epoch: lane?.epoch.toString() ?? null,
         takingBets: lane !== null && deps.lane.epoch() === lane.epoch && deps.lane.takingBets(),
       },
+      ...(await senderState(deps)),
     },
     node: deps.node,
     bounds: BOUNDS,

@@ -341,3 +341,20 @@ export async function writeActionOnce(
   );
   return rows[0] === undefined ? null : Number(rows[0].number);
 }
+
+/** A bet's legs as its record serves them: the expected stakes, and what the chain recorded where it has. */
+export async function legsForRecord(on: Pick<pg.Pool, 'query'>, betHash: Hex): Promise<Array<{ position: number; orderHash: Hex; account: string; oddsTick: number; makerRisk: string; takerRisk: string; recordedMakerRisk: string | null; recordedTakerRisk: string | null; skip: string | null }>> {
+  const { rows } = await on.query<{ position: number; order_hash: Hex; account: string; odds_tick: number; m: string; t: string; rm: string | null; rt: string | null; skip_reason: string | null }>(
+    `SELECT l.position, l.order_hash, o.account, o.odds_tick, l.expected_maker_risk::text AS m, l.expected_taker_risk::text AS t,
+            l.recorded_maker_risk::text AS rm, l.recorded_taker_risk::text AS rt, l.skip_reason
+     FROM legs l JOIN orders o ON o.hash = l.order_hash WHERE l.bet_hash = $1 ORDER BY l.position`,
+    [betHash.toLowerCase()],
+  );
+  return rows.map((r) => ({ position: Number(r.position), orderHash: r.order_hash, account: r.account, oddsTick: Number(r.odds_tick), makerRisk: r.m, takerRisk: r.t, recordedMakerRisk: r.rm, recordedTakerRisk: r.rt, skip: r.skip_reason }));
+}
+
+/** Whether a Cross is reconciled: false while cross-unreconciled holds it, its condition open and naming this bet. */
+export async function reconciledOf(on: Pick<pg.Pool, 'query'>, betHash: Hex): Promise<boolean> {
+  const { rowCount } = await on.query(`SELECT 1 FROM conditions WHERE key = 'cross-unreconciled' AND cleared_at IS NULL AND lower(facts->>'betHash') = $1`, [betHash.toLowerCase()]);
+  return (rowCount ?? 0) === 0;
+}

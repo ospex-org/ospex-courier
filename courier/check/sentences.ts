@@ -45,5 +45,4 @@ export const VERDICT = {
   CROSS_TOO_LARGE_SEARCHED: (n: string, listed: string) => `At block ${n}, a fill of this bet against the ${listed} quotes listed for it needs more gas than one transaction may carry. The courier looked for a fill against fewer of them, taken in their order, that fits one transaction and meets this bet's minimum, and its search found none; that does not mean none exists. Nothing was sent. Sign the bet again with a smaller stake or a lower minimum.`,
   CHAIN_UNREACHABLE: 'The courier could not read the chain to check this bet, after two tries. Nothing was sent. Sign the bet again.',
   COURIER_FAULT: "The courier's own check of this bet went wrong. That is the courier's fault, and it is recorded as one. Nothing was sent. Sign the bet again.",
-  NOT_SENT: (n: string) => `The courier checked this bet at block ${n} and found that it would fill as listed. The sender is a later build, so nothing was signed or sent.`,
 } as const;

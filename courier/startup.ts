@@ -57,7 +57,6 @@ function openKey(
 
 /** What this build does not yet do, published on the status address. */
 export const NOT_YET_BUILT = [
-  'the sender and the key (the sender build): nothing is signed or sent; a bet found ready is closed not sent',
   'incidents and their cursor (the reports build)',
 ] as const;
 

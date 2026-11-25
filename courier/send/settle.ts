@@ -132,7 +132,14 @@ export function createSettler(deps: SettleDeps): Settler {
   async function writeRan(bet: OrderRow, cross: CrossRow, legs: Awaited<ReturnType<typeof legsOf>>, l: Ran & { F: Header }): Promise<'written' | 'unchanged' | 'lost'> {
     const F = l.F;
     const receipt = l.receipt;
-    const base = { txHash: receipt.transactionHash, nonce: s(cross.nonce as bigint), block: { number: s(receipt.blockNumber), hash: receipt.blockHash }, final: finalNamed(F), betFilled: s(l.betFilled), gasUsed: s(receipt.gasUsed), effectiveGasPrice: s(receipt.effectiveGasPrice) };
+    let receiptBlockTime: string | null = null;
+    try {
+      const h = await deps.chain.ask(F, () => headerByHash(deps.rpc, receipt.blockHash));
+      receiptBlockTime = h === null ? null : s(h.timestamp);
+    } catch (err) {
+      if (!(err instanceof ChainUnreachable)) throw err;
+    }
+    const base = { txHash: receipt.transactionHash, nonce: s(cross.nonce as bigint), block: { number: s(receipt.blockNumber), hash: receipt.blockHash, ...(receiptBlockTime === null ? {} : { time: receiptBlockTime }) }, final: finalNamed(F), betFilled: s(l.betFilled), gasUsed: s(receipt.gasUsed), effectiveGasPrice: s(receipt.effectiveGasPrice) };
     if (l.status === 'confirmed') {
       const r = l.record;
       if (r === null || r.crossed === null) throw new Error('a confirmed Cross has its record');
@@ -140,6 +147,7 @@ export function createSettler(deps: SettleDeps): Settler {
       const recorded = {
         betFilled: s(l.betFilled),
         final: finalNamed(F),
+        ...(receiptBlockTime === null ? {} : { receiptBlockTime }),
         totals: { maker: s(r.crossed.totalMakerRisk), taker: s(r.crossed.totalTakerRisk), marketId: s(r.crossed.marketId) },
         marketCreated: r.marketCreated === null ? null : s(r.marketCreated),
         pulls: Object.fromEntries([...r.pulls].map(([a, v]) => [a, s(v)])),
@@ -167,7 +175,7 @@ export function createSettler(deps: SettleDeps): Settler {
     }
     // Reverted: the failed receipt alone establishes it; the reason from one trace, or unavailable.
     const { reason, facts } = await revertFacts(bet, cross, legs, receipt, F);
-    const recorded = { betFilled: s(l.betFilled), final: finalNamed(F), reason: facts };
+    const recorded = { betFilled: s(l.betFilled), final: finalNamed(F), reason: facts, ...(receiptBlockTime === null ? {} : { receiptBlockTime }) };
     const outcome: FinalOutcome = {
       state: 'reverted',
       final: { number: F.number, hash: F.hash },
