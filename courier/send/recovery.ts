@@ -141,7 +141,14 @@ export async function reconcileRestored(deps: RecoveryDeps, key: Address, restor
         intent = null;
         continue;
       }
-      // A transaction with no retained Cross: appended to the restore's incident, once for each transaction.
+      // A transaction with no retained Cross: appended to the restore's incident, once for each transaction. Where it
+      // carries a retained bet, the chain's outcome and the bet's total filled at F go with it.
+      let outcome: Record<string, unknown> = {};
+      if (taking !== null && (await deps.store.orders.get(taking, deps.store.lane)) !== null) {
+        const receipt = await deps.chain.ask(F, () => receiptOf(deps.rpc, found.found.hash));
+        const total = (await filledAtF(deps.chain, deps.set, F, [taking])).get(taking);
+        outcome = { retainedBet: true, outcome: receipt === null ? null : receipt.status, betFilled: total === undefined ? null : s(total) };
+      }
       await owned(deps, key, async (client) => {
         const { rowCount } = await client.query(`SELECT 1 FROM events WHERE kind = 'incident' AND reason = 'RESTORE_UNASSOCIATED' AND facts->>'txHash' = $1`, [found.found.hash.toLowerCase()]);
         if ((rowCount ?? 0) > 0) return;
@@ -152,6 +159,7 @@ export async function reconcileRestored(deps: RecoveryDeps, key: Address, restor
           txHash: found.found.hash,
           block: { number: s(found.found.block.number), hash: found.found.block.hash },
           carries: taking,
+          ...outcome,
           final: finalNamed(F),
         });
       });

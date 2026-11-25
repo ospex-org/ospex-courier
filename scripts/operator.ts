@@ -42,7 +42,8 @@ if (command === 'clear' && (lane === undefined || !isAddress(lane) || found === 
   process.exit(1);
 }
 
-const read = readCourierConfig(process.env);
+// The command listens on nothing: the courier's port setting, where it is not set, is not asked of it.
+const read = readCourierConfig({ PORT: '0', ...process.env });
 if (!read.ok) {
   console.log(`operator: not run: settings: ${read.problems.join('; ')}`);
   process.exit(1);

@@ -203,8 +203,9 @@ export function createLane(deps: LaneDeps): Lane {
   /**
    * Under a restore's hold: every lane's nonce use reconciled and its retained intent closed where the chain allows;
    * each signed or later Cross settled by its own hash; each retained bet with no Cross given its ACTION once its
-   * expiry is past a final block. Looked at again at the gap until every lane is reconciled. Nothing is reserved,
-   * signed or handed off, and the hold stands: always 'stop'.
+   * expiry is past a final block. Looked at again at the gap for as long as this process runs: a transaction kept
+   * from the chain can land at any later block, and the hold never lifts. Nothing is reserved, signed or handed off.
+   * 'stop' once this process stops.
    */
   async function recoverUnderHold(hold: number): Promise<'stop'> {
     let gap: number = LOOK_GAP.firstMs;
@@ -237,7 +238,7 @@ export function createLane(deps: LaneDeps): Lane {
         if (!(err instanceof ChainUnreachable)) throw err;
         all = false;
       }
-      if (all) return 'stop';
+      if (all) deps.log("lane: under the restore's hold, every lane is reconciled as the final block stands; looking again at the gap");
       await sleep(gap);
       gap = Math.min(gap * 2, LOOK_GAP.lastMs);
     }
