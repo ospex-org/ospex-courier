@@ -120,7 +120,7 @@ export async function clearLane(deps: OperatorDeps, lane: Address, found: string
   let F: Header;
   try {
     F = await deps.chain.finalHeader();
-    const crosses = await crossesOfKey(deps.store.pool, lane);
+    const crosses = await crossesOfKey(deps.store.pool, lane, row.watermark.to);
     const toShow = blocksToShow(F, row.watermark, crosses);
     const shown = toShow.length === 0 ? [] : await onFinalChain(deps.chain, deps.rpc, F, toShow);
     const onF = new Map(toShow.map((b, i) => [b.hash.toLowerCase(), shown[i]]));

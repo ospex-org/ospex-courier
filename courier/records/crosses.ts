@@ -168,9 +168,19 @@ export async function freeLaneOfCross(on: Client, lane: Address): Promise<void> 
   await on.query('UPDATE lanes SET held_bet = NULL, reservation = NULL, reserved_at = NULL, open_cross = NULL WHERE sender = $1', [lane.toLowerCase()]);
 }
 
-/** A key's Crosses that bear on its nonces: every one with a nonce, oldest nonce first, with what explains each and what does not. */
-export async function crossesOfKey(on: Pick<pg.Pool, 'query'> | Client, sender: Address): Promise<CrossRow[]> {
-  const { rows } = await on.query(`SELECT ${COLUMNS} FROM crosses c WHERE c.sender = $1 AND c.nonce IS NOT NULL ORDER BY c.nonce, c.bet_hash`, [sender.toLowerCase()]);
+/**
+ * A key's Crosses that bear on its nonces from `fromNonce` up, oldest nonce first: one range of the key's index on its
+ * sender and nonce. The nonces below the lane's watermark were explained at an earlier final block and are not read
+ * again, so an ordinary read stays the same size as the history grows.
+ */
+export async function crossesOfKey(on: Pick<pg.Pool, 'query'> | Client, sender: Address, fromNonce: bigint): Promise<CrossRow[]> {
+  const { rows } = await on.query(`SELECT ${COLUMNS} FROM crosses c WHERE c.sender = $1 AND c.nonce >= $2 ORDER BY c.nonce, c.bet_hash`, [sender.toLowerCase(), fromNonce.toString()]);
+  return rows.map((r) => toCross(r as Record<string, unknown>));
+}
+
+/** The key's Crosses at one nonce: what a replacement's fees rise over, and what a search's find is held against. */
+export async function crossesAtNonce(on: Pick<pg.Pool, 'query'> | Client, sender: Address, nonce: bigint): Promise<CrossRow[]> {
+  const { rows } = await on.query(`SELECT ${COLUMNS} FROM crosses c WHERE c.sender = $1 AND c.nonce = $2 ORDER BY c.bet_hash`, [sender.toLowerCase(), nonce.toString()]);
   return rows.map((r) => toCross(r as Record<string, unknown>));
 }
 

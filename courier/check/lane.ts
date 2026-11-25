@@ -5,7 +5,7 @@ import { ChainUnreachable } from '../chain/snapshot';
 import { lockKey } from '../orders/door';
 import { coinAmount } from '../orders/order';
 import { inLockOrder } from '../orders/stops';
-import { closeBeforeGate, crossesOfKey, crossRow, freeLaneOfCross, lockCross, markHandingOff, writeAnswer, writeIntent, writeSigned } from '../records/crosses';
+import { closeBeforeGate, crossesAtNonce, crossesOfKey, crossRow, freeLaneOfCross, lockCross, markHandingOff, writeAnswer, writeIntent, writeSigned } from '../records/crosses';
 import { firstWaitingBet, type OrderRow } from '../records/orders';
 import { free, holdBet, lockBet, lockLane, otherOpenCrosses, putBack, raiseWatermark, readLane, reserve, restoreHold, setBetState, shareLane, shutLane, take, type LaneRow, type Taken } from '../records/lanes';
 import type { Run } from '../records/runs';
@@ -416,7 +416,7 @@ export function createLane(deps: LaneDeps): Lane {
     let crosses;
     try {
       lane = await readLane(client, key);
-      crosses = await crossesOfKey(client, key);
+      crosses = lane === null ? [] : await crossesOfKey(client, key, lane.watermark.to);
     } finally {
       done();
     }
@@ -501,8 +501,7 @@ export function createLane(deps: LaneDeps): Lane {
     if (proof.kind === 'unexplained') return shutForNonce(res, proof.facts, c.send.final, proof.nonce, lane.watermark.anchor);
     if (proof.kind === 'contradiction') return contradiction(res, proof.facts);
 
-    const crosses = await crossesOfKey(store.lane, key);
-    const earlier = crosses.filter((x) => x.nonce === proof.nonce && x.state === 'expired unmined');
+    const earlier = (await crossesAtNonce(store.lane, key, proof.nonce)).filter((x) => x.state === 'expired unmined');
     const fees = chooseFees(c.send.tip, c.send.baseFee, earlier);
     const wallet = walletCovers(c.send.keyPol, c.gas.limit, fees.maxFeePerGas);
     if (!wallet.ok) {
@@ -834,7 +833,7 @@ export function createLane(deps: LaneDeps): Lane {
         const carried = await carry(r);
         current = null;
         if (carried === 'lost') {
-          deps.log('lane: a step of a bet was not written: this process no longer holds its lane or its reservation');
+          deps.log('lane: the outcome of a bet was not written: this process no longer holds its lane or its reservation');
           break;
         }
         if (carried === 'stop') break;

@@ -55,7 +55,7 @@ export async function repairMarks(deps: MarksDeps, F: Header): Promise<Repaired>
   const out: Repaired = { final: 0, rewritten: 0, lifted: 0, stopped: 0 };
   const { rows } = await deps.pool.query<Waiting>(
     `SELECT hash, account, nonce::text AS nonce, risk_amount::text AS risk_amount, expiry::text AS expiry, market_key, ended, ended_block::text AS ended_block, ended_block_hash
-     FROM orders WHERE ended_block IS NOT NULL AND NOT ended_final AND ended_block <= $1 ORDER BY ended_block, hash LIMIT $2`,
+     FROM orders o WHERE o.ended_block IS NOT NULL AND NOT o.ended_final AND o.ended_block <= $1 ORDER BY o.ended_block LIMIT $2`,
     [F.number.toString(), MARKS_PER_PASS],
   );
   if (rows.length === 0) return out;

@@ -110,7 +110,7 @@ export async function reconcileRestored(deps: RecoveryDeps, key: Address, restor
     throw err;
   }
   try {
-    const crosses = await crossesOfKey(deps.store.lane, key);
+    const crosses = await crossesOfKey(deps.store.lane, key, lane.watermark.to);
     const toShow = blocksToShow(F, lane.watermark, crosses);
     const shown = toShow.length === 0 ? [] : await onFinalChain(deps.chain, deps.rpc, F, toShow);
     const onF = new Map(toShow.map((b, i) => [b.hash.toLowerCase(), shown[i]]));

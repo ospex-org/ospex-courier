@@ -4,8 +4,8 @@ import { byHash, headerByHash, receiptOf, transactionCountAt, type Header, type 
 import type { BettingSet } from '../chain/set';
 import { ChainUnreachable, type ChainReader } from '../chain/snapshot';
 import { ORDER_RULES } from '../orders/order';
-import { crossesOfKey, crossRow, freeLaneOf, FINAL_STATES, legsOf, lockCross, writeActionOnce, writeFinal, writeOrphaned, writePending, type CrossRow, type FinalOutcome } from '../records/crosses';
-import { lockLane, shutLane } from '../records/lanes';
+import { crossesAtNonce, crossesOfKey, crossRow, freeLaneOf, FINAL_STATES, legsOf, lockCross, writeActionOnce, writeFinal, writeOrphaned, writePending, type CrossRow, type FinalOutcome } from '../records/crosses';
+import { lockLane, readLane, shutLane } from '../records/lanes';
 import type { OrderRow } from '../records/orders';
 import type { Store } from '../records/store';
 import { filledAtF, onFinalChain } from './chain';
@@ -255,7 +255,9 @@ export function createSettler(deps: SettleDeps): Settler {
   }
 
   async function readExpiredAgain(F: Header): Promise<'none' | 'written' | 'stop'> {
-    const expired = (await crossesOfKey(store.lane, key)).filter((c) => c.state === 'expired unmined' && c.txHash !== null && c.nonce !== null);
+    // Only from the lane's watermark up: an expired unmined Cross below it had its nonce used by another transaction, and can never be mined.
+    const lane = await readLane(store.lane, key);
+    const expired = (await crossesOfKey(store.lane, key, lane?.watermark.to ?? 0n)).filter((c) => c.state === 'expired unmined' && c.txHash !== null && c.nonce !== null);
     if (expired.length === 0) return 'none';
     let count: bigint;
     try {
@@ -326,7 +328,7 @@ export function createSettler(deps: SettleDeps): Settler {
       if (cross === null) throw new Error('the Cross to settle has no row');
       if (FINAL_STATES.includes(cross.state)) return 'done';
       const { expected, legs } = await expectedOf(bet, cross);
-      const ours = new Map((await crossesOfKey(store.lane, key)).filter((c) => c.nonce === cross.nonce && c.txHash !== null && c.betHash.toLowerCase() !== cross.betHash.toLowerCase()).map((c) => [(c.txHash as Hex).toLowerCase(), c.betHash]));
+      const ours = new Map((cross.nonce === null ? [] : await crossesAtNonce(store.lane, key, cross.nonce)).filter((c) => c.txHash !== null && c.betHash.toLowerCase() !== cross.betHash.toLowerCase()).map((c) => [(c.txHash as Hex).toLowerCase(), c.betHash]));
       const l = await look(outcomeDeps, cross, expected, lastF, ours);
       if (l.kind !== 'not comparable' && (lastF === null || l.F.number > lastF.number)) lastF = l.F;
       if (l.kind !== 'not comparable' && l.kind !== 'contradiction' && deps.repairMarks !== undefined) {
