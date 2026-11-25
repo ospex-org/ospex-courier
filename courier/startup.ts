@@ -106,7 +106,7 @@ export async function startService(env: Record<string, string | undefined>, opti
 
   // What the node can do, proved, from the key's address. The verdict is kept: while it fails one the pre-check needs,
   // the door takes no order (the node's gate), and it is served on the status address.
-  const node = await checkNode(rpc, { relay: set.relay, sender: config.courierAddress }, now);
+  const node = await checkNode(rpc, { relay: set.relay, sender: config.courierAddress, ...(config.traceCheckTransaction === undefined ? {} : { traceTransaction: config.traceCheckTransaction }) }, now);
   log(`courier: the node ${node.usable ? 'honours' : 'does not honour'} every request the pre-check makes at a block's hash; override ${node.overrideTaken.ok ? 'taken' : 'not taken'}`);
 
   // This run.
