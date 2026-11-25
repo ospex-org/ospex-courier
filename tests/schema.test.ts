@@ -152,12 +152,11 @@ test('one bet, one Cross; one transaction hash; one open Cross a lane', async ()
   await insertOrder(HASH('b1'), 'take');
   await insertOrder(HASH('b2'), 'take');
   await insertOrder(HASH('b3'), 'take');
-  // A Cross sent was handed to the node once: its count says so, as the sender's rule of the count by state asks.
   const cross = (bet: string, state: string, tx: string | null) =>
     pool.query(
-      `INSERT INTO crosses (bet_hash, lane, epoch, reservation, block_number, block_hash, block_time, state, tx_hash, hand_offs)
-       VALUES ($1, $2, 1, 1, 100, $3, 1794268800, $4, $5, $6)`,
-      [bet, ADDRESS('9'), HASH('e'), state, tx, state === 'sent' ? 1 : 0],
+      `INSERT INTO crosses (bet_hash, lane, epoch, reservation, block_number, block_hash, block_time, state, tx_hash)
+       VALUES ($1, $2, 1, 1, 100, $3, 1794268800, $4, $5)`,
+      [bet, ADDRESS('9'), HASH('e'), state, tx],
     );
   await cross(HASH('b1'), 'sent', HASH('71'));
   await refused(cross(HASH('b1'), 'intent', null), '23505', 'a second Cross for one bet');
@@ -497,7 +496,7 @@ const BEFORE_THE_LANE = `
 test("lanes and crosses as the schema before the lane made them, and events without the bet's index, are named by the start's probe and brought to this schema by applying it: the columns, the constraints, the index and the sequence read back as a database this schema made by itself; applied again, each new rule is the same constraint; and the rules hold", async () => {
   const fresh = { lanes: await tableShape(pool, 'lanes'), crosses: await tableShape(pool, 'crosses') };
   assert.ok(fresh.lanes.constraints.includes('lanes_reserved_at_with_bet c validated CHECK (((held_bet IS NULL) = (reserved_at IS NULL)))'), fresh.lanes.constraints.join(' | '));
-  assert.ok(fresh.crosses.constraints.includes("crosses_not_sent_reasons c validated CHECK ((not_sent_reason = ANY (ARRAY['STOPPED_AT_GATE'::text, 'COURIER_RESTARTED'::text, 'NODE_REFUSED'::text])))"), fresh.crosses.constraints.join(' | '));
+  assert.ok(fresh.crosses.constraints.includes("crosses_not_sent_reasons c validated CHECK ((not_sent_reason = 'SENDER_NOT_BUILT'::text))"), fresh.crosses.constraints.join(' | '));
   assert.ok(fresh.crosses.constraints.includes("crosses_not_sent_with_reason c validated CHECK (((state = 'not sent'::text) = (not_sent_reason IS NOT NULL)))"), fresh.crosses.constraints.join(' | '));
   const name = await db.createDatabase('lane_before');
   const older = openPool(db.urlFor(name), null);
@@ -530,9 +529,9 @@ test("lanes and crosses as the schema before the lane made them, and events with
         [HASH('b1'), ADDRESS('c'), HASH('d'), state, reason],
       );
     await refused(cross('not sent', null), '23514', 'a Cross not sent has its reason');
-    await refused(cross('intent', 'COURIER_RESTARTED'), '23514', 'only a Cross not sent has a reason');
+    await refused(cross('intent', 'SENDER_NOT_BUILT'), '23514', 'only a Cross not sent has a reason');
     await refused(cross('not sent', 'THE_NODE_SAID_NO'), '23514', 'a reason this build does not have');
-    await cross('not sent', 'COURIER_RESTARTED');
+    await cross('not sent', 'SENDER_NOT_BUILT');
     const checked = await older.query<{ checked: unknown }>('SELECT checked FROM crosses WHERE bet_hash = $1', [HASH('b1')]);
     assert.deepEqual(checked.rows[0]?.checked, {}, 'the figures start empty');
   } finally {
