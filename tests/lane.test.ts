@@ -51,6 +51,8 @@ const hooks = (): HookControl => {
 
 before(async () => {
   stack = await startStack('lane', { hooked: true });
+  // The final block follows the head: a ready bet is now sent, and its Cross settles once a final block holds it.
+  stack.proxy.finalFollows(0n);
   rig = stack.rig;
   pool = openPool(stack.databaseUrl, null);
 });
@@ -94,20 +96,26 @@ async function readyPair(market = ownMarket()): Promise<{ hash: Hex; order: Orde
   return { hash: posted.body.orderHash as Hex, order, quote: quote.body.orderHash as Hex, bettor: B };
 }
 
-/** The bet's record once an outcome is written: read again until it is no longer queued. */
+/** The states of a bet whose outcome is not yet written: waiting or being checked, or sent and not yet final. */
+const UNSETTLED = new Set(['queued', 'unknown', 'sent', 'pending']);
+
+/** The bet's record once an outcome is written: read again until it is no longer queued, nor a Cross not yet final. */
 async function judged(hash: string, on = url()): Promise<Record<string, unknown>> {
   // Read every tenth of a second, at most 300 times: well under the address's 600 a minute.
   for (let i = 0; i < 300; i++) {
     const r = await get(on, `/v1/orders/${hash}`);
-    if (r.body.state !== 'queued') return r.body;
+    if (!UNSETTLED.has(String(r.body.state))) return r.body;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`the bet ${hash} was still queued after 30 seconds`);
 }
 
+/** The kinds of a bet's outcome line: a refusal, a lapse, or its Cross's final outcome. */
+const OUTCOME_KINDS = `'bet refused', 'bet lapsed', 'cross not sent', 'cross confirmed', 'cross reverted', 'cross expired unmined', 'cross replaced'`;
+
 /** The bet's outcome lines: kind, reason and run, in order. */
 async function outcomeLines(hash: string): Promise<Array<{ kind: string; reason: string | null; run: number }>> {
-  const { rows } = await pool.query(`SELECT kind, reason, run::int AS run FROM events WHERE bet_hash = $1 AND kind IN ('bet refused', 'bet lapsed', 'cross not sent') ORDER BY number`, [hash.toLowerCase()]);
+  const { rows } = await pool.query(`SELECT kind, reason, run::int AS run FROM events WHERE bet_hash = $1 AND kind IN (${OUTCOME_KINDS}) ORDER BY number`, [hash.toLowerCase()]);
   return rows as Array<{ kind: string; reason: string | null; run: number }>;
 }
 
@@ -173,7 +181,7 @@ for (const point of ['after-reservation', 'after-read-c', 'before-result'] as co
       const second = await startHookedCourier(stack.env);
       try {
         const record = await judged(bet.hash, second.url);
-        assert.equal(record.state, kind === 'ready' ? 'not sent' : 'refused', JSON.stringify(record));
+        assert.equal(record.state, kind === 'ready' ? 'confirmed' : 'refused', JSON.stringify(record));
         // A bet posted to the first, which lost the lane: refused, and no row.
         const late = await freshAccount();
         const T = await rig.time();
@@ -192,7 +200,7 @@ for (const point of ['after-reservation', 'after-read-c', 'before-result'] as co
         await first.hooks.go(held);
         await logged(first, LOST);
         const lines = await outcomeLines(bet.hash);
-        assert.deepEqual(lines, [{ kind: kind === 'ready' ? 'cross not sent' : 'bet refused', reason: kind === 'ready' ? 'SENDER_NOT_BUILT' : 'NO_DEPTH', run: runOf(second) }], 'one outcome, the second\'s');
+        assert.deepEqual(lines, [{ kind: kind === 'ready' ? 'cross confirmed' : 'bet refused', reason: kind === 'ready' ? 'CONFIRMED' : 'NO_DEPTH', run: runOf(second) }], 'one outcome, the second\'s');
         const crosses = await pool.query('SELECT count(*)::int AS n FROM crosses WHERE bet_hash = $1', [bet.hash.toLowerCase()]);
         assert.equal(crosses.rows[0].n, kind === 'ready' ? 1 : 0);
       } finally {
@@ -476,10 +484,10 @@ test('the database lost in a lane step: the outcome\'s transaction fails, and th
   await (restarted.hooks as HookControl).go(first);
   const record = await judged(pair.hash);
   const next = await judged(fresh.hash);
-  const { rows: order } = await pool.query<{ bet_hash: string }>(`SELECT bet_hash FROM events WHERE bet_hash = ANY($1) AND kind IN ('bet refused', 'bet lapsed', 'cross not sent') ORDER BY number`, [[pair.hash.toLowerCase(), fresh.hash.toLowerCase()]]);
+  const { rows: order } = await pool.query<{ bet_hash: string }>(`SELECT bet_hash FROM events WHERE bet_hash = ANY($1) AND kind IN (${OUTCOME_KINDS}) ORDER BY number`, [[pair.hash.toLowerCase(), fresh.hash.toLowerCase()]]);
   assert.deepEqual(
     { firstReserved: first.bet, state: record.state, next: next.state, order: order.map((r) => r.bet_hash), lines: (await outcomeLines(pair.hash)).length },
-    { firstReserved: pair.hash.toLowerCase(), state: 'not sent', next: 'refused', order: [pair.hash.toLowerCase(), fresh.hash.toLowerCase()], lines: 1 },
+    { firstReserved: pair.hash.toLowerCase(), state: 'confirmed', next: 'refused', order: [pair.hash.toLowerCase(), fresh.hash.toLowerCase()], lines: 1 },
     'the held bet went back to waiting, was reserved first, in record order, and judged exactly once',
   );
 });
@@ -540,7 +548,7 @@ for (const variant of ['the process ended at the kill point', "the outcome's tra
     assert.equal((await pool.query('SELECT count(*)::int AS n FROM events')).rows[0].n, linesBefore, 'nothing written');
     // A new bet: checked, and found ready. The lane is not stuck.
     const next = await readyPair();
-    assert.equal((await judged(next.hash)).state, 'not sent');
+    assert.equal((await judged(next.hash)).state, 'confirmed');
     // A second restart: still one STOPPED line, and the ready bet's result unchanged.
     await stack.restartCourier({ hooked: true });
     assert.deepEqual(await outcomeLines(pair.hash), [{ kind: 'bet refused', reason: 'STOPPED', run: runOf(restarted) }]);
@@ -592,7 +600,7 @@ test('a stopped quote is listed for no bet whose candidate query begins after th
   assert.equal((record.verdict as { code: string }).code, 'NO_DEPTH');
   const other = ownMarket() as { scorer: Hex; lineTicks: number };
   await quoteOf(await freshAccount(), other);
-  assert.equal((await judged((await betOf(await freshAccount(), other)).hash)).state, 'not sent', 'the control');
+  assert.equal((await judged((await betOf(await freshAccount(), other)).hash)).state, 'confirmed', 'the control');
 });
 
 test('a bet stopped while it waits, another bet holding the lane: it is never reserved, it gets no verdict line, its record says stopped, and the queue holds one bet fewer', async () => {
@@ -826,15 +834,30 @@ test("the cost, in commands to the database, counted at the relay the courier's 
 });
 
 test('the cost, in requests to the node at the proxy, for one round by its path: a lapse is 1; a refusal at read A is 2; a refusal after the walk with nothing listed is 3; a ready bet is 9 to 12', async () => {
-  const counted = async (post: () => Promise<{ hash: Hex }>, between: () => Promise<void> = async () => undefined): Promise<{ state: unknown; requests: number }> => {
+  // One round, counted from the reservation to its outcome. A ready bet's check is counted to its result, before any
+  // step of the send: the check's own path, and apart from it the sender's two reads the check now makes, the key's
+  // count at the final block and the tip, each counted by its method (docs/COST.md).
+  const counted = async (post: () => Promise<{ hash: Hex }>, between: () => Promise<void> = async () => undefined, ready = false): Promise<{ state: unknown; requests: number; senderReads?: { tip: number; keyCounts: number } }> => {
     await hooks().arm('after-reservation');
+    if (ready) await hooks().arm('before-result');
     const posted = await post();
     const held = await hooks().reached('after-reservation');
     await between();
     const before = stack.proxy.count();
+    const tips = stack.proxy.count('eth_maxPriorityFeePerGas');
+    const keyCounts = stack.proxy.count('eth_getTransactionCount');
     await hooks().go(held);
+    let atResult: { requests: number; senderReads: { tip: number; keyCounts: number } } | null = null;
+    if (ready) {
+      const result = await hooks().reached('before-result');
+      atResult = { requests: stack.proxy.count() - before, senderReads: { tip: stack.proxy.count('eth_maxPriorityFeePerGas') - tips, keyCounts: stack.proxy.count('eth_getTransactionCount') - keyCounts } };
+      await hooks().go(result);
+    }
     const record = await judged(posted.hash);
-    return { state: record.state, requests: stack.proxy.count() - before };
+    if (atResult === null) return { state: record.state, requests: stack.proxy.count() - before };
+    // The check's own path: the round to its result, less the sender's two reads (one tip; the key's count at the
+    // final block, beside the check's own count at H).
+    return { state: record.state, requests: atResult.requests - 2, senderReads: atResult.senderReads };
   };
   const lapsedBettor = await freshAccount();
   const lapsed = await counted(
@@ -856,12 +879,13 @@ test('the cost, in requests to the node at the proxy, for one round by its path:
     async () => void (await rig.write(unregistered, rig.addresses.matching, rig.abis.OspexMatching as Abi, 'unregisterCourier', [rig.addresses.relay])),
   );
   const afterWalk = await counted(async () => lonelyBet(await freshAccount()));
-  const ready = await counted(() => readyPair());
-  const paths = { lapsed, atReadA, afterWalk, ready: { state: ready.state, inRange: ready.requests >= 9 && ready.requests <= 12, requests: ready.requests } };
+  const ready = await counted(() => readyPair(), async () => undefined, true);
+  const paths = { lapsed, atReadA, afterWalk, ready: { state: ready.state, inRange: ready.requests >= 9 && ready.requests <= 12, requests: ready.requests, senderReads: ready.senderReads } };
   console.log(`# node requests by path: ${JSON.stringify(paths)}`);
+  assert.deepEqual(ready.senderReads, { tip: 1, keyCounts: 2 }, `the sender's two reads, beside the check's own count at H: ${JSON.stringify(paths)}`);
   assert.deepEqual(
     { lapsed, atReadA, afterWalk, ready: { state: ready.state, inRange: paths.ready.inRange } },
-    { lapsed: { state: 'lapsed', requests: 1 }, atReadA: { state: 'refused', requests: 2 }, afterWalk: { state: 'refused', requests: 3 }, ready: { state: 'not sent', inRange: true } },
+    { lapsed: { state: 'lapsed', requests: 1 }, atReadA: { state: 'refused', requests: 2 }, afterWalk: { state: 'refused', requests: 3 }, ready: { state: 'confirmed', inRange: true } },
     `requests by path: ${JSON.stringify(paths)}`,
   );
 });
