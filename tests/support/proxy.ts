@@ -78,6 +78,11 @@ export interface ChainProxy {
   /** The block the proxy answers for the `finalized` tag: by number, read from the node on each request. Null: pass the tag on. */
   setFinal(number: bigint | null): void;
   /**
+   * The `finalized` tag answered as the block this many below the latest, read from the node on each request: a chain
+   * whose final block follows its head, as Polygon's does. Null: lift it. `setFinal` with a number wins over it.
+   */
+  finalFollows(lag: bigint | null): void;
+  /**
    * Hold every request of the method until `release` is called; `arrived` resolves when the first such request has
    * arrived. `release(then)` lets the held requests go on under `then` (a rule left in force for the method), or under
    * no rule: passed on to the node. With `when`, only the requests it picks by their params are held, and `arrived`
@@ -107,6 +112,7 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
   const rules = new Map<string, Rule>();
   const counted: Counted[] = [];
   let finalNumber: bigint | null = null;
+  let finalLag: bigint | null = null;
 
   async function upstream(body: string): Promise<string> {
     const target = new URL(upstreamUrl);
@@ -184,6 +190,13 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       const text = await upstream(JSON.stringify({ jsonrpc: '2.0', id: req.id, method: 'eth_getBlockByNumber', params: [`0x${finalNumber.toString(16)}`, params[1] ?? false] }));
       return { text, how: 'answered' };
     }
+    if (req.method === 'eth_getBlockByNumber' && params[0] === 'finalized' && finalLag !== null) {
+      const head = JSON.parse(await upstream(JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'eth_blockNumber', params: [] }))) as { result: string };
+      const latest = BigInt(head.result);
+      const at = latest > finalLag ? latest - finalLag : 0n;
+      const text = await upstream(JSON.stringify({ jsonrpc: '2.0', id: req.id, method: 'eth_getBlockByNumber', params: [`0x${at.toString(16)}`, params[1] ?? false] }));
+      return { text, how: 'answered' };
+    }
     return { text: await upstream(raw), how: 'passed' };
   }
 
@@ -254,6 +267,9 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
     },
     setFinal(number) {
       finalNumber = number;
+    },
+    finalFollows(lag) {
+      finalLag = lag;
     },
     hold(method, when) {
       let release = () => undefined as void;

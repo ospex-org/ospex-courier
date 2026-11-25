@@ -55,8 +55,26 @@ function launchCourier(env: Stack['env'], options: { hooked?: boolean; holds?: s
   return options.hooked === true || options.holds !== undefined ? startHookedCourier(env, options.holds ?? '') : startCourier(env);
 }
 
-export async function startStack(prefix: string, options: { hooked?: boolean; holds?: string; genesisTime?: bigint; coin?: 'TestCoin' | 'RefusingCoin' | 'FalseCoin' } = {}): Promise<Stack> {
-  const rig = await startRig({ ...(options.genesisTime === undefined ? {} : { genesisTime: options.genesisTime }), ...(options.coin === undefined ? {} : { coin: options.coin }) });
+/**
+ * The stack's options. `blockTime` mines a block every so many seconds with the pool open, as the sender's tests need;
+ * `sending` is a stack whose courier sends, where each test counts its signatures and hand-offs itself and the close
+ * asserts nothing of them.
+ */
+export interface StackOptions {
+  hooked?: boolean;
+  holds?: string;
+  genesisTime?: bigint;
+  coin?: 'TestCoin' | 'RefusingCoin' | 'FalseCoin';
+  blockTime?: number;
+  sending?: true;
+}
+
+export async function startStack(prefix: string, options: StackOptions = {}): Promise<Stack> {
+  const rig = await startRig({
+    ...(options.genesisTime === undefined ? {} : { genesisTime: options.genesisTime }),
+    ...(options.coin === undefined ? {} : { coin: options.coin }),
+    ...(options.blockTime === undefined ? {} : { blockTime: options.blockTime }),
+  });
   const proxy = await startProxy(rig.url);
   const db = testServer();
   const { name, url } = await db.createWithSchema(prefix);
@@ -115,6 +133,7 @@ export async function startStack(prefix: string, options: { hooked?: boolean; ho
       await proxy.close();
       await rig.close();
       await db.end();
+      if (options.sending === true) return;
       assert.deepEqual(sends, { eth_sendRawTransaction: 0, eth_sendTransaction: 0 }, 'the courier sent a transaction, or tried to: this build signs and sends nothing');
     },
   };
