@@ -64,11 +64,21 @@ interface Frame {
 
 const frames = (f: Frame): Frame[] => [f, ...(f.calls ?? []).flatMap(frames)];
 
+/** A transaction's receipt once the chain has mined it: at once, or a moment after the send's answer, as the local chain's versions differ. Ten seconds at most. */
+async function minedReceipt<T>(on: Rig, hash: unknown): Promise<T> {
+  for (let i = 0; i < 100; i++) {
+    const r = await on.rpc('eth_getTransactionReceipt', [hash]);
+    if (r !== null) return r as T;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error('no receipt within ten seconds');
+}
+
 test('the local chain traces a mined transaction with the call tracer: one the contract refused, to its named refusal; one given too little gas, to running out of gas', async () => {
   const data = await refusedCross(rig);
   // Mined with a fixed limit, so nothing estimates it first: the chain takes it, and it reverts.
   const refused = await rig.rpc('eth_sendRawTransaction', [await rawFrom(rig, 4, rig.addresses.relay, data, { gas: 1_000_000n, tip: 1_000_000_000n })]);
-  const r1 = (await rig.rpc('eth_getTransactionReceipt', [refused])) as { status: Hex };
+  const r1 = await minedReceipt<{ status: Hex }>(rig, refused);
   assert.equal(r1.status, '0x0', 'mined, and failed');
   const t1 = (await rig.rpc('debug_traceTransaction', [refused, { tracer: 'callTracer' }])) as Frame;
   assert.equal(typeof t1.output, 'string', JSON.stringify(t1).slice(0, 400));
@@ -76,7 +86,7 @@ test('the local chain traces a mined transaction with the call tracer: one the c
   assert.equal(named.errorName, 'OspexMatching__NothingFilled');
   // Given less gas than its work needs: mined, failed, and the trace shows the frame that ran out.
   const starved = await rig.rpc('eth_sendRawTransaction', [await rawFrom(rig, 4, rig.addresses.relay, data, { gas: 40_000n, tip: 1_000_000_000n })]);
-  const r2 = (await rig.rpc('eth_getTransactionReceipt', [starved])) as { status: Hex };
+  const r2 = await minedReceipt<{ status: Hex }>(rig, starved);
   assert.equal(r2.status, '0x0');
   const t2 = (await rig.rpc('debug_traceTransaction', [starved, { tracer: 'callTracer' }])) as Frame;
   assert.ok(frames(t2).some((f) => /out of gas/i.test(f.error ?? '')), `a frame ran out of gas: ${JSON.stringify(frames(t2).map((f) => f.error))}`);
@@ -102,7 +112,9 @@ test('on its clock the chain mines a block every two seconds with its pool open:
     const [a, b] = [await receipt(low), await receipt(high)];
     assert.equal(a.blockNumber, b.blockNumber, 'one block');
     assert.ok(Number(b.transactionIndex) < Number(a.transactionIndex), 'the higher tip first');
-    // The clock: two blocks in a row, two seconds apart.
+    // The clock: the blocks after it come on the clock, not on a transaction. A block's time is the wall clock's
+    // second when it was mined, so one gap can read a second either side of two; three gaps in a row read two each
+    // on average.
     const n = BigInt(a.blockNumber);
     const next = async (number: bigint) => {
       for (let i = 0; i < 100; i++) {
@@ -112,8 +124,10 @@ test('on its clock the chain mines a block every two seconds with its pool open:
       }
       throw new Error(`no block ${number} within ten seconds`);
     };
-    const [t0, t1] = [await next(n), await next(n + 1n)];
-    assert.equal(t1 - t0, 2n, 'two seconds');
+    const ts = [await next(n), await next(n + 1n), await next(n + 2n), await next(n + 3n)];
+    for (let i = 1; i < ts.length; i++) assert.ok((ts[i] as bigint) > (ts[i - 1] as bigint), `block ${n + BigInt(i)} after the one before it: ${ts.join(', ')}`);
+    const span = (ts[3] as bigint) - (ts[0] as bigint);
+    assert.ok(span >= 5n && span <= 7n, `three gaps of about two seconds: ${ts.join(', ')}`);
   } finally {
     await clocked.close();
   }
@@ -150,7 +164,7 @@ test("the chain's proxy: it answers the finalized tag itself; it refuses, drops,
     (e: unknown) => (e instanceof NodeFailure ? e.kind : 'other'),
   );
   await held.passed;
-  assert.notEqual(await rig.rpc('eth_getTransactionReceipt', [keccak256(raw)]), null, 'the chain has it, mined');
+  assert.notEqual(await minedReceipt(rig, keccak256(raw)), null, 'the chain has it, mined');
   held.release({ drop: true });
   assert.equal(await asked, 'unreachable', 'and the client never heard');
 
@@ -162,7 +176,7 @@ test("the chain's proxy: it answers the finalized tag itself; it refuses, drops,
     assert.equal(await rig.rpc('eth_getTransactionReceipt', [keccak256(raw2)]), null, 'the chain never saw it');
     assert.deepEqual(kept.kept, [raw2]);
     await kept.forward();
-    assert.notEqual(await rig.rpc('eth_getTransactionReceipt', [keccak256(raw2)]), null, 'handed on, and mined');
+    assert.notEqual(await minedReceipt(rig, keccak256(raw2)), null, 'handed on, and mined');
   } finally {
     kept.stop();
   }
