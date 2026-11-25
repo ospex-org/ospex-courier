@@ -202,6 +202,26 @@ test("the signer refuses before anything is signed: an object it is not told is 
   assert.equal(signed.length, 1);
 });
 
+test("a genuine call of the signer with a Cross row's fields: the nonce, the gas, the fees, the epoch and the reservation a row holds, read back from the database and made into the send's shape around the bet's orders, not sealed by the pre-check, is refused before anything is signed", async () => {
+  const held = { epoch: 3n, reservation: 41n };
+  const marks = new WeakSet<object>();
+  const { signer, signed } = signerWith(marks, held);
+  const sealed = sendOf(marks, held);
+  // The row as the database holds it, its figures in text, as a planted signed row carries them.
+  const row = { nonce: '999', gas_limit: '500000', max_fee_per_gas: '1', max_priority_fee: '1', epoch: '3', reservation: '41' };
+  const fromRow = {
+    ...sealed,
+    nonce: BigInt(row.nonce),
+    gas: { estimate: BigInt(row.gas_limit), limit: BigInt(row.gas_limit) },
+    maxFeePerGas: BigInt(row.max_fee_per_gas),
+    maxPriorityFeePerGas: BigInt(row.max_priority_fee),
+    epoch: BigInt(row.epoch),
+    reservation: BigInt(row.reservation),
+  };
+  await refusedBy(signer.signCross(fromRow), /not a send the pre-check sealed/);
+  assert.equal(signed.length, 0, 'nothing was signed');
+});
+
 test("the bytes it signs are the sealed send's: an EIP-1559 transaction from the key to the relay, calling cross, carrying no coin, on the chain's id, at the nonce, gas and fees chosen; read back by the signer, and again here; the hash is the bytes' own", async () => {
   const held = { epoch: 1n, reservation: 7n };
   const marks = new WeakSet<object>();

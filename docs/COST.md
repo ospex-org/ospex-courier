@@ -3,7 +3,9 @@
 What one request to the book costs the database, measured against the three books the plan names, two of them at
 two sizes, each in two maintenance states; and the orders table's maintenance settings, chosen with the figures in
 view. Then what one bet's check costs: its requests to the node and its commands to the database, counted by path,
-and its candidate statement, measured on the same books ("A bet's check", below).
+and its candidate statement, measured on the same books ("A bet's check", below). Then what a sent bet costs: its
+requests and commands end to end, the sender's own statements measured, the lane measured with twenty bets at once,
+and the catch-up counted apart ("A sent bet", below).
 The statement measured is the one the courier runs (`SCAN_SQL` in `courier/records/orders.ts`): the book's index
 walked in its order for one side of one market, at most 2,000 rows returned, the expired among them marked where the
 final block's time plus one has reached their expiry, the live among them passed. The test is `tests/cost.test.ts`;
@@ -156,10 +158,10 @@ pass through in the tests (`tests/lane.test.ts`, "the cost, in commands to the d
 | The candidate statement | 1 | the design |
 | The marks | 0 or 1 | the design |
 | An outcome: a lapse or a refusal | 7: `BEGIN`, the lane's lock, the bet read again, the line, the bet's state, the lane freed, `COMMIT` | the lane's cost case |
-| An outcome: ready | 9, with the Cross and its legs in one insert | the design |
+| A ready bet's check, to its result | as the ready path above; its send and its outcome are counted below ("A sent bet") | the design |
 
-With the door's, about 19 for a bet, the ordinary path in all is about 33 for a lapse, 34 for a refusal at read A,
-and 44 to 48 for a ready bet. Each attempt lost to a stop adds 5. A second round adds its own requests' bookkeeping,
+With the door's, about 19 for a bet, the ordinary path in all is about 33 for a lapse and 34 for a refusal at read A.
+A ready bet goes on to its send, counted below. Each attempt lost to a stop adds 5. A second round adds its own requests' bookkeeping,
 one candidate statement and 0 or 1 marks.
 
 ### The candidate statement, measured
@@ -192,6 +194,97 @@ reported and held to nothing, as the scan's are.
 
 Nothing. With no request, an hour of blocks writes no row and no line and makes no request to the node (the lane's
 idle case).
+
+## A sent bet
+
+What one sent bet costs, beside the check's figures above: its requests to the node, its commands to the database,
+the sender's own statements measured as the book's scan is, the lane measured with twenty bets at once, and the
+catch-up counted apart. Every figure here is the local chain's and this machine's: the rig runs the pinned Foundry's
+anvil (1.6.0-nightly on this machine, v1.10.0 in CI), whose gas schedule predates Polygon's Chicago fork, so no gas or
+POL figure below is Polygon's, and none is a figure the courier acts on. The first real bets record what was paid.
+
+### One bet, end to end
+
+Counted at the proxy and at the database's relay, from the bet's post to its Cross `confirmed`, on the rig's
+two-second clock with the final block one behind the head (`tests/userside.test.ts`, "one bet end to end").
+
+| | measured | the design's estimate |
+| -- | -- | -- |
+| Requests to the node | 30: `eth_getBlockByNumber` 8, `eth_call` 8, `eth_getTransactionCount` 6, `eth_getTransactionReceipt` 4, `eth_estimateGas` 1, `eth_maxPriorityFeePerGas` 1, `eth_sendRawTransaction` 1, `eth_getBlockByHash` 1 | 20 to 31 |
+| Commands to the database | 154 | 75 to 95 |
+| Signatures, hand-offs | 1, 1 | 1, 1 |
+
+The database's count is above the design's estimate, and is reported as measured; it includes the door, the check, the
+send's steps, each look's reads while the Cross was not yet final, and the outcome.
+
+### The check's own path, and the sender's reads in it
+
+A ready bet's check, counted from its reservation to its result, before any step of the send: 10 requests in the
+lane's cost case, inside the check's 9 to 12 above. Beside them the check now makes the sender's two reads, the key's
+count at the final block and the tip, held to exactly one of each by method (`tests/lane.test.ts`,
+`tests/precheck.test.ts`). The send's own checks then show the lane's watermark on the final block's chain: no request
+where its anchor is the final block itself, one call at the final block within 256 blocks of it, and a walk below that
+(the catch-up, below).
+
+### The sender's statements, measured
+
+Each from its own `EXPLAIN (ANALYZE, BUFFERS)`, the scan nodes' shared buffer accesses added, on a key's history of
+1,000 and of 100,000 confirmed Crosses, with four lines each and a lane shut by a line (`tests/cost-sender.test.ts`).
+
+| statement | 1,000 Crosses | 100,000 Crosses | how |
+| -- | -- | -- | -- |
+| The nonce proof's read, the key's Crosses from the lane's watermark up | 2 | 3 | `crosses_sender_nonce` |
+| A nonce's Crosses (a replacement's fees, a search's find) | 3 | 4 | `crosses_sender_nonce` |
+| The restore's hold | 1 | 1 | `events_restore_shut`, index only: empty on a database never restored |
+| The reservation's lock statement, with the drain and the hold | 5 | 5 | the lanes, which are few, and `events_restore_shut` |
+| The gate's read of the stops on the hashes it locked | 3 | 4 | `orders_pkey`, and the stops |
+
+The index `crosses_sender_nonce` is two levels deep at 100,000 and one at 1,000; each figure stays within one page a
+level of it, and the test holds them there.
+
+The marks waiting for the final block: one pass reads at most 200 of a backlog of 10,000 among 100,000 quotes, 20
+buffers, through the partial index `orders_marks_not_final`.
+
+### The lane, measured
+
+Twenty bets posted at once, each against its own quote on a market of its own, on the rig's two-second clock with
+the final block one behind the head (`tests/lane-measured.test.ts`): 7 sent and settled, 6 of them confirmed, and 13
+lapsed at their turn (by the order they were posted: 2, 4 to 7, 13 to 20); 11.9 Crosses a minute through the one lane.
+Each hop from the records' own times, the median and the most, in milliseconds:
+
+| hop | median | most |
+| -- | -- | -- |
+| The queue and the check together, from the post to the intent | 14,115 | 28,032 |
+| The intent to the signed record | 31 | 36 |
+| The gate | 10 | 12 |
+| The hand-off, to the node's answer | 15 | 17 |
+| Into a block, to the receipt first seen | 1,089 | 3,115 |
+| To final, to the outcome written | 2,066 | 4,080 |
+| The lane held, from the intent to the outcome | 3,212 | 7,251 |
+
+The lane, not the chain, is what bounds a bet's 30 seconds: behind one lane, the bets posted after the first few
+lapse at their turn. The rig's block interval is a setting, so the figures past the hand-off check the method and
+are not Polygon's.
+
+### The catch-up, counted apart
+
+Each grows with the gap it covers, not with the history.
+
+- **A walk of parent hashes past 256 blocks.** A receipt, or the lane's watermark, more than 256 blocks below the final block is
+  shown on its chain by reading the final block's parents by hash down to it, one request a block. Measured after a
+  quiet spell of 300 blocks with no bet (`tests/lane-measured.test.ts`): the next bet's send checks read 304 headers
+  by hash, and the bet after it none, the watermark raised by the bet before. On Polygon's two-second blocks a quiet
+  hour is about 1,800 such reads before the next bet can be sent.
+- **The search for what used a nonce:** about log₂ of the gap in blocks for the counts that find the block, then that
+  block in full, then its place on the final block's chain.
+- **A backlog of marks:** 200 a pass, at each read of the final block the courier makes anyway.
+- **The first start after a restore:** the count check read from the lane's older watermark; recovery looks again at a
+  gap widening to 30 seconds for as long as the process runs, and writes only what it finds.
+
+### Idle
+
+Nothing, as before. With a Cross open, the looks come at a widening gap of 30 seconds at most, and write no row (the
+user's side's idle case).
 
 ## The growth
 
