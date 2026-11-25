@@ -7,7 +7,7 @@ import { coinAmount } from '../orders/order';
 import { inLockOrder } from '../orders/stops';
 import { closeBeforeGate, crossesAtNonce, crossesOfKey, crossRow, freeLaneOfCross, lockCross, markHandingOff, writeAnswer, writeIntent, writeSigned } from '../records/crosses';
 import { firstWaitingBet, type OrderRow } from '../records/orders';
-import { free, holdBet, lockBet, lockLane, otherOpenCrosses, putBack, raiseWatermark, readLane, reserve, restoreHold, setBetState, shareLane, shutLane, take, type LaneRow, type Taken } from '../records/lanes';
+import { free, holdBet, lockBet, lockLane, lockLaneToReserve, otherOpenCrosses, putBack, raiseWatermark, readLane, reserve, restoreHold, setBetState, shareLane, shutLane, take, type LaneRow, type Taken } from '../records/lanes';
 import type { Run } from '../records/runs';
 import { failureCode, type Store } from '../records/store';
 import { onFinalChain, type Named } from '../send/chain';
@@ -265,23 +265,28 @@ export function createLane(deps: LaneDeps): Lane {
     deps.log(`lane: ${why}; this process sends nothing more until it restarts`);
   };
 
-  /** One reservation: the bet it took and the reservation, null where the queue is empty, or 'stop' where this process no longer owns the lane. At most 33 attempts. */
-  async function reserveOne(): Promise<Reserved | null | 'stop'> {
+  /**
+   * One reservation: the bet it took and the reservation, null where the queue is empty, 'settle' where an open Cross,
+   * this lane's or another's, or a restore's hold must be dealt with first, or 'stop' where this process no longer
+   * owns the lane or the lane is shut. At most 33 attempts. What decides it is read with the lane's lock, in its one
+   * statement.
+   */
+  async function reserveOne(): Promise<Reserved | null | 'stop' | 'settle'> {
     for (let attempt = 1; attempt <= 33; attempt++) {
       const { client, done } = await laneClient(store.lane);
       try {
         await client.query('BEGIN');
-        const lane = await lockLane(client, key);
+        const lane = await lockLaneToReserve(client, key);
         if (lane === null || lane.epoch !== epoch || stopped) {
           await client.query('ROLLBACK');
           return 'stop';
         }
-        if (lane.heldBet !== null || lane.openCross !== null || lane.shutLine !== null) {
+        // An open Cross, this lane's or another's (the drain), or the database-wide restore hold: settled first.
+        if (lane.openCross !== null || lane.othersOpen || lane.restoreHold !== null) {
           await client.query('ROLLBACK');
-          return 'stop';
+          return 'settle';
         }
-        // The database-wide restore hold, and the drain: no lane reserves while another lane holds an open Cross.
-        if ((await restoreHold(client)) !== null || (await otherOpenCrosses(client, key)).length > 0) {
+        if (lane.heldBet !== null || lane.shutLine !== null) {
           await client.query('ROLLBACK');
           return 'stop';
         }
@@ -815,13 +820,22 @@ export function createLane(deps: LaneDeps): Lane {
   }
 
   async function loop(): Promise<void> {
+    let settledJustNow = false;
     try {
       for (;;) {
         if (stopped) break;
         flag = false;
-        if ((await settleOpen()) === 'stop') break;
         const r = await reserveOne();
         if (r === 'stop') break;
+        if (r === 'settle') {
+          // Something is open just after it was settled: the lane goes no further until it is woken again.
+          if (settledJustNow) break;
+          // Before the lane reserves anything: every open Cross settled from the chain, or the restore's hold kept.
+          if ((await settleOpen()) === 'stop') break;
+          settledJustNow = true;
+          continue;
+        }
+        settledJustNow = false;
         if (r === null) {
           await hooks.at('after-empty-reservation', null);
           // Read after the reservation that found nothing: a wake that came meanwhile is not lost.

@@ -140,6 +140,24 @@ export async function lockLane(on: Client, key: Address): Promise<LaneRow | null
   return rows[0] === undefined ? null : toLane(rows[0] as Record<string, unknown>);
 }
 
+/**
+ * The lane's row under its lock for a reservation, with what decides whether it may reserve, in the same statement:
+ * whether another lane holds an open Cross (the drain), and the restore's line where one holds the database. One
+ * statement, as the reservation's lock was before.
+ */
+export async function lockLaneToReserve(on: Client, key: Address): Promise<(LaneRow & { othersOpen: boolean; restoreHold: number | null }) | null> {
+  const { rows } = await on.query(
+    `SELECT ${LANE_COLUMNS},
+       EXISTS (SELECT 1 FROM lanes o WHERE o.open_cross IS NOT NULL AND o.sender <> $1) AS others_open,
+       (SELECT e.number::text FROM lanes h JOIN events e ON e.number = h.shut_line WHERE e.kind = 'incident' AND e.reason = 'RESTORE_SHUT' ORDER BY e.number LIMIT 1) AS restore_hold
+     FROM lanes WHERE sender = $1 FOR UPDATE`,
+    [key.toLowerCase()],
+  );
+  const r = rows[0] as (Record<string, unknown> & { others_open: boolean; restore_hold: string | null }) | undefined;
+  if (r === undefined) return null;
+  return { ...toLane(r), othersOpen: r.others_open, restoreHold: r.restore_hold === null ? null : Number(r.restore_hold) };
+}
+
 /** The lane's row read with no lock, as the send's own checks read it before deciding: what a step decides is decided again under the lock. */
 export async function readLane(on: Client, key: Address): Promise<LaneRow | null> {
   const { rows } = await on.query(`SELECT ${LANE_COLUMNS} FROM lanes WHERE sender = $1`, [key.toLowerCase()]);
