@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import type pg from 'pg';
 import { applySchema, missingSchema, openPool, TABLES } from '../courier/records/store';
+import { closeEach } from './support/close';
 import { testServer } from './support/database';
 
 // db/schema.sql against a real Postgres: applied twice, the eleven tables, the
@@ -57,10 +58,7 @@ before(async () => {
   pool = openPool(url, null);
 });
 
-after(async () => {
-  await pool.end();
-  await db.end();
-});
+after(() => closeEach(() => pool.end(), () => db.end()));
 
 test('applied again, the schema is the same schema, and nothing is missing', async () => {
   await applySchema(pool);

@@ -6,6 +6,7 @@ import { after, before, test } from 'node:test';
 import { promisify } from 'node:util';
 import pg from 'pg';
 import { connectionSettings, databaseRefusal, errorCode, failureCode, isCertificateFailure, openPool, pinnedAuthority, POOL_WAIT_EXHAUSTED, StoreRefused } from '../courier/records/store';
+import { closeEach } from './support/close';
 import { testServer } from './support/database';
 import { makeAuthorities, startTlsFront, type TestAuthorities, type TlsFront } from './support/tls';
 
@@ -45,11 +46,7 @@ before(async () => {
   otherNameFront = await startTlsFront(serverPort, authorities.otherNameCert, authorities.otherNameKey);
 });
 
-after(async () => {
-  await front.close();
-  await otherNameFront.close();
-  await db.end();
-});
+after(() => closeEach(() => front.close(), () => otherNameFront.close(), () => db.end()));
 
 test('only the URL\'s user, password, host, port and database are read; its options cannot turn TLS off', () => {
   const settings = connectionSettings('postgres://u:p%40ss@db.example:6543/courier?sslmode=disable&ssl=0', 'AUTHORITY PEM');

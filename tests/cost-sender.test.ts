@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import pg from 'pg';
+import { closeEach } from './support/close';
 import { testServer } from './support/database';
 
 // The sender's own statements, measured: each run under EXPLAIN (ANALYZE,
@@ -22,10 +23,7 @@ before(async () => {
   await pool.query('CREATE EXTENSION IF NOT EXISTS pgstattuple');
 });
 
-after(async () => {
-  await pool?.end();
-  await db.end();
-});
+after(() => closeEach(() => pool?.end(), () => db.end()));
 
 type PlanNode = Record<string, unknown> & { Plans?: PlanNode[] };
 function* walk(node: PlanNode): Generator<PlanNode> {

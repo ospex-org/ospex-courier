@@ -355,11 +355,19 @@ export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin
     },
     createGame,
     async close() {
-      anvil.process.kill();
+      const child = anvil.process;
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      // The chain's process is held from here until it has exited, and the wait's own timer too: a file's close goes
+      // on to drop its database after this, and a test process with nothing else left to wait on would otherwise end
+      // first, with the close never finished and the database left behind.
+      child.ref();
       await new Promise<void>((resolve) => {
-        if (anvil.process.exitCode !== null) return resolve();
-        anvil.process.once('exit', () => resolve());
-        setTimeout(resolve, 2_000).unref();
+        const timer = setTimeout(resolve, 2_000);
+        child.once('exit', () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        child.kill();
       });
     },
   };

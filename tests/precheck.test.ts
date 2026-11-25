@@ -15,6 +15,7 @@ import { cancelAll, cancelOnChain, contractHash, crossFromTheTest, grantAgent, l
 import { postStop as postStopFrom, stopMessage } from './support/stops';
 import type { ChainProxy } from './support/proxy';
 import type { Rig } from './support/rig';
+import { closeEach } from './support/close';
 import { publishedList, startStack, type Stack } from './support/stack';
 
 // The bet's check, from what a user would see: a signed order posted over
@@ -59,10 +60,7 @@ before(async () => {
   pool = openPool(stack.databaseUrl, null);
 });
 
-after(async () => {
-  await pool?.end();
-  await stack?.close();
-});
+after(() => closeEach(() => pool?.end(), () => stack?.close()));
 
 /** A fresh account of the rig's mnemonic, funded: coin, an allowance to the positions contract, the relay registered. */
 let nextAccount = 40;

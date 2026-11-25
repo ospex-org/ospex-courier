@@ -9,6 +9,7 @@ import { CROSS_SELECTOR } from '../courier/send/signer';
 import { get as getFrom, type CourierProcess, type HookControl } from './support/courier';
 import { testAccountKey, testKeystoreFor } from './support/keystore';
 import { orderOn, postOrder as postOrderFrom, type Order } from './support/orders';
+import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
 
 // What the key signs, on the stack: only one Cross, to the relay read at
@@ -54,10 +55,7 @@ before(async () => {
   pool = new pg.Pool({ connectionString: stack.databaseUrl, max: 2 });
 });
 
-after(async () => {
-  await pool?.end();
-  await stack?.close();
-});
+after(() => closeEach(() => pool?.end(), () => stack?.close()));
 
 let nextAccount = 40;
 async function fresh(): Promise<HDAccount> {

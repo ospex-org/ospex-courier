@@ -5,6 +5,7 @@ import type { HDAccount } from 'viem/accounts';
 import pg from 'pg';
 import type { HookControl } from './support/courier';
 import { orderOn, postOrder as postOrderFrom, type Order } from './support/orders';
+import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
 
 // A Cross's outcome, from the chain's own evidence at a final block on F's
@@ -34,10 +35,7 @@ before(async () => {
   pool = new pg.Pool({ connectionString: stack.databaseUrl, max: 2 });
 });
 
-after(async () => {
-  await pool?.end();
-  await stack?.close();
-});
+after(() => closeEach(() => pool?.end(), () => stack?.close()));
 
 let nextAccount = 40;
 async function fresh(): Promise<HDAccount> {

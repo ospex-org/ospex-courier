@@ -9,6 +9,7 @@ import { openPool } from '../courier/records/store';
 import { get as getFrom, startHookedCourier, type CourierProcess, type HookControl } from './support/courier';
 import { cancelOnChain, orderOn, postOrder as postOrderFrom, type Order } from './support/orders';
 import type { Rig } from './support/rig';
+import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
 import { postStop as postStopFrom, stopMessage } from './support/stops';
 
@@ -57,10 +58,7 @@ before(async () => {
   pool = openPool(stack.databaseUrl, null);
 });
 
-after(async () => {
-  await pool?.end();
-  await stack?.close();
-});
+after(() => closeEach(() => pool?.end(), () => stack?.close()));
 
 let nextAccount = 60;
 async function freshAccount(): Promise<HDAccount> {

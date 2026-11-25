@@ -4,6 +4,7 @@ import pg from 'pg';
 import type { HDAccount } from 'viem/accounts';
 import type { HookControl } from './support/courier';
 import { orderOn, postOrder as postOrderFrom, type Order } from './support/orders';
+import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
 
 // The lane, measured: twenty bets posted at once, each against its own quote
@@ -26,10 +27,7 @@ before(async () => {
   pool = new pg.Pool({ connectionString: stack.databaseUrl, max: 2 });
 });
 
-after(async () => {
-  await pool?.end();
-  await stack?.close();
-});
+after(() => closeEach(() => pool?.end(), () => stack?.close()));
 
 const FINAL = ['confirmed', 'reverted', 'not sent', 'expired unmined', 'replaced'];
 

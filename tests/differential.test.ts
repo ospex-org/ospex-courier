@@ -7,6 +7,7 @@ import { openPool } from '../courier/records/store';
 import { get as getFrom, type HookControl } from './support/courier';
 import { orderOn, postOrder as postOrderFrom, sign, type Order, type Signed } from './support/orders';
 import type { Rig } from './support/rig';
+import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
 
 // The walk and the netted pull against the contract itself: within the
@@ -61,10 +62,7 @@ before(async () => {
   pool = openPool(stack.databaseUrl, null);
 });
 
-after(async () => {
-  await pool?.end();
-  await stack?.close();
-});
+after(() => closeEach(() => pool?.end(), () => stack?.close()));
 
 /** A small, fixed-seed generator: the same seed, the same cases, every run. */
 function generator(seed: number) {

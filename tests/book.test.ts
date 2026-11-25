@@ -8,6 +8,7 @@ import { openPool } from '../courier/records/store';
 import { get, startCourier } from './support/courier';
 import { cancelAll, cancelOnChain, contractHash, crossFromTheTest, grantAgent, hashesOf, liftCap, nextOrderNumber, nonceOf, orderOn, postOrder, postOrderAs, raiseFloor, sign, type Order } from './support/orders';
 import type { Rig } from './support/rig';
+import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
 
 // The book, read from a user's side: real quotes posted through the door, a
@@ -34,10 +35,7 @@ before(async () => {
   await liftCap(rig);
 });
 
-after(async () => {
-  await pool?.end();
-  await stack?.close();
-});
+after(() => closeEach(() => pool?.end(), () => stack?.close()));
 
 const url = () => stack.courier.url;
 

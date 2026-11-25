@@ -3,11 +3,12 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
+import { closeEach } from './close';
 import { testServer } from './database';
 import { startCourier, startHookedCourier, type CourierProcess, type HookControl } from './courier';
 import { testKeystoreFor } from './keystore';
 export type { CourierProcess };
-import { startProxy, type ChainProxy } from './proxy';
+import { startProxy, type ChainProxy, type Sends } from './proxy';
 import { startRig, type Rig } from './rig';
 import { startTcpRelay, type TcpRelay } from './tcp';
 
@@ -103,10 +104,12 @@ export async function startStack(prefix: string, options: StackOptions = {}): Pr
   try {
     courier = await launchCourier(env, options);
   } catch (err) {
-    await dbRelay.close();
-    await proxy.close();
-    await rig.close();
-    await db.end();
+    await closeEach(
+      () => dbRelay.close(),
+      () => proxy.close(),
+      () => rig.close(),
+      () => db.end(),
+    ).catch(() => undefined);
     throw err;
   }
   const stack: Stack = {
@@ -126,25 +129,30 @@ export async function startStack(prefix: string, options: StackOptions = {}): Pr
       return stack.courier;
     },
     async close() {
-      await stack.courier.stop();
-      // Counted once the courier has stopped, so a send in flight at the close is in the count too.
-      const sends = proxy.sends();
-      console.log(`# the courier's sends through the proxy (${prefix}): eth_sendRawTransaction ${sends.eth_sendRawTransaction}, eth_sendTransaction ${sends.eth_sendTransaction}`);
-      // The Crosses the records hold as handed to the node: what the sends must be, one each.
+      let sends: Sends = { eth_sendRawTransaction: 0, eth_sendTransaction: 0 };
       let handed = 0;
-      if (options.sending !== true) {
-        const records = new pg.Pool({ connectionString: url, max: 1 });
-        try {
-          const { rows } = await records.query<{ n: string }>('SELECT count(*)::text AS n FROM crosses WHERE hand_offs = 1');
-          handed = Number((rows[0] as { n: string }).n);
-        } finally {
-          await records.end();
-        }
-      }
-      await dbRelay.close();
-      await proxy.close();
-      await rig.close();
-      await db.end();
+      // Each step in its own try: the database is dropped whatever failed before it.
+      await closeEach(
+        () => stack.courier.stop(),
+        async () => {
+          // Counted once the courier has stopped, so a send in flight at the close is in the count too.
+          sends = proxy.sends();
+          console.log(`# the courier's sends through the proxy (${prefix}): eth_sendRawTransaction ${sends.eth_sendRawTransaction}, eth_sendTransaction ${sends.eth_sendTransaction}`);
+          // The Crosses the records hold as handed to the node: what the sends must be, one each.
+          if (options.sending === true) return;
+          const records = new pg.Pool({ connectionString: url, max: 1 });
+          try {
+            const { rows } = await records.query<{ n: string }>('SELECT count(*)::text AS n FROM crosses WHERE hand_offs = 1');
+            handed = Number((rows[0] as { n: string }).n);
+          } finally {
+            await records.end();
+          }
+        },
+        () => dbRelay.close(),
+        () => proxy.close(),
+        () => rig.close(),
+        () => db.end(),
+      );
       if (options.sending === true) return;
       assert.deepEqual(sends, { eth_sendRawTransaction: handed, eth_sendTransaction: 0 }, 'the courier sent a transaction its records do not hold as handed off once, or asked the node to sign one');
     },

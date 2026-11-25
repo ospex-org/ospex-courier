@@ -38,6 +38,7 @@ import {
   type Order,
 } from './support/orders';
 import type { Rig } from './support/rig';
+import { closeEach } from './support/close';
 import { publishedList, startStack, type Stack } from './support/stack';
 
 // The door, from a user's side: signed orders posted over HTTP to the courier
@@ -57,10 +58,7 @@ before(async () => {
   pool = openPool(stack.databaseUrl, null);
 });
 
-after(async () => {
-  await pool?.end();
-  await stack?.close();
-});
+after(() => closeEach(() => pool?.end(), () => stack?.close()));
 
 const url = () => stack.courier.url;
 

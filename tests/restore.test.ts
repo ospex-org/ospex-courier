@@ -8,6 +8,7 @@ import { RELAY_SENDER_SLOT } from '../courier/chain/abi';
 import { startHookedCourier, type CourierProcess, type HookControl } from './support/courier';
 import { testKeystoreFor } from './support/keystore';
 import { orderOn, postOrder as postOrderFrom, type Order } from './support/orders';
+import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
 import { postStop as postStopFrom, stopMessage } from './support/stops';
 
@@ -56,12 +57,7 @@ before(async () => {
   original = new pg.Pool({ connectionString: stack.databaseUrl, max: 2 });
 });
 
-after(async () => {
-  for (const c of extra) await c.stop();
-  for (const p of pools) await p.end();
-  await original?.end();
-  await stack?.close();
-});
+after(() => closeEach(...extra.map((c) => () => c.stop()), ...pools.map((p) => () => p.end()), () => original?.end(), () => stack?.close()));
 
 let nextAccount = 40;
 async function fresh(): Promise<HDAccount> {

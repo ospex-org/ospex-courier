@@ -10,6 +10,7 @@ import { readCrossReceipt } from '../courier/send/chain';
 import type { HookControl } from './support/courier';
 import { contractHash, crossFromTheTest, grantAgent, nextOrderNumber, nonceOf, orderOn, postOrder as postOrderFrom, postOrderAs as postOrderAsFrom, sign, type Order } from './support/orders';
 import { artifact, TIMELOCK_DELAY, type Rig } from './support/rig';
+import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
 
 // A sent Cross's outcome from the chain's own evidence at a final block on F's chain, and its record from the
@@ -43,10 +44,7 @@ before(async () => {
   pool = new pg.Pool({ connectionString: stack.databaseUrl, max: 2 });
 });
 
-after(async () => {
-  await pool?.end();
-  await stack?.close();
-});
+after(() => closeEach(() => pool?.end(), () => stack?.close()));
 
 let nextAccount = 40;
 async function fresh(): Promise<HDAccount> {

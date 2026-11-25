@@ -6,6 +6,7 @@ import { openPool } from '../courier/records/store';
 import { get, startCourier } from './support/courier';
 import { orderOn, postOrder, type Answer } from './support/orders';
 import type { Rig } from './support/rig';
+import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
 
 // Admission: before it nothing is kept; the two budgets, rows in the
@@ -22,10 +23,7 @@ before(async () => {
   pool = openPool(stack.databaseUrl, null);
 });
 
-after(async () => {
-  await pool?.end();
-  await stack?.close();
-});
+after(() => closeEach(() => pool?.end(), () => stack?.close()));
 
 const url = () => stack.courier.url;
 

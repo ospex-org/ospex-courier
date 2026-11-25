@@ -7,6 +7,7 @@ import type { HDAccount } from 'viem/accounts';
 import pg from 'pg';
 import { get as getFrom, type HookControl } from './support/courier';
 import { orderOn, postOrder as postOrderFrom, type Order } from './support/orders';
+import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
 import { outcomes, postStop as postStopFrom, resultsOf, stopMessage } from './support/stops';
 
@@ -43,10 +44,7 @@ before(async () => {
   pool = new pg.Pool({ connectionString: stack.databaseUrl, max: 2 });
 });
 
-after(async () => {
-  await pool?.end();
-  await stack?.close();
-});
+after(() => closeEach(() => pool?.end(), () => stack?.close()));
 
 let nextAccount = 40;
 async function fresh(): Promise<HDAccount> {
