@@ -134,6 +134,25 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
   /** How many requests of each method had arrived when its current rule was set: the nth under the rule counts from there. */
   const arrivedAtRule = new Map<string, number>();
 
+  /**
+   * A request passed on to the node. The finalized tag is answered here, under any rule as without one: by the block
+   * the test named, or by the head less the lag, each read from the node by number. Every other request goes as it is.
+   */
+  async function passOn(req: JsonRpcRequest, params: unknown[], raw: string | null): Promise<{ text: string; standIn: boolean }> {
+    if (req.method === 'eth_getBlockByNumber' && params[0] === 'finalized' && finalNumber !== null) {
+      const text = await upstream(JSON.stringify({ jsonrpc: '2.0', id: req.id, method: 'eth_getBlockByNumber', params: [`0x${finalNumber.toString(16)}`, params[1] ?? false] }));
+      return { text, standIn: true };
+    }
+    if (req.method === 'eth_getBlockByNumber' && params[0] === 'finalized' && finalLag !== null) {
+      const head = JSON.parse(await upstream(JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'eth_blockNumber', params: [] }))) as { result: string };
+      const latest = BigInt(head.result);
+      const at = latest > finalLag ? latest - finalLag : 0n;
+      const text = await upstream(JSON.stringify({ jsonrpc: '2.0', id: req.id, method: 'eth_getBlockByNumber', params: [`0x${at.toString(16)}`, params[1] ?? false] }));
+      return { text, standIn: true };
+    }
+    return { text: await upstream(raw ?? JSON.stringify({ ...req, params })), standIn: false };
+  }
+
   async function answerOne(req: JsonRpcRequest, raw: string): Promise<{ text: string | null; how: Counted['how'] }> {
     const params = req.params ?? [];
     const rule = rules.get(req.method);
@@ -159,21 +178,21 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       // This request is already counted as arrived, so the nth is the count since the rule less the ones before it.
       const nth = counted.filter((c) => c.method === req.method).length - (arrivedAtRule.get(req.method) ?? 0);
       if (rule.refuse(nth)) return { text: JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: rule.code, message: rule.message } }), how: 'refused' };
-      return { text: await upstream(raw), how: 'passed' };
+      return { text: (await passOn(req, params, raw)).text, how: 'passed' };
     }
     if (rule?.kind === 'refuseIf') {
       if (rule.refuse(params)) return { text: JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: rule.code, message: rule.message } }), how: 'refused' };
-      return { text: await upstream(raw), how: 'passed' };
+      return { text: (await passOn(req, params, raw)).text, how: 'passed' };
     }
     if (rule?.kind === 'answer') {
       return { text: JSON.stringify({ jsonrpc: '2.0', id: req.id, result: rule.result(params) }), how: 'answered' };
     }
     if (rule?.kind === 'rewrite') {
-      const text = await upstream(JSON.stringify({ ...req, params: rule.params(params) }));
+      const text = (await passOn(req, rule.params(params), null)).text;
       return { text, how: 'passed' };
     }
     if (rule?.kind === 'rewriteResult') {
-      const text = await upstream(raw);
+      const text = (await passOn(req, params, raw)).text;
       const answer = JSON.parse(text) as Record<string, unknown>;
       if (!('result' in answer)) return { text, how: 'passed' };
       return { text: JSON.stringify({ ...answer, result: rule.result(params, answer.result) }), how: 'answered' };
@@ -185,19 +204,9 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       const again = await answerOne(req, raw);
       return { text: again.text, how: again.text === null ? 'dropped' : 'held' };
     }
-    // The finalized tag, answered here: the block the test named, read from the node by number.
-    if (req.method === 'eth_getBlockByNumber' && params[0] === 'finalized' && finalNumber !== null) {
-      const text = await upstream(JSON.stringify({ jsonrpc: '2.0', id: req.id, method: 'eth_getBlockByNumber', params: [`0x${finalNumber.toString(16)}`, params[1] ?? false] }));
-      return { text, how: 'answered' };
-    }
-    if (req.method === 'eth_getBlockByNumber' && params[0] === 'finalized' && finalLag !== null) {
-      const head = JSON.parse(await upstream(JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'eth_blockNumber', params: [] }))) as { result: string };
-      const latest = BigInt(head.result);
-      const at = latest > finalLag ? latest - finalLag : 0n;
-      const text = await upstream(JSON.stringify({ jsonrpc: '2.0', id: req.id, method: 'eth_getBlockByNumber', params: [`0x${at.toString(16)}`, params[1] ?? false] }));
-      return { text, how: 'answered' };
-    }
-    return { text: await upstream(raw), how: 'passed' };
+    // The finalized tag, answered here: the block the test named, or the head less the lag, read from the node by number.
+    const passed = await passOn(req, params, raw);
+    return { text: passed.text, how: passed.standIn ? 'answered' : 'passed' };
   }
 
   const server: Server = createServer((incoming, res) => {

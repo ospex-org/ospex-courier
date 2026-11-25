@@ -60,8 +60,10 @@ export interface Rig {
     timelockKey: HDAccount;
     maker: HDAccount;
     taker: HDAccount;
-    /** The relay's first sender: an address with no key in this build's courier. */
+    /** The relay's first sender: the courier's key, account 4 of the local chain's published test accounts. */
     sender: HDAccount;
+    /** Another courier's sender: the key of a second relay the funded accounts register, for the tests' own Crosses. */
+    otherSender: HDAccount;
     creator: HDAccount;
     stranger: HDAccount;
   };
@@ -78,6 +80,8 @@ export interface Rig {
     spread: Address;
     total: Address;
     relay: Address;
+    /** Another courier's relay: the tests send their own Crosses through it, so the courier's key sends only its own. */
+    otherRelay: Address;
     signpost: Address;
   };
   /** The betting entry's number on the signpost. */
@@ -179,6 +183,7 @@ export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin
     sender: account(4),
     creator: account(5),
     stranger: account(6),
+    otherSender: account(7),
   };
   const wallet = (who: HDAccount) => createWalletClient({ account: who, chain, transport });
   const rpc = async (method: string, params: unknown[]): Promise<unknown> => {
@@ -244,8 +249,9 @@ export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin
   await write(accounts.deployer, core, coreAbi, 'bootstrapModules', [types, [markets, positions, matching, moneyline, spread, total]]);
   await write(accounts.deployer, core, coreAbi, 'finalize');
 
-  // The relay, with its first sender.
+  // The relay, with its first sender; and another courier's, with a sender of its own.
   const relay = await deploy(accounts.deployer, 'OspexCourierRelay.sol', 'OspexCourierRelay', [matching, accounts.sender.address]);
+  const otherRelay = await deploy(accounts.deployer, 'OspexCourierRelay.sol', 'OspexCourierRelay', [matching, accounts.otherSender.address]);
 
   // The signpost: the games set is its first entry, written by the constructor; the betting set is added through
   // the timelock, as a set is listed live.
@@ -277,6 +283,7 @@ export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin
     await write(accounts.deployer, coin, coinAbi, 'mint', [who.address, PURSE]);
     await write(who, coin, coinAbi, 'approve', [positions, 2n ** 256n - 1n]);
     await write(who, matching, matchingAbi, 'registerCourier', [relay]);
+    await write(who, matching, matchingAbi, 'registerCourier', [otherRelay]);
   };
   for (const who of [accounts.maker, accounts.taker]) await fund(who);
   await write(accounts.deployer, coin, coinAbi, 'mint', [accounts.creator.address, PURSE]);
@@ -319,7 +326,7 @@ export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin
     anvil,
     publicClient,
     accounts,
-    addresses: { timelock, coin, reporter, games, core, markets, positions, matching, moneyline, spread, total, relay, signpost },
+    addresses: { timelock, coin, reporter, games, core, markets, positions, matching, moneyline, spread, total, relay, otherRelay, signpost },
     bettingEntryId,
     gameId,
     abis,

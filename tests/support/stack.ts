@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import pg from 'pg';
 import { testServer } from './database';
 import { startCourier, startHookedCourier, type CourierProcess, type HookControl } from './courier';
 import { testKeystoreFor } from './keystore';
@@ -14,8 +15,8 @@ import { startTcpRelay, type TcpRelay } from './tcp';
 // database with the schema applied, a relay in front of the database, and the
 // courier as its own process against the two. At its close every stack prints
 // what the courier sent through the proxy, counted as the requests arrived,
-// and asserts it sent nothing: this build holds no key and sends no
-// transaction, and the suite shows it rather than the source alone.
+// and asserts it sent no transaction but the Crosses its records hold as handed
+// to the node, each once, and never asked the node to sign anything.
 
 export interface Stack {
   rig: Rig;
@@ -129,12 +130,23 @@ export async function startStack(prefix: string, options: StackOptions = {}): Pr
       // Counted once the courier has stopped, so a send in flight at the close is in the count too.
       const sends = proxy.sends();
       console.log(`# the courier's sends through the proxy (${prefix}): eth_sendRawTransaction ${sends.eth_sendRawTransaction}, eth_sendTransaction ${sends.eth_sendTransaction}`);
+      // The Crosses the records hold as handed to the node: what the sends must be, one each.
+      let handed = 0;
+      if (options.sending !== true) {
+        const records = new pg.Pool({ connectionString: url, max: 1 });
+        try {
+          const { rows } = await records.query<{ n: string }>('SELECT count(*)::text AS n FROM crosses WHERE hand_offs = 1');
+          handed = Number((rows[0] as { n: string }).n);
+        } finally {
+          await records.end();
+        }
+      }
       await dbRelay.close();
       await proxy.close();
       await rig.close();
       await db.end();
       if (options.sending === true) return;
-      assert.deepEqual(sends, { eth_sendRawTransaction: 0, eth_sendTransaction: 0 }, 'the courier sent a transaction, or tried to: this build signs and sends nothing');
+      assert.deepEqual(sends, { eth_sendRawTransaction: handed, eth_sendTransaction: 0 }, 'the courier sent a transaction its records do not hold as handed off once, or asked the node to sign one');
     },
   };
   return stack;

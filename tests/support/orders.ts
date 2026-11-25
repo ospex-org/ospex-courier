@@ -191,14 +191,13 @@ export interface Signed {
 }
 
 /**
- * One Cross, sent by the test from the relay's sender through the relay: the
- * contract's own side of a boundary. Returns the transaction's hash where it
- * filled, or the revert where the contract refused it. The courier is not
- * involved: nothing in it signs or sends.
+ * One Cross, sent by the test through another courier the accounts register, from that courier's own sender: the
+ * contract's own side of a boundary. Returns the transaction's hash where it filled, or the revert where the contract
+ * refused it. The courier under test is not involved, and its key's line of transactions stays its own.
  */
 export async function crossFromTheTest(rig: Rig, taking: Signed, resting: Signed[]): Promise<{ filled: true; hash: Hex } | { filled: false; reason: string }> {
   try {
-    const hash = await rig.write(rig.accounts.sender, rig.addresses.relay, rig.abis.OspexCourierRelay as Abi, 'cross', [taking, resting]);
+    const hash = await rig.write(rig.accounts.otherSender, rig.addresses.otherRelay, rig.abis.OspexCourierRelay as Abi, 'cross', [taking, resting]);
     return { filled: true, hash };
   } catch (err) {
     return { filled: false, reason: err instanceof Error ? err.message : String(err) };
