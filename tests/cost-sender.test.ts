@@ -79,6 +79,17 @@ async function lay(n: number, quotes: number, marks: number): Promise<void> {
      FROM generate_series(1, $1) AS g`,
     [n, KEY],
   );
+  // The history's lines, four for each Cross as a sent bet writes them, added to the lines already there: the table is
+  // append-only, and only grows. And a lane of another key shut by a line of its own, so the hold's read finds a shut
+  // lane among them and looks its line up.
+  await pool.query(
+    `INSERT INTO events (run, kind, order_hash, bet_hash, account, game_id, reason, facts)
+     SELECT 1, k.kind, ${hex('g')}, ${hex('g')}, '0x' || repeat('0b', 20), 1, k.reason, '{}'::jsonb
+     FROM generate_series(1, $1) AS g CROSS JOIN (VALUES ('order received', NULL), ('cross sent', 'TAKEN'), ('cross pending', 'PENDING'), ('cross confirmed', 'CONFIRMED')) AS k(kind, reason)`,
+    [n],
+  );
+  const { rows } = await pool.query<{ number: string }>(`INSERT INTO events (run, kind, reason, facts) VALUES (1, 'condition opened', 'cross-unreconciled', '{}'::jsonb) RETURNING number::text AS number`);
+  await pool.query(`INSERT INTO lanes (sender, epoch, shut_line) VALUES ($1, 1, $2)`, [`0x${'16'.repeat(20)}`, (rows[0] as { number: string }).number]);
   await pool.query('ANALYZE');
 }
 
@@ -88,14 +99,19 @@ const STATEMENTS = {
   /** A nonce's Crosses: a replacement's fees, a search's find. */
   atNonce: `SELECT bet_hash, state FROM crosses c WHERE c.sender = $1 AND c.nonce = $2 ORDER BY c.bet_hash`,
   /** The restore's hold. */
-  hold: `SELECT e.number FROM lanes l JOIN events e ON e.number = l.shut_line WHERE e.kind = 'incident' AND e.reason = 'RESTORE_SHUT' ORDER BY e.number LIMIT 1`,
+  hold: `SELECT e.number::text AS number FROM events e WHERE e.kind = 'incident' AND e.reason = 'RESTORE_SHUT' ORDER BY e.number LIMIT 1`,
+  /** The reservation's lock statement: the lane's row with the drain and the hold, read with it. */
+  reservation: `SELECT epoch::text AS epoch, reservation::text AS reservation, held_bet, open_cross, shut_line::text AS shut_line,
+       EXISTS (SELECT 1 FROM lanes o WHERE o.open_cross IS NOT NULL AND o.sender <> $1) AS others_open,
+       (SELECT e.number::text FROM events e WHERE e.kind = 'incident' AND e.reason = 'RESTORE_SHUT' ORDER BY e.number LIMIT 1) AS restore_hold
+     FROM lanes WHERE sender = $1 FOR UPDATE`,
   /** The gate's read of the stops on the hashes it locked. */
   gateStops: `SELECT hash FROM orders WHERE hash = ANY($1::text[]) AND ended = 'stopped' UNION SELECT hash FROM stops WHERE hash = ANY($1::text[])`,
   /** The marks waiting for F: one pass's worth. */
   marksWaiting: `SELECT o.hash FROM orders o WHERE o.ended_block IS NOT NULL AND NOT o.ended_final AND o.ended_block <= $1 ORDER BY o.ended_block LIMIT 200`,
 } as const;
 
-test("the ordinary reads stay the same size as the key's history grows: the nonce proof's range, a nonce's Crosses, the restore's hold and the gate's read of the stops, at 1,000 and at 100,000 Crosses, each through its index, within one page a level of it; printed for the cost page", async () => {
+test("the ordinary reads stay the same size as the key's history grows: the nonce proof's range, a nonce's Crosses, the restore's hold, the reservation's lock statement and the gate's read of the stops, at 1,000 and at 100,000 Crosses with four lines each and a lane shut by a line, each through its index, within one page a level of it; printed for the cost page", async () => {
   const figures: Record<string, Record<string, { buffers: number; ms: number; scans: string }>> = {};
   for (const n of [1_000, 100_000]) {
     await lay(n, 10, 0);
@@ -105,13 +121,16 @@ test("the ordinary reads stay the same size as the key's history grows: the nonc
     assert.ok(range.scans.some((s) => s.index === 'crosses_sender_nonce'), JSON.stringify(range.scans));
     const one = await measure(STATEMENTS.atNonce, [KEY, n - 1]);
     const hold = await measure(STATEMENTS.hold, []);
+    assert.ok(!hold.scans.some((x) => x.relation === 'events' && x.node === 'Seq Scan'), `the hold's read looks the shut line up, and reads no history: ${JSON.stringify(hold.scans)}`);
+    const reservation = await measure(STATEMENTS.reservation, [KEY]);
+    assert.ok(!reservation.scans.some((x) => x.relation === 'events' && x.node === 'Seq Scan'), `the reservation reads no history: ${JSON.stringify(reservation.scans)}`);
     const gate = await measure(STATEMENTS.gateStops, [[`0x${'00'.repeat(31)}01`, `0x${'00'.repeat(31)}02`]]);
-    figures[String(n)] = { nonceRange: at(range), atNonce: at(one), hold: at(hold), gateStops: at(gate), level: { buffers: level, ms: 0, scans: 'crosses_sender_nonce tree level' } };
+    figures[String(n)] = { nonceRange: at(range), atNonce: at(one), hold: at(hold), reservation: at(reservation), gateStops: at(gate), level: { buffers: level, ms: 0, scans: 'crosses_sender_nonce tree level' } };
   }
   const small = figures['1000'] as Record<string, { buffers: number }>;
   const large = figures['100000'] as Record<string, { buffers: number }>;
   const level = (large.level as { buffers: number }).buffers;
-  for (const k of ['nonceRange', 'atNonce', 'hold', 'gateStops']) {
+  for (const k of ['nonceRange', 'atNonce', 'hold', 'reservation', 'gateStops']) {
     assert.ok(((large[k] as { buffers: number }).buffers - (small[k] as { buffers: number }).buffers) <= level + 1, `${k}: ${JSON.stringify(figures)}`);
   }
   console.log(`# the sender's ordinary reads, by history: ${JSON.stringify(figures)}`);
