@@ -200,7 +200,7 @@ async function closeIntentFound(deps: RecoveryDeps, key: Address, intent: CrossR
   const filled = (await filledAtF(deps.chain, deps.set, F, [intent.betHash])).get(intent.betHash.toLowerCase());
   if (filled === undefined) return 'unresolved';
   const legs = await legsOf(deps.store.lane, intent.betHash);
-  const record = receipt.status === 'success' ? readCrossReceipt(deps.set, receipt) : null;
+  const record = receipt.status === 'success' ? readCrossReceipt(deps.set, receipt, intent.betHash) : null;
   if (record !== null && (record.legs.length !== legs.length || record.legs.some((l, i) => l.orderHash.toLowerCase() !== (legs[i] as { orderHash: Hex }).orderHash.toLowerCase()))) return 'unresolved';
   const state = receipt.status === 'success' ? 'confirmed' : 'reverted';
   await owned(deps, key, async (client) => {

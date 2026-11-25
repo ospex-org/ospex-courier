@@ -104,8 +104,23 @@ export interface CrossReceipt {
  * block hash and this transaction's hash. One direct Cross: its leg events, filled or skipped, are one for each
  * listed occurrence, in list order, a hash listed twice as two; any other count is a contradiction the caller judges.
  */
-export function readCrossReceipt(set: BettingSet, receipt: Receipt): CrossReceipt {
-  const out: CrossReceipt = { legs: [], crossed: null, pulls: new Map(), paysBack: new Map(), paysBackRefused: [], marketCreated: null };
+export function readCrossReceipt(set: BettingSet, receipt: Receipt, betHash: Hex): CrossReceipt {
+  const bet = betHash.toLowerCase();
+  return readCrossesOfReceipt(set, receipt).find((c) => c.crossed !== null && c.crossed.takingOrderHash.toLowerCase() === bet) ?? emptyCross();
+}
+
+const emptyCross = (): CrossReceipt => ({ legs: [], crossed: null, pulls: new Map(), paysBack: new Map(), paysBackRefused: [], marketCreated: null });
+
+/**
+ * Every Cross a receipt recorded, Cross by Cross, in the order of the logs. A receipt can hold more than one Cross, as
+ * a batch of calls through a relay can make; each Cross's events end at its own Crossed, so the receipt is read in
+ * those pieces and no Cross's legs, pulls or pay-backs are counted in another's. Events after the last Crossed, which
+ * a successful Cross does not leave, are a last piece with no Crossed.
+ */
+export function readCrossesOfReceipt(set: BettingSet, receipt: Receipt): CrossReceipt[] {
+  const pieces: CrossReceipt[] = [];
+  let out: CrossReceipt = emptyCross();
+  let touched = false;
   const add = (m: Map<string, bigint>, k: string, v: bigint) => m.set(k, (m.get(k) ?? 0n) + v);
   const matching = set.matching.toLowerCase();
   const positions = set.positions.toLowerCase();
@@ -124,6 +139,7 @@ export function readCrossReceipt(set: BettingSet, receipt: Receipt): CrossReceip
       continue;
     }
     const a = e.args;
+    touched = true;
     if (at === matching && e.eventName === 'OrderMatched') {
       out.legs.push({ kind: 'filled', orderHash: (a.orderHash as Hex).toLowerCase() as Hex, maker: getAddress(a.maker as string), makerRisk: a.makerRisk as bigint, takerRisk: a.takerRisk as bigint, logIndex: log.logIndex });
     } else if (at === matching && e.eventName === 'OrderSkipped') {
@@ -132,6 +148,10 @@ export function readCrossReceipt(set: BettingSet, receipt: Receipt): CrossReceip
       out.legs.push({ kind: 'skipped', orderHash: (a.orderHash as Hex).toLowerCase() as Hex, account: getAddress(a.account as string), reason, logIndex: log.logIndex });
     } else if (at === matching && e.eventName === 'Crossed') {
       out.crossed = { courier: getAddress(a.courier as string), takingOrderHash: (a.takingOrderHash as Hex).toLowerCase() as Hex, taker: getAddress(a.taker as string), marketId: a.marketId as bigint, totalMakerRisk: a.totalMakerRisk as bigint, totalTakerRisk: a.totalTakerRisk as bigint };
+      // This Cross's events end here: the next ones are another Cross's.
+      pieces.push(out);
+      out = emptyCross();
+      touched = false;
     } else if (at === positions && e.eventName === 'HeldChanged') {
       const account = getAddress(a.account as string);
       if ((a.pulled as bigint) > 0n) add(out.pulls, account, a.pulled as bigint);
@@ -142,5 +162,6 @@ export function readCrossReceipt(set: BettingSet, receipt: Receipt): CrossReceip
       out.marketCreated = a.marketId as bigint;
     }
   }
-  return out;
+  if (touched) pieces.push(out);
+  return pieces;
 }

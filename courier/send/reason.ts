@@ -1,4 +1,4 @@
-import { decodeErrorResult, decodeFunctionData, keccak256, type Address, type Hex } from 'viem';
+import { decodeErrorResult, decodeFunctionData, getAddress, keccak256, type Address, type Hex } from 'viem';
 import { COIN_REFUSALS_ABI } from '../chain/abi';
 import { traceOf, type JsonRpc, type Receipt, type TraceFrame } from '../chain/rpc';
 import type { BettingSet } from '../chain/set';
@@ -171,8 +171,8 @@ export async function reasonOf(rpc: JsonRpc, set: BettingSet, key: Address, rece
         const leg = named.legs[i];
         const r = reasons[i];
         if (leg === undefined) return unavailable('the refusal lists more skips than the Cross listed quotes');
-        if (r === 'Cancelled') pinned.push({ account: leg.account, role: 'maker', act: 'cancelled on chain' });
-        else if (r === 'NoCourier') pinned.push({ account: leg.account, role: 'maker', act: "had not registered the courier's relay" });
+        if (r === 'Cancelled') pinned.push({ account: getAddress(leg.account), role: 'maker', act: 'cancelled on chain' });
+        else if (r === 'NoCourier') pinned.push({ account: getAddress(leg.account), role: 'maker', act: "had not registered the courier's relay" });
         else if (r === 'GrantGone') unknown = true;
         else if (r === 'PullRefused') {
           // The maker's pull: its frame, by its account, to the positions contract; the amount is the frame's own.
@@ -188,10 +188,10 @@ export async function reasonOf(rpc: JsonRpc, set: BettingSet, key: Address, rece
           if (frame === undefined) return unavailable("the trace stops short of the coin's frame of a maker's pull");
           const amount = (decodeFunctionData({ abi: COIN_REFUSALS_ABI, data: frame.input }).args as [Address, Address, bigint])[2];
           const coin = coinRefusal(frame);
-          affected.push({ account: leg.account, role: 'maker', pull: amount.toString(), coin });
+          affected.push({ account: getAddress(leg.account), role: 'maker', pull: amount.toString(), coin });
           const act = pullAct(coin);
           if (act === null) unknown = true;
-          else pinned.push({ account: leg.account, role: 'maker', act });
+          else pinned.push({ account: getAddress(leg.account), role: 'maker', act });
         }
       }
       return { ...base, name: short, pinnedOn: unknown ? 'unknown' : pinned, cause: unknown ? 'unknown' : pinned.length > 0 ? 'accounts' : 'depth', affected, needsLook: false };

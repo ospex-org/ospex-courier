@@ -173,7 +173,7 @@ async function ran(deps: OutcomeDeps, F: Header, cross: CrossRow, expected: Expe
     const f = await filled(deps, F, expected.betHash, []);
     return { kind: 'ran', F, status: 'reverted', receipt, record: null, betFilled: f.bet, quotesFilled: f.quotes };
   }
-  const record = readCrossReceipt(deps.set, receipt);
+  const record = readCrossReceipt(deps.set, receipt, expected.betHash);
   if (record.legs.length !== expected.legs.length || record.legs.some((l, i) => l.orderHash.toLowerCase() !== (expected.legs[i] as { orderHash: Hex }).orderHash.toLowerCase())) {
     return { kind: 'contradiction', F, facts: { ...base, why: 'the receipt does not hold one leg event for each listed occurrence, in order', events: record.legs.map((l) => l.orderHash), listed: expected.legs.map((l) => l.orderHash) } };
   }
