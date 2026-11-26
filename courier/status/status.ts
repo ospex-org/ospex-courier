@@ -49,7 +49,8 @@ export const GROWTH_RATES = {
 } as const;
 
 /**
- * The sender as the records stand: each lane's open Cross, with its state, transaction and nonce; each lane shut, with
+ * The sender as the records stand: each lane's open Cross, with its state and, once recorded, its transaction and
+ * nonce, and no bet's hash; each lane shut, with
  * the line that shut it and why (a key's nonce the records could not explain, or a restore's fence); and the
  * database-wide restore hold, where one stands.
  */
@@ -62,7 +63,8 @@ async function senderState(deps: StatusDeps): Promise<Record<string, unknown>> {
   return {
     lanes: rows.map((r) => ({
       sender: r.sender,
-      openCross: r.open_cross === null ? null : { bet: r.open_cross, state: r.state, ...(r.tx_hash === null ? {} : { txHash: r.tx_hash }), ...(r.nonce === null ? {} : { nonce: r.nonce }) },
+      // No bet's hash on the status: the record and the lines are the places for the bet's identity.
+      openCross: r.open_cross === null ? null : { state: r.state, ...(r.tx_hash === null ? {} : { txHash: r.tx_hash }), ...(r.nonce === null ? {} : { nonce: r.nonce }) },
       shut: r.shut_line === null ? null : { line: Number(r.shut_line), by: r.reason === 'RESTORE_SHUT' ? 'a restore' : r.reason === 'cross-unreconciled' ? 'a nonce of the key the records do not explain' : r.reason },
     })),
     restoreHold: restore === undefined ? null : { line: Number(restore.shut_line), note: 'no lane, old or new, reserves, signs or hands off on this database, and the door takes no new bet' },

@@ -36,12 +36,17 @@ const from = () => {
 
 /** The status's lanes, as the courier serves them. */
 async function lanes(): Promise<Array<{ sender: string; openCross: Record<string, unknown> | null; shut: unknown }>> {
-  const status = await getFrom(stack.courier.url, '/v1/status', from());
-  assert.equal(status.status, 200, JSON.stringify(status.body));
-  return ((status.body.sender as { lanes: Array<{ sender: string; openCross: Record<string, unknown> | null; shut: unknown }> }).lanes);
+  return (await statusBody()).lanes;
 }
 
-test("the status while a Cross the node answered with a named error is held: the lane's open Cross reads unknown, with its transaction and nonce, and the lane is not shut; at the outcome, the lane has no open Cross", async () => {
+/** The status's sender part, and the whole body as text. */
+async function statusBody(): Promise<{ lanes: Array<{ sender: string; openCross: Record<string, unknown> | null; shut: unknown }>; text: string }> {
+  const status = await getFrom(stack.courier.url, '/v1/status', from());
+  assert.equal(status.status, 200, JSON.stringify(status.body));
+  return { lanes: (status.body.sender as { lanes: Array<{ sender: string; openCross: Record<string, unknown> | null; shut: unknown }> }).lanes, text: JSON.stringify(status.body).toLowerCase() };
+}
+
+test("the status while a Cross the node answered with a named error is held: the lane's open Cross reads unknown, with its transaction and nonce and no bet's hash, and the lane is not shut; at the outcome, the lane's open Cross is null", async () => {
   const market = w.market();
   await w.quoteIn(market);
   const B = w.people().bettor;
@@ -52,9 +57,12 @@ test("the status while a Cross the node answered with a named error is held: the
   try {
     bet = await w.post(B, made);
     const c = await w.heldUnknown(bet, 'max fee per gas less than block base fee');
-    const lane = (await lanes()).find((l) => l.sender === stack.rig.accounts.sender.address.toLowerCase());
-    assert.ok(lane !== undefined, 'the lane is on the status');
-    assert.deepEqual([lane.openCross?.state, lane.openCross?.txHash, lane.openCross?.nonce], ['unknown', c.tx_hash, c.nonce], JSON.stringify(lane));
+    const seen = await statusBody();
+    const lane = seen.lanes.find((l) => l.sender === stack.rig.accounts.sender.address.toLowerCase());
+    assert.ok(lane !== undefined && lane.openCross !== null, 'the lane is on the status, with its open Cross');
+    assert.deepEqual([lane.openCross.state, lane.openCross.txHash, lane.openCross.nonce], ['unknown', c.tx_hash, c.nonce], JSON.stringify(lane));
+    assert.equal('bet' in lane.openCross, false, "no bet on the open Cross: the property is absent");
+    assert.ok(!seen.text.includes(bet.hash.slice(2)), "the bet's hash is nowhere on the status");
     assert.equal(lane.shut, null, 'the lane is not shut');
   } finally {
     stack.proxy.rule('eth_sendRawTransaction', null);
