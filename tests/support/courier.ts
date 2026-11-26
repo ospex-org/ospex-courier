@@ -3,6 +3,7 @@ import { afterEach } from 'node:test';
 import pg from 'pg';
 import { isAddress, type Hex } from 'viem';
 import type { HoldPoint } from '../../courier/check/hooks';
+import { allJournals, type JournalEntry } from './journal';
 import { testKeystoreFor } from './keystore';
 
 // The courier under test, started as its own process through its real entry
@@ -116,7 +117,7 @@ async function launch(entry: string, env: CourierEnv & { COURIER_TEST_HOLDS?: st
   const lines: string[] = [];
   // When each line arrived, for the print of a failed case alone: the lines themselves are what the tests read.
   const times: number[] = [];
-  const record: Started = { number: started.length + 1, entry, child, lines, times, url: null, databaseUrl: childEnv.DATABASE_URL, from: 0, withheld: withheldOf(childEnv) };
+  const record: Started = { number: started.length + 1, entry, child, lines, times, url: null, databaseUrl: childEnv.DATABASE_URL, launchedAt: Date.now(), listeningAt: null, checkPrinted: false, from: 0, withheld: withheldOf(childEnv) };
   started.push(record);
   const hooks = ipc ? control(child, () => lines) : null;
   // The courier never outlives the test process; the listener leaves with the child, so a file that starts many
@@ -152,6 +153,7 @@ async function launch(entry: string, env: CourierEnv & { COURIER_TEST_HOLDS?: st
     setTimeout(() => reject(new Error(`the courier did not listen within 60 seconds; its lines: ${lines.join(' | ')}`)), 60_000).unref();
   });
   record.url = `http://127.0.0.1:${port}`;
+  record.listeningAt = Date.now();
 
   return {
     port,
@@ -176,9 +178,15 @@ async function launch(entry: string, env: CourierEnv & { COURIER_TEST_HOLDS?: st
 // before this one ended (the first case gets its start's lines), each with the time it arrived; and, while it still
 // runs, what its status address says of its node check and its lane: the parts of the check that did not pass,
 // whether the lane takes bets, and the line that shut it, read whole from the courier's database. So a post answered
-// 503 NODE_UNUSABLE or NOT_TAKING_BETS where the case expected otherwise says why. All of it is read after the case
-// has failed, never during a case: no case's requests, waits or expected values change, and a case that passes prints
-// nothing. The print fails no case.
+// 503 NODE_UNUSABLE or NOT_TAKING_BETS where the case expected otherwise says why. Where the check failed, the first
+// failed case prints it whole, every part with its verdict, and the requests it made, each with its times and the
+// block it named. From the courier's database: each lane's row (its held bet, reservation, epoch and watermark), and
+// each Cross made in the case or open in a lane, with the nonce proof its send recorded. From each chain proxy's
+// journal (tests/support/journal.ts): every change of its rules in the case, the final block it held by number and by
+// hash, and any request that crossed a change; and, in order, the courier's reads of the key's count, of a block's
+// header and of a receipt: the block each named, and the number, hash or count each answer gave. All of it is read
+// after the case has failed, never during a case: no case's requests, waits or expected values change, and a case
+// that passes prints nothing. The print fails no case.
 
 interface Started {
   number: number;
@@ -190,6 +198,11 @@ interface Started {
   url: string | null;
   /** The database it was given, where the line that shut its lane is read. */
   databaseUrl: string | undefined;
+  /** When it was started, and when it listened: its node check is made between the two. */
+  launchedAt: number;
+  listeningAt: number | null;
+  /** Whether its failed node check has been printed whole. */
+  checkPrinted: boolean;
   /** How many of its lines there were when the last case ended. */
   from: number;
   /** The values it was handed that a print never carries, each with the name printed in its place. */
@@ -210,12 +223,22 @@ interface CaseContext {
   diagnostic?: (message: string) => void;
 }
 
+/** When the case before this one ended: the window of a failed case's print starts there. */
+let caseFrom = Date.now();
+
 afterEach(async (context) => {
   const t = context as unknown as CaseContext;
   const ends = started.map((s) => s.lines.length);
+  const now = Date.now();
   try {
     if (t.passed === false) {
-      for (const s of started) await printCourier((m) => t.diagnostic?.(m), s);
+      const say = (m: string) => t.diagnostic?.(m);
+      const databases = new Set<string>();
+      for (const s of started) {
+        if ((await printCourier(say, s)) && s.databaseUrl !== undefined) databases.add(s.databaseUrl);
+      }
+      for (const url of databases) await printRecords(say, url, caseFrom, started.find((s) => s.databaseUrl === url)?.withheld ?? []);
+      await printJournals(say, caseFrom, now);
     }
   } catch (err) {
     try {
@@ -227,15 +250,16 @@ afterEach(async (context) => {
     started.forEach((s, i) => {
       s.from = ends[i] ?? s.lines.length;
     });
+    caseFrom = Date.now();
   }
 });
 
-/** One courier's print for a failed case: its lines since the case before ended, and its status while it runs. */
-async function printCourier(say: (message: string) => void, s: Started): Promise<void> {
+/** One courier's print for a failed case: its lines since the case before ended, and its status while it runs. Says whether it printed. */
+async function printCourier(say: (message: string) => void, s: Started): Promise<boolean> {
   const running = s.child.exitCode === null && s.child.signalCode === null;
   const from = s.from <= s.lines.length ? s.from : 0;
   const end = s.lines.length;
-  if (end === from && !running) return;
+  if (end === from && !running) return false;
   const state = running ? 'running' : `exited (${s.child.signalCode ?? s.child.exitCode})`;
   say(`the courier ${s.number} (${s.entry}, process ${s.child.pid ?? 'without an id'}, ${state}): ${end - from} line${end - from === 1 ? '' : 's'} since the case before this one ended`);
   const cut = end - from > PRINT_FIRST + PRINT_LAST;
@@ -249,6 +273,85 @@ async function printCourier(say: (message: string) => void, s: Started): Promise
     const status = await statusOf(s.url);
     say(`the courier ${s.number}'s status: ${printable(status.text, s.withheld)}`);
     if (status.shutLines.length > 0) say(`the courier ${s.number}'s lane shut by: ${printable(await linesOf(s.databaseUrl, status.shutLines), s.withheld)}`);
+    if (status.node !== null && status.node.usable === false && !s.checkPrinted) {
+      s.checkPrinted = true;
+      printCheckWhole(say, s, status.node);
+    }
+  }
+  return true;
+}
+
+/** The node check made at the courier's start, whole: every part with its verdict, the passing ones too; and the requests it made, each with its times and the block it named. */
+function printCheckWhole(say: (message: string) => void, s: Started, node: Record<string, unknown> & { verdicts?: unknown }): void {
+  const part = (v: unknown) => (typeof v === 'object' && v !== null ? `${(v as { ok?: unknown }).ok === true ? 'passed' : 'FAILED'}: ${String((v as { saw?: unknown }).saw)}` : String(v));
+  say(`the courier ${s.number}'s node check, whole: usable ${String(node.usable)}; made at ${String(node.checkedAt)}; latest ${JSON.stringify(node.latest)}; back ${JSON.stringify(node.back)}`);
+  for (const v of Array.isArray(node.verdicts) ? (node.verdicts as Array<Record<string, unknown>>) : []) {
+    say(`  ${String(v.request)}: at latest ${part(v.atLatest)}; at the block back ${part(v.atBlockBack)}; at the unknown hash ${part(v.atUnknownHash)}`);
+  }
+  for (const name of ['relaySenderSlot', 'overrideTaken', 'timedCall', 'finalized', 'baseFee', 'tip', 'trace']) say(`  ${name}: ${part(node[name])}`);
+  const to = s.listeningAt ?? Date.now();
+  for (const j of allJournals()) {
+    const made = j.entries.filter((e) => e.arrivedAt >= s.launchedAt && e.arrivedAt <= to);
+    if (made.length === 0) continue;
+    say(`the requests the courier ${s.number} made at its start, through ${j.label}, from ${clock(s.launchedAt)} to ${clock(to)}: ${made.length}`);
+    for (const e of made.slice(0, 120)) say(`  ${entryLine(e)}`);
+    if (made.length > 120) say(`  … ${made.length - 120} more left out …`);
+  }
+}
+
+/** One request of a journal, as printed: its number, times, method, the block or transaction it named, how, and what its answer said. */
+function entryLine(e: JournalEntry): string {
+  return printable(`#${e.n} ${clock(e.arrivedAt)} to ${e.answeredAt === null ? 'not answered' : clock(e.answeredAt)} ${e.method}${e.named === null ? '' : ` at ${e.named}`}: ${e.how}${e.answer === null ? '' : `, ${e.answer}`}`, []);
+}
+
+/** The reads a failed case prints from each journal, in order: the key's count, a block's header, and a receipt. */
+const READS = new Set(['eth_getTransactionCount', 'eth_getBlockByNumber', 'eth_getBlockByHash', 'eth_getTransactionReceipt']);
+
+/** Each proxy's journal in the case's window: its rule changes, with any request that crossed one, and the courier's reads. */
+async function printJournals(say: (message: string) => void, from: number, to: number): Promise<void> {
+  for (const j of allJournals()) {
+    const changes = j.rules.filter((r) => r.at >= from && r.at <= to);
+    const reads = j.entries.filter((e) => e.arrivedAt >= from && e.arrivedAt <= to && READS.has(e.method));
+    if (changes.length === 0 && reads.length === 0) continue;
+    say(`${j.label}: ${changes.length} change${changes.length === 1 ? '' : 's'} of its rules and ${reads.length} read${reads.length === 1 ? '' : 's'} of a count, a header or a receipt in the case`);
+    for (const r of changes) {
+      const held = r.finalNumber === undefined ? '' : `; block ${r.finalNumber}'s hash on the chain now: ${(await j.blockHash(r.finalNumber)) ?? 'not read'}`;
+      say(printable(`  ${clock(r.at)} the rule changed: ${r.what}${held}`, []));
+      for (const e of j.entries.filter((x) => x.arrivedAt < r.at && (x.answeredAt === null || x.answeredAt > r.at))) say(`    crossed it: ${entryLine(e)}`);
+    }
+    const cut = reads.length > PRINT_FIRST + PRINT_LAST;
+    const shown = cut ? [...reads.slice(0, PRINT_FIRST), null, ...reads.slice(reads.length - PRINT_LAST)] : reads;
+    for (const e of shown) say(e === null ? `  … ${reads.length - PRINT_FIRST - PRINT_LAST} reads left out …` : `  ${entryLine(e)}`);
+  }
+}
+
+/** From a courier's database: each lane's row, and each Cross made since `from` or open or held in a lane, with the nonce proof its send recorded. */
+async function printRecords(say: (message: string) => void, databaseUrl: string, from: number, withheld: Array<[string, string]>): Promise<void> {
+  const client = new pg.Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000, query_timeout: 5_000 });
+  try {
+    await client.connect();
+    const lanes = await client.query(
+      `SELECT sender, epoch::text AS epoch, owner_run::text AS owner_run, held_bet, reservation::text AS reservation, open_cross, reserved_at, shut_line::text AS shut_line,
+              verified_nonce_to::text AS verified_nonce_to, verified_block_number::text AS verified_block_number, verified_block_hash
+       FROM lanes ORDER BY sender`,
+    );
+    for (const r of lanes.rows) say(printable(`the lane, from the courier's database: ${JSON.stringify(r)}`, withheld));
+    const crosses = await client.query(
+      `SELECT bet_hash, lane, epoch::text AS epoch, reservation::text AS reservation, state, nonce::text AS nonce, tx_hash, hand_offs, node_answer,
+              block_number::text AS pre_check_block, block_hash AS pre_check_hash, checked -> 'send' -> 'nonce' AS nonce_proof,
+              receipt_block_number::text AS receipt_block, receipt_block_hash, final_block_number::text AS final_block, final_block_hash, not_sent_reason, created_at
+       FROM crosses
+       WHERE created_at >= to_timestamp($1::double precision / 1000)
+          OR bet_hash IN (SELECT open_cross FROM lanes WHERE open_cross IS NOT NULL UNION SELECT held_bet FROM lanes WHERE held_bet IS NOT NULL)
+       ORDER BY created_at LIMIT 10`,
+      [from],
+    );
+    for (const r of crosses.rows) say(printable(`a Cross, from the courier's database: ${JSON.stringify(r)}`, withheld));
+    if (crosses.rows.length === 0) say("no Cross was made in the case, and none is open or held in a lane, by the courier's database");
+  } catch (err) {
+    say(`the courier's database not read: ${err instanceof Error ? err.name : typeof err}`);
+  } finally {
+    await client.end().catch(() => undefined);
   }
 }
 
@@ -287,7 +390,7 @@ interface StatusRead {
  * The status address, read once with a wait of 5 seconds: the node check's parts that did not pass, and the lane; and
  * the numbers of the lines that shut a lane, or the database, where any did.
  */
-async function statusOf(url: string): Promise<{ text: string; shutLines: number[] }> {
+async function statusOf(url: string): Promise<{ text: string; shutLines: number[]; node: (Record<string, unknown> & { verdicts?: unknown }) | null }> {
   let answered: number | null = null;
   try {
     const res = await fetch(`${url}/v1/status`, { signal: AbortSignal.timeout(5_000) });
@@ -297,7 +400,7 @@ async function statusOf(url: string): Promise<{ text: string; shutLines: number[
     try {
       body = JSON.parse(text) as StatusRead;
     } catch {
-      return { text: `answered ${answered}, not as JSON: ${text.slice(0, 300)}`, shutLines: [] };
+      return { text: `answered ${answered}, not as JSON: ${text.slice(0, 300)}`, shutLines: [], node: null };
     }
     const lineOf = (v: unknown): number | null => {
       const line = typeof v === 'object' && v !== null ? (v as { line?: unknown }).line : undefined;
@@ -321,9 +424,9 @@ async function statusOf(url: string): Promise<{ text: string; shutLines: number[
               verdicts: (Array.isArray(node.verdicts) ? (node.verdicts as unknown[]) : []).filter((v) => typeof v === 'object' && v !== null && Object.values(v as Record<string, unknown>).some(notOk)),
             },
           };
-    return { text: JSON.stringify({ answered, nodeCheck, lane: body.sender?.lane ?? null, lanes: body.sender?.lanes ?? null, restoreHold: body.sender?.restoreHold ?? null }), shutLines };
+    return { text: JSON.stringify({ answered, nodeCheck, lane: body.sender?.lane ?? null, lanes: body.sender?.lanes ?? null, restoreHold: body.sender?.restoreHold ?? null }), shutLines, node };
   } catch (err) {
-    return { text: `not read${answered === null ? '' : ` (answered ${answered})`}: ${err instanceof Error ? err.name : typeof err}`, shutLines: [] };
+    return { text: `not read${answered === null ? '' : ` (answered ${answered})`}: ${err instanceof Error ? err.name : typeof err}`, shutLines: [], node: null };
   }
 }
 

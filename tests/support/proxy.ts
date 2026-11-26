@@ -1,6 +1,7 @@
 import { createServer, request as httpRequest, type Server } from 'node:http';
 import { once } from 'node:events';
 import { keccak256 } from 'viem';
+import { answerOf, namedBy, openJournal, type JournalEntry } from './journal';
 
 // A small proxy between the courier and the chain, which the tests control.
 // It counts requests and their bytes, by method, as they ARRIVE, so a request
@@ -136,6 +137,18 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
   const counted: Counted[] = [];
   let finalNumber: bigint | null = null;
   let finalLag: bigint | null = null;
+  // What this proxy saw, for the print of a failed case alone (tests/support/journal.ts): no request's answer, wait or
+  // count changes for it.
+  const journal = openJournal('the chain proxy', async (number) => {
+    try {
+      const block = (JSON.parse(await upstream(JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'eth_getBlockByNumber', params: [`0x${number.toString(16)}`, false] }))) as { result?: { hash?: string } | null }).result;
+      return block?.hash ?? null;
+    } catch {
+      return null;
+    }
+  });
+  let journalled = 0;
+  const changed = (what: string, finalAt?: bigint) => journal.rules.push({ at: Date.now(), what, ...(finalAt === undefined ? {} : { finalNumber: finalAt }) });
 
   async function upstream(body: string): Promise<string> {
     const target = new URL(upstreamUrl);
@@ -183,12 +196,14 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
     if (rule?.kind === 'dropOnce') {
       // One request only, never passed on: the rule goes as it arrives, so the next of the method passes as usual.
       rules.delete(req.method);
+      changed(`${req.method}: the drop of one request spent`);
       return { text: null, how: 'dropped' };
     }
     if (rule?.kind === 'passHold') {
       // One request only: the rule goes as this one arrives, so the next of the method passes as usual. `passed` once
       // the chain has answered it: the chain has the request; its answer waits here.
       rules.delete(req.method);
+      changed(`${req.method}: the hold of one answer spent`);
       const text = await upstream(raw);
       rule.passed();
       const { drop } = await rule.released;
@@ -266,8 +281,15 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
         ...(r.method !== 'eth_sendRawTransaction' && Array.isArray(r.params) ? { params: r.params } : {}),
       }));
       counted.push(...arrived);
+      const logged: JournalEntry[] = list.map((r) => ({ n: ++journalled, method: r.method, named: namedBy(r.method, r.params ?? []), arrivedAt: Date.now(), answeredAt: null, how: 'arrived', answer: null }));
+      journal.entries.push(...logged);
       Promise.all(list.map((r) => answerOne(r, JSON.stringify(r)))).then(
         (answers) => {
+          logged.forEach((entry, i) => {
+            entry.answeredAt = Date.now();
+            entry.how = answers[i]?.how ?? 'passed';
+            entry.answer = answerOf(entry.method, answers[i]?.text ?? null);
+          });
           if (answers.some((a) => a.text === null)) {
             // Dropped: the connection is closed with no answer at all.
             arrived.forEach((entry, i) => {
@@ -285,6 +307,7 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
           res.end(text);
         },
         () => {
+          for (const entry of logged) Object.assign(entry, { answeredAt: Date.now(), how: 'failed', answer: 'the proxy answered 502: its request to the chain failed' });
           res.writeHead(502);
           res.end();
         },
@@ -295,6 +318,7 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
   await once(server, 'listening');
   const address = server.address();
   const port = typeof address === 'object' && address !== null ? address.port : 0;
+  journal.label = `the chain proxy on port ${port}`;
 
   const count = (method?: string) => (method === undefined ? counted.length : counted.filter((c) => c.method === method).length);
 
@@ -306,6 +330,7 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       return { eth_sendRawTransaction: count('eth_sendRawTransaction'), eth_sendTransaction: count('eth_sendTransaction') };
     },
     rule(method, rule) {
+      changed(`${method}: ${rule === null ? 'its rule lifted' : `the rule ${rule.kind}`}`);
       if (rule === null) rules.delete(method);
       else {
         rules.set(method, rule);
@@ -313,12 +338,15 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       }
     },
     clear() {
+      changed('every rule lifted');
       rules.clear();
     },
     setFinal(number) {
+      changed(number === null ? 'the final block no longer held at a number' : `the final block held at ${number}`, number ?? undefined);
       finalNumber = number;
     },
     finalFollows(lag) {
+      changed(lag === null ? 'the final block no longer follows the head' : `the final block follows the head, ${lag} below it`);
       finalLag = lag;
     },
     hold(method, when) {
@@ -326,10 +354,12 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       let arrivedResolve = () => undefined as void;
       const released = new Promise<void>((resolve) => (release = resolve));
       const arrived = new Promise<void>((resolve) => (arrivedResolve = resolve));
+      changed(`${method}: the rule hold${when === undefined ? '' : ', of the requests it picks'}`);
       rules.set(method, { kind: 'hold', released, arrived: () => arrivedResolve(), ...(when === undefined ? {} : { when }) });
       return {
         arrived,
         release: (then = null) => {
+          changed(`${method}: the held requests let go${then === null ? '' : `, under the rule ${then.kind}`}`);
           if (then === null) rules.delete(method);
           else {
             rules.set(method, then);
@@ -340,10 +370,12 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       };
     },
     drop(method) {
+      changed(`${method}: the rule drop`);
       rules.set(method, { kind: 'drop' });
       arrivedAtRule.set(method, count(method));
     },
     dropNext(method) {
+      changed(`${method}: the rule drop the next`);
       rules.set(method, { kind: 'dropOnce' });
       arrivedAtRule.set(method, count(method));
     },
@@ -352,15 +384,24 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       let releaseResolve = (_: { drop: boolean }) => undefined as void;
       const passed = new Promise<void>((resolve) => (passedResolve = resolve));
       const released = new Promise<{ drop: boolean }>((resolve) => (releaseResolve = resolve));
+      changed(`${method}: the rule pass and hold the answer`);
       rules.set(method, { kind: 'passHold', passed: () => passedResolve(), released });
-      return { passed, release: (how = {}) => releaseResolve({ drop: how.drop === true }) };
+      return {
+        passed,
+        release: (how = {}) => {
+          changed(`${method}: the held answer ${how.drop === true ? 'dropped' : 'let go'}`);
+          releaseResolve({ drop: how.drop === true });
+        },
+      };
     },
     passThenError(method, error, when) {
       const forwarded: unknown[] = [];
+      changed(`${method}: the rule pass, then answer error ${error.code}${when === undefined ? '' : ', for the requests it picks'}`);
       rules.set(method, { kind: 'passThenError', code: error.code, message: error.message, ...(when === undefined ? {} : { when }), forwarded: (answer) => forwarded.push(JSON.parse(answer) as unknown) });
       return {
         forwarded,
         stop: () => {
+          changed(`${method}: the rule pass, then answer an error, lifted`);
           if (rules.get(method)?.kind === 'passThenError') rules.delete(method);
         },
       };
@@ -369,6 +410,7 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       const kept: string[] = [];
       let arrivedResolve = () => undefined as void;
       const arrived = new Promise<void>((resolve) => (arrivedResolve = resolve));
+      changed('eth_sendRawTransaction: the rule withhold');
       rules.set('eth_sendRawTransaction', {
         kind: 'withhold',
         kept: (raw) => {
@@ -388,6 +430,7 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
           return answers;
         },
         stop() {
+          changed('eth_sendRawTransaction: the rule withhold lifted');
           if (rules.get('eth_sendRawTransaction')?.kind === 'withhold') rules.delete('eth_sendRawTransaction');
         },
       };
