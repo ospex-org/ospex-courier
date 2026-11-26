@@ -39,8 +39,18 @@ interface Planned {
   buffers: number;
   /** The shared buffer accesses of its scans of tables, added, as the cost page measures a statement: a write's own accesses (the heap's free-space search, index entries, page splits) are in `buffers` and not here. */
   scanBuffers: number;
-  /** Each index's walks from its root: an index scan's loops, added by index. */
+  /**
+   * The plan's loops of each index's scans, added by index: what the plan counts, and not the searches a scan makes from
+   * the index's root, of which a scan by `= ANY` makes one for each leaf page its keys fall on.
+   */
   walks: Record<string, number>;
+  /**
+   * The gate's lookup's measure (docs/COST.md, "The gate's lookup of stopped hashes"): the shared buffer accesses, hits
+   * and reads, of each node that reads a table or an index, each its own and none twice, the heap's with the index's.
+   */
+  readerBuffers: number;
+  /** Each node of the plan that reads a table or an index, or reads any page, and that `readerBuffers` does not take. */
+  uncounted: string[];
   /** The scans of tables in its plan. */
   scanNodes: number;
   scans: string[];
@@ -51,6 +61,11 @@ const normal = (sql: string) => sql.replace(/\s+/g, ' ').trim();
 
 const RELATION_SCANS = new Set(['Seq Scan', 'Index Scan', 'Index Only Scan', 'Bitmap Heap Scan']);
 const accesses = (n: PlanNode) => Number(n['Shared Hit Blocks'] ?? 0) + Number(n['Shared Read Blocks'] ?? 0);
+/** A node's own accesses: a plan's figures for a node include its children's, so theirs are taken away. */
+const ownAccesses = (n: PlanNode) => accesses(n) - (n.Plans ?? []).reduce((sum, child) => sum + accesses(child), 0);
+/** The nodes the lookup's measure takes: the scans of a table, and the bitmap scan of an index under a table's. */
+const COUNTED_READERS = new Set([...RELATION_SCANS, 'Bitmap Index Scan']);
+const reads = (n: PlanNode) => typeof n['Relation Name'] === 'string' || typeof n['Index Name'] === 'string';
 
 function planned(message: string): Planned | null {
   const i = message.indexOf('{');
@@ -61,9 +76,14 @@ function planned(message: string): Planned | null {
     text: normal(doc['Query Text']),
     buffers: accesses(top),
     scanBuffers: [...walk(top)].filter((n) => RELATION_SCANS.has(String(n['Node Type']))).reduce((sum, n) => sum + accesses(n), 0),
+    // The number is the plan's loops of each index's scans, added by index: not the index's searches from its root.
     walks: [...walk(top)]
       .filter((n) => typeof n['Index Name'] === 'string')
       .reduce<Record<string, number>>((w, n) => ({ ...w, [String(n['Index Name'])]: (w[String(n['Index Name'])] ?? 0) + Number(n['Actual Loops'] ?? 0) }), {}),
+    readerBuffers: [...walk(top)].filter((n) => reads(n) && COUNTED_READERS.has(String(n['Node Type']))).reduce((sum, n) => sum + ownAccesses(n), 0),
+    uncounted: [...walk(top)]
+      .filter((n) => (reads(n) ? !COUNTED_READERS.has(String(n['Node Type'])) : ownAccesses(n) > 0))
+      .map((n) => `${String(n['Node Type'])}${n['Relation Name'] === undefined ? '' : ` on ${String(n['Relation Name'])}`}${n['Index Name'] === undefined ? '' : ` by ${String(n['Index Name'])}`}: ${ownAccesses(n)} of its own`),
     scanNodes: [...walk(top)].filter((n) => RELATION_SCANS.has(String(n['Node Type']))).length,
     scans: [...walk(top)]
       .filter((n) => /Scan/.test(String(n['Node Type'])))
@@ -77,10 +97,16 @@ function planned(message: string): Planned | null {
 /** One sent bet's statements, by their text: how often each ran, its largest figure, and its scans. */
 export interface Measured {
   bet: string;
-  statements: Record<string, { calls: number; buffers: number; scanBuffers: number; walks: Record<string, number>; scanNodes: number; scans: string[]; seqOrders: Array<{ loops: number; rows: number; buffers: number }> }>;
+  statements: Record<string, { calls: number; buffers: number; scanBuffers: number; walks: Record<string, number>; scanNodes: number; scans: string[]; seqOrders: Array<{ loops: number; rows: number; buffers: number }>; readerBuffers: number; uncounted: string[] }>;
   calls: number;
   buffers: number;
 }
+
+/**
+ * The gate's lookup of stopped hashes (courier/check/lane.ts): whether any of a Cross's hashes is stopped, by the order's
+ * mark or by a row in stops, read under the hash locks just before the hand-off. Named by its two reads.
+ */
+const isLookup = (t: string) => t.startsWith("SELECT hash FROM orders WHERE hash = ANY($1::text[]) AND ended = 'stopped'") && t.includes('SELECT hash FROM stops WHERE hash = ANY($1::text[])');
 
 /** The named statements, by the code's own text where it exports it, and by a fragment of it where it does not. */
 const NAMED: Record<string, (text: string) => boolean> = {
@@ -88,7 +114,21 @@ const NAMED: Record<string, (text: string) => boolean> = {
   "the outcome's marks": (t) => t === normal(MARK_ENDED_AT_FINAL_SQL),
   "the nonce's floor": (t) => t.includes('FROM crosses c WHERE c.sender = $1 AND c.nonce >= $2'),
   "the marks' read": (t) => t.includes('o.ended_block IS NOT NULL AND NOT o.ended_final AND o.ended_block <= $1'),
+  "the gate's lookup": isLookup,
 };
+
+/**
+ * The gate's lookup's budget: its shared buffer accesses an execution after vacuum, on the large books at both sizes
+ * (docs/COST.md, "The gate's lookup of stopped hashes"). A guard against a regression, measured on these books: not a
+ * bound for every size of book or of Cross.
+ */
+export const LOOKUP_BUDGET = 32;
+
+/** The gate's lookup in one sent bet: its calls, its largest execution by its own measure, its scans, and what that measure does not take. */
+const lookupOf = (m: Measured) =>
+  Object.entries(m.statements)
+    .filter(([t]) => isLookup(t))
+    .map(([, s]) => ({ calls: s.calls, readerBuffers: s.readerBuffers, scans: s.scans, uncounted: s.uncounted }));
 
 export const summary = (m: Measured) => ({
   statements: Object.keys(m.statements).length,
@@ -97,6 +137,7 @@ export const summary = (m: Measured) => ({
   scanBuffers: Object.values(m.statements).reduce((sum, s) => sum + s.scanBuffers, 0),
   named: Object.fromEntries(Object.entries(NAMED).map(([name, is]) => [name, Object.entries(m.statements).filter(([t]) => is(t)).map(([, s]) => ({ calls: s.calls, buffers: s.buffers, scanBuffers: s.scanBuffers, scans: s.scans }))])),
   largest: Object.entries(m.statements).sort((a, b) => b[1].buffers - a[1].buffers).slice(0, 3).map(([t, s]) => ({ statement: t.slice(0, 90), buffers: s.buffers, scanBuffers: s.scanBuffers, scans: s.scans })),
+  lookup: lookupOf(m),
   seqOrders: Object.entries(m.statements).filter(([, s]) => s.seqOrders.length > 0).map(([t, s]) => ({ statement: t.slice(0, 90), ran: s.seqOrders })),
 });
 
@@ -109,11 +150,24 @@ export const noSeqScanOnOrders = (m: Measured, what: string) => {
 };
 
 /**
+ * The gate's lookup, held to its budget in one sent bet: present once, every node that reads a table, an index or a page
+ * taken by its measure, and each execution within LOOKUP_BUDGET accesses.
+ */
+export const lookupWithinBudget = (m: Measured, what: string) => {
+  const found = lookupOf(m);
+  assert.equal(found.length, 1, `${what}: the gate's lookup is one statement among the bet's: ${JSON.stringify(found)}`);
+  const l = found[0] as (typeof found)[number];
+  assert.deepEqual(l.uncounted, [], `${what}: a node of the gate's lookup reads a table, an index or a page that its measure does not take: ${JSON.stringify(l)}`);
+  assert.ok(l.readerBuffers <= LOOKUP_BUDGET, `${what}: an execution of the gate's lookup read ${l.readerBuffers} shared buffers after vacuum, past its budget of ${LOOKUP_BUDGET}: ${JSON.stringify(l)}`);
+  return l;
+};
+
+/**
  * The after-vacuum figures at the two sizes, statement by statement, by the cost page's measure, its scans' shared
- * buffer accesses: the same, within one page a level of each index for each walk the statement makes of it from its
- * root, and one page a scan. A statement that looks up a row at a time walks an index once a row, so its figure grows
- * by the index's new level once a row, and by nothing else. A write's own accesses are reported beside them, and not
- * held to this.
+ * buffer accesses: the same, within one page a level of each index for each of the plan's loops of its scans of that
+ * index, and one page a scan. A statement that looks up a row at a time loops over an index once a row, so its figure
+ * grows by the index's new level once a row, and by nothing else. A write's own accesses are reported beside them, and
+ * not held to this. The gate's lookup is held to its own budget instead (lookupWithinBudget).
  */
 export function sameAtBothSizes(what: string, small: Measured, large: Measured, levelsSmall: Record<string, number>, levelsLarge: Record<string, number>, otherwise: unknown[]): Array<{ statement: string; at50000: [number, number]; at500000: [number, number]; walks: Record<string, number>; allowed: number }> {
   const deeper = (index: string) => Math.max(0, (levelsLarge[index] ?? 0) - (levelsSmall[index] ?? 0));
@@ -122,8 +176,9 @@ export function sameAtBothSizes(what: string, small: Measured, large: Measured, 
   const readsTheBook = (s: { scans: string[] }) => s.scans.some((x) => / on orders( |$)/.test(x));
   for (const [t, s] of Object.entries(large.statements)) {
     const at = small.statements[t];
-    // The books are the orders table: a statement that reads no part of it does not read the book.
-    if (at === undefined || !readsTheBook(s)) continue;
+    // The books are the orders table: a statement that reads no part of it does not read the book. The gate's lookup
+    // has a budget of its own.
+    if (at === undefined || !readsTheBook(s) || isLookup(t)) continue;
     if (paths(at) !== paths(s)) {
       otherwise.push({ statement: t.slice(0, 90), at50000: { scans: at.scans, scanBuffers: at.scanBuffers, readWhole: at.seqOrders }, at500000: { scans: s.scans, scanBuffers: s.scanBuffers } });
       continue;
@@ -131,7 +186,7 @@ export function sameAtBothSizes(what: string, small: Measured, large: Measured, 
     const allowed = Object.entries(s.walks).reduce((sum, [index, walks]) => sum + walks * deeper(index), 0) + s.scanNodes + 1;
     both.push({ statement: t.slice(0, 90), at50000: [at.scanBuffers, at.buffers], at500000: [s.scanBuffers, s.buffers], walks: s.walks, allowed });
   }
-  for (const b of both) assert.ok(b.at500000[0] - b.at50000[0] <= b.allowed, `${what}: after vacuum, its scans read ${b.at500000[0]} buffers at 500,000 against ${b.at50000[0]} at 50,000, beyond one page a level of each index a walk (${b.allowed}; walks ${JSON.stringify(b.walks)}, levels ${JSON.stringify(levelsSmall)} to ${JSON.stringify(levelsLarge)}): ${b.statement}`);
+  for (const b of both) assert.ok(b.at500000[0] - b.at50000[0] <= b.allowed, `${what}: after vacuum, its scans read ${b.at500000[0]} buffers at 500,000 against ${b.at50000[0]} at 50,000, beyond one page a level of each index a loop (${b.allowed}; the plan's loops ${JSON.stringify(b.walks)}, levels ${JSON.stringify(levelsSmall)} to ${JSON.stringify(levelsLarge)}): ${b.statement}`);
   return both.sort((a, b) => b.at500000[1] - b.at50000[1] - (a.at500000[1] - a.at50000[1]));
 }
 
@@ -202,8 +257,9 @@ export async function openSentCost(prefix: string): Promise<SentCost> {
     } finally {
       c.release();
     }
-    // The maintenance states are made here, by hand, and measured as made.
+    // The maintenance states are made here, by hand, and measured as made: the stops' as the orders'.
     await pool.query('ALTER TABLE orders SET (autovacuum_enabled = false)');
+    await pool.query('ALTER TABLE stops SET (autovacuum_enabled = false)');
     await pool.query('CREATE EXTENSION IF NOT EXISTS pgstattuple');
     // The courier's sessions opened again, so that each loads auto_explain.
     await stack.restartCourier();
@@ -239,7 +295,9 @@ export async function openSentCost(prefix: string): Promise<SentCost> {
     /**
      * `n` quotes laid in the book's market by statement, of a maker of their own, each its own hash from `base`, at
      * `tick`, expiring at `expiry`: laid after the book's live quotes, so behind them at the same tick and ahead of them
-     * at a better one.
+     * at a better one. And as many stops, under one stop message of a laid account: a stop is kept for good, so a live
+     * courier's stops are never empty. Their hashes are spread over a hash's whole range, so that the bet's and its
+     * quote's fall among them. Each table is analyzed after its lay.
      */
     async lay(book, n, tick, expiry, base) {
       await pool.query(
@@ -249,6 +307,19 @@ export async function openSentCost(prefix: string): Promise<SentCost> {
         [base, book.gameId.toString(), book.scorer, book.lineTicks, tick, expiry.toString(), book.market, book.side, n],
       );
       await pool.query('ANALYZE orders');
+      const message = await pool.query<{ id: string }>(
+        `INSERT INTO stop_messages (account, signer, message, signature) VALUES ('0x' || repeat('0b', 20), '0x' || repeat('0b', 20), $1::jsonb, '0x' || repeat('22', 65)) RETURNING id::text AS id`,
+        [JSON.stringify({ laid: base })],
+      );
+      // The first fifteen hex digits spread evenly over their whole range, g of n; the rest from g's own digests.
+      const stopped = await pool.query(
+        `INSERT INTO stops (hash, account, message_id)
+         SELECT '0x' || lpad(to_hex((g::numeric * 1152921504606846976 / $1::numeric)::bigint), 15, '0') || md5(g::text) || substr(md5('stop ' || g::text), 1, 17), '0x' || repeat('0b', 20), $2::bigint
+         FROM generate_series(0, $1::integer - 1) AS g`,
+        [n, message.rows[0]?.id],
+      );
+      assert.equal(stopped.rowCount, n, `${book.name}: the book's stops laid`);
+      await pool.query('ANALYZE stops');
     },
     /**
      * The laid quotes taken out again, the table vacuumed and its indexes built again, so the next book is measured on a
@@ -258,6 +329,14 @@ export async function openSentCost(prefix: string): Promise<SentCost> {
       await pool.query(`DELETE FROM orders WHERE hash > '0x' || lpad(to_hex($1::bigint), 64, '0') AND hash <= '0x' || lpad(to_hex($1::bigint + 99999999), 64, '0')`, [base]);
       await pool.query('VACUUM (INDEX_CLEANUP ON) orders');
       await pool.query('REINDEX TABLE orders');
+      // The book's stops, with their message.
+      const message = await pool.query<{ id: string }>('SELECT id::text AS id FROM stop_messages WHERE message = $1::jsonb', [JSON.stringify({ laid: base })]);
+      for (const { id } of message.rows) {
+        await pool.query('DELETE FROM stops WHERE message_id = $1', [id]);
+        await pool.query('DELETE FROM stop_messages WHERE id = $1', [id]);
+      }
+      await pool.query('VACUUM (INDEX_CLEANUP ON) stops');
+      await pool.query('REINDEX TABLE stops');
     },
     /** The orders table's indexes, each with its depth. */
     async levels() {
@@ -285,9 +364,11 @@ export async function openSentCost(prefix: string): Promise<SentCost> {
       for (const n of stack.dbRelay.takeNotices()) {
         const p = planned(n.message);
         if (p === null) continue;
-        const s = (out.statements[p.text] ??= { calls: 0, buffers: 0, scanBuffers: 0, walks: {}, scanNodes: 0, scans: [], seqOrders: [] });
+        const s = (out.statements[p.text] ??= { calls: 0, buffers: 0, scanBuffers: 0, walks: {}, scanNodes: 0, scans: [], seqOrders: [], readerBuffers: 0, uncounted: [] });
         s.calls += 1;
         s.buffers = Math.max(s.buffers, p.buffers);
+        s.readerBuffers = Math.max(s.readerBuffers, p.readerBuffers);
+        for (const x of p.uncounted) if (!s.uncounted.includes(x)) s.uncounted.push(x);
         // The call whose scans read most is the statement's figure, with its walks and its scans.
         if (p.scanBuffers >= s.scanBuffers) Object.assign(s, { scanBuffers: p.scanBuffers, walks: p.walks, scanNodes: p.scanNodes });
         for (const x of p.scans) if (!s.scans.includes(x)) s.scans.push(x);

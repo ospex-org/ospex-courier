@@ -290,8 +290,49 @@ What the figures show:
   reads more of the table by a sequential scan than the bound of 2,000 rows.
 
 After vacuum, the test holds each statement that reads the orders table and is planned the same way at both sizes to
-its figure at 50,000, within one page a level of each index for each walk it makes of it from its root. A write's own
-accesses (the heap's free space, index entries, page splits) are reported and not held to that.
+its figure at 50,000, within one page a level of each index for each of the plan's loops over that index. A write's own
+accesses (the heap's free space, index entries, page splits) are reported and not held to that. The gate's lookup of
+stopped hashes is held to a budget of its own instead (below).
+
+The table above was measured before the large books held stops.
+
+### The gate's lookup of stopped hashes
+
+Just before the hand-off, under the hash locks a stop takes, the courier reads whether any of the Cross's hashes is
+stopped: the bet's and each listed quote's (`courier/check/lane.ts`). It is one statement with two reads: the orders
+the hashes name that a stop has marked, by the orders table's primary key, and the stops' rows for those hashes, by
+the stops table's primary key. A stop is kept for good, so a live courier's stops table is never empty, and only grows.
+
+So the large books hold stops too: as many as each book's laid orders, under one stop message, their hashes spread over
+a hash's whole range, so that the bet's and its quote's fall among them (`tests/support/sentcost.ts`). The plan is the
+same in every book, size and state: one index scan of the orders' primary key and one index-only scan of the stops'
+primary key, each run once. Each makes one search of its index for each leaf page its keys fall on: with a bet and one
+quote, two keys, at most two searches of each. The stops' index is two levels deep at 50,000 and at 500,000 stops.
+
+Shared buffer accesses, hits and reads, of each node that reads a table or an index, each once, the heap's with the
+index's, in one sent bet (`tests/cost-sent.test.ts`, `tests/cost-sent-ended.test.ts`):
+
+| book | size | the final block held behind it | before vacuum | after vacuum |
+| -- | -- | -- | -- | -- |
+| ten live quotes, no stops | 10 | | 4 | 1 |
+| ended by the mark, ahead of ten live quotes | 50,000 | | 12 | 11 |
+| | 500,000 | | 13 | 17 |
+| expired, not yet marked, behind the bet's live quote | 50,000 | 15 | 12 | 13 |
+| | 500,000 | 17 | 13 | 18 |
+
+**The budget.** After vacuum, on both large books at both sizes, each execution of the lookup reads at most 32 shared
+buffers by that count (`LOOKUP_BUDGET` in `tests/support/sentcost.ts`), and its plan has no node that reads a table, an
+index or a page that the count does not take. Before vacuum, and on the small book, the figures are reported and not
+held. The budget guards against a regression, such as a read that grows with the book. It is not a bound for every
+size.
+
+**What still stands:**
+
+- These books measure a bet and one quote. A Cross that lists more quotes has more keys, and each read makes up to one
+  more search for each.
+- The stops' index is two levels deep here. A deeper one adds a page to each search.
+- The sender's table above measures the same statement on a key's history with no stops on record.
+- The figures are this machine's, from one run.
 
 ### The lane, measured
 

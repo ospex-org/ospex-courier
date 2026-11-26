@@ -1,16 +1,17 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
-import { noSeqScanOnOrders, openSentCost, sameAtBothSizes, summary, type Measured, type SentCost } from './support/sentcost';
+import { lookupWithinBudget, noSeqScanOnOrders, openSentCost, sameAtBothSizes, summary, type Measured, type SentCost } from './support/sentcost';
 
 // One sent bet's statements, measured, each from its own EXPLAIN (ANALYZE, BUFFERS) (tests/support/sentcost.ts), on
 // the book ended by the mark: the bet sent end to end on 50,000 and 500,000 orders ended by the mark, ahead of ten live
-// quotes, before vacuum, with the dead versions the mark leaves, and after. A file of its own, beside the small book and
+// quotes, with as many stops on record, before vacuum, with the dead versions the mark leaves, and after. A file of its own, beside the small book and
 // the backlog (tests/cost-sent.test.ts), so that neither file runs near the test's time-out on a busy machine. On the
 // book of 500,000 no statement reads more of the orders table by a sequential scan than a request's own bound of rows;
 // at 50,000 each such read is reported. After vacuum, each statement that reads the orders table and walks the same
-// indexes at both sizes reads at 500,000 what it reads at 50,000, within one page a level of each index for each walk it
-// makes of it; a statement planned otherwise at the two sizes is reported. The figures are printed for docs/COST.md, and
-// read there as this machine's.
+// indexes at both sizes reads at 500,000 what it reads at 50,000, within one page a level of each index for each of the
+// plan's loops of its scans of it; a statement planned otherwise at the two sizes is reported. The gate's lookup of
+// stopped hashes is held instead to its budget of shared buffer accesses an execution after vacuum, at both sizes;
+// before vacuum its figures are reported. The figures are printed for docs/COST.md, and read there as this machine's.
 
 let cost: SentCost;
 
@@ -37,6 +38,7 @@ for (const [k, n] of [50_000, 500_000].entries()) {
     await pool.query('VACUUM (INDEX_CLEANUP ON)');
     const after_ = await cost.sendOne(book);
     if (n === 500_000) noSeqScanOnOrders(after_, `ended ${n}, after vacuum`);
+    lookupWithinBudget(after_, `ended ${n}, after vacuum`);
     ENDED[n] = { after: after_, levels: await cost.levels() };
     cost.report[`ended ${n}`] = { before: summary(before_), after: summary(after_), levels: ENDED[n]?.levels };
     if (n === 500_000) {

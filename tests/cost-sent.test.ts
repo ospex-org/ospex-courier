@@ -1,18 +1,21 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
-import { noSeqScanOnOrders, openSentCost, sameAtBothSizes, summary, type Measured, type SentCost } from './support/sentcost';
+import { lookupWithinBudget, noSeqScanOnOrders, openSentCost, sameAtBothSizes, summary, type Measured, type SentCost } from './support/sentcost';
 
 // One sent bet's statements, measured, each from its own EXPLAIN (ANALYZE, BUFFERS) (tests/support/sentcost.ts), on
 // the small book and the backlog: the bet sent end to end on a book of ten live quotes, before and after vacuum; and on
-// 50,000 and 500,000 expired quotes not yet marked, behind the bet's live quote, first with the final block held behind
-// their expiry while the bet is checked, so that F has not passed them, then with F past them, before vacuum and after.
+// 50,000 and 500,000 expired quotes not yet marked, behind the bet's live quote, with as many stops on record, first with
+// the final block held behind their expiry while the bet is checked, so that F has not passed them, then with F past
+// them, before vacuum and after.
 // The book ended by the mark is in a file of its own (tests/cost-sent-ended.test.ts), so that neither file runs near the
 // test's time-out on a busy machine. On the books of 500,000 no statement reads more of the orders table by a
 // sequential scan than a request's own bound of rows; at 50,000 the planner may read the whole table where that costs
 // less than walking an index a row at a time, and each such read is reported. After vacuum, each statement that reads
 // the orders table and walks the same indexes at both sizes reads at 500,000 what it reads at 50,000, within one page a
-// level of each index for each walk it makes of it; a statement planned otherwise at the two sizes is reported. The
-// figures are printed for docs/COST.md, and read there as this machine's.
+// level of each index for each of the plan's loops of its scans of it; a statement planned otherwise at the two sizes
+// is reported. The gate's lookup of stopped hashes is held instead to its budget of shared buffer accesses an execution
+// after vacuum, at both sizes; before vacuum its figures are reported. The figures are printed for docs/COST.md, and
+// read there as this machine's.
 
 let cost: SentCost;
 
@@ -67,6 +70,7 @@ for (const [k, n] of [50_000, 500_000].entries()) {
     await pool.query('VACUUM (INDEX_CLEANUP ON)');
     const after_ = await cost.sendOne(book);
     if (n === 500_000) noSeqScanOnOrders(after_, `backlog ${n}, after vacuum`);
+    lookupWithinBudget(after_, `backlog ${n}, after vacuum`);
     BACKLOG[n] = { after: after_, levels: await cost.levels() };
     cost.report[`backlog ${n}`] = { heldBehind: summary(held), before: summary(before_), after: summary(after_), levels: BACKLOG[n]?.levels };
     if (n === 500_000) {
