@@ -99,8 +99,8 @@ test('the local chain honours every request at a block\'s hash, refuses a hash n
   assert.equal(proxy.count('eth_estimateGas'), 5);
   assert.equal(proxy.count('eth_getStorageAt'), 1);
   assert.equal(proxy.count('eth_getTransactionCount'), 3);
-  // The headers: latest, the block 50 back, finalized.
-  assert.equal(proxy.count('eth_getBlockByNumber'), 3);
+  // The headers: latest, the block 50 back, finalized, and latest again after it, the header the final block is held to.
+  assert.equal(proxy.count('eth_getBlockByNumber'), 4);
   // Each request named its block by a hash, required canonical, and is the one the list names: the old ones and the
   // new ones alike. A block named any other way reads as NOT BY HASH.
   const latestHash = check.latest?.hash.toLowerCase();
@@ -162,6 +162,40 @@ test('a node that ignores the hash and answers at its head is caught by the mult
     assert.equal(relay?.atBlockBack.ok, true, "the relay's own read cannot tell the blocks apart: that is why the probe exists");
   } finally {
     proxy.clear();
+  }
+});
+
+test('the check slowed past three blocks while the final block follows the head by one: its first estimate, after its read of the latest header, held while three blocks are mined; the final block is held to a header read after it, and the node is usable', async () => {
+  proxy.finalFollows(1n);
+  const held = proxy.hold('eth_estimateGas');
+  try {
+    const checking = checkNode(rpc, { relay: rig.addresses.relay, sender: rig.accounts.sender.address });
+    await held.arrived;
+    await rig.rpc('anvil_mine', ['0x3']);
+    held.release();
+    const check = await checking;
+    assert.equal(check.finalized.ok, true, JSON.stringify(check.finalized));
+    assert.equal(check.usable, true);
+  } finally {
+    proxy.clear();
+    proxy.finalFollows(null);
+  }
+});
+
+test('the control: a node whose final block is above the head it serves fails the finalized check, and is not usable', async () => {
+  const head = BigInt((await rig.rpc('eth_blockNumber', [])) as string);
+  const older = await rig.rpc('eth_getBlockByNumber', [`0x${(head - 5n).toString(16)}`, false]);
+  // The node serves its latest block five blocks back, and its final block one under the real head.
+  proxy.rule('eth_getBlockByNumber', { kind: 'rewriteResult', result: (p, result) => (p[0] === 'latest' ? older : result) });
+  proxy.finalFollows(1n);
+  try {
+    const check = await checkNode(rpc, { relay: rig.addresses.relay, sender: rig.accounts.sender.address });
+    assert.equal(check.finalized.ok, false);
+    assert.match(check.finalized.saw, /^finalized \(\d+\) is above latest \(\d+\)$/);
+    assert.equal(check.usable, false);
+  } finally {
+    proxy.clear();
+    proxy.finalFollows(null);
   }
 });
 

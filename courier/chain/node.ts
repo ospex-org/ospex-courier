@@ -261,10 +261,14 @@ export async function checkNode(rpc: JsonRpc, targets: NodeCheckTargets, now: ()
     }
   })();
 
-  // The finalized tag: a block at or under the latest.
+  // The finalized tag: a block at or under a latest header read after it, so that a check slowed past blocks does not
+  // hold a later final block to an earlier head.
   const finalized = await expectAnswer(
-    () => headerByTag(rpc, 'finalized'),
-    (h) => (h.number <= latest.number ? null : `finalized (${h.number}) is above latest (${latest.number})`),
+    async () => {
+      const final = await headerByTag(rpc, 'finalized');
+      return { final, after: await headerByTag(rpc, 'latest') };
+    },
+    ({ final, after }) => (final.number <= after.number ? null : `finalized (${final.number}) is above latest (${after.number})`),
   );
 
   // The base fee of the latest block, which the sender's fee cap is set from.
