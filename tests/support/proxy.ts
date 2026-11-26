@@ -1,7 +1,7 @@
 import { createServer, request as httpRequest, type Server } from 'node:http';
 import { once } from 'node:events';
 import { keccak256 } from 'viem';
-import { answerOf, namedBy, openJournal, type JournalEntry } from './journal';
+import { answerOf, heldChecked, namedBy, openJournal, takeHeld, type JournalEntry } from './journal';
 
 // A small proxy between the courier and the chain, which the tests control.
 // It counts requests and their bytes, by method, as they ARRIVE, so a request
@@ -104,6 +104,14 @@ export interface ChainProxy {
    * lets none go that is held already.
    */
   hold(method: string, when?: (params: unknown[]) => boolean): { arrived: Promise<void>; release(then?: Rule | null): void };
+  /**
+   * The changes seen of a final block the test held at a height and not yet said, each said whole: a hash, in an answer
+   * the proxy gave for a block at that height, other than the one the block had when it was held; or another hash at
+   * that height when the hold was let go or moved. Taking them says them; those not taken fail the case at its end.
+   */
+  heldFinalChanged(): string[];
+  /** Resolves once every check of a held final block that has begun is done: the held block's own hash read among them. */
+  heldFinalChecked(): Promise<void>;
   /** Every request of the method, from now until the rule is lifted, is dropped: its connection closed with no answer. */
   drop(method: string): void;
   /**
@@ -149,6 +157,51 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
   });
   let journalled = 0;
   const changed = (what: string, finalAt?: bigint) => journal.rules.push({ at: Date.now(), what, ...(finalAt === undefined ? {} : { finalNumber: finalAt }) });
+
+  // The final block the test holds at a height, by its hash too: the hash the block had when it was held, read from the
+  // chain past the proxy, against every block the proxy answers at that height, whatever the request named, and against
+  // the block at that height when the hold is let go or moved. A change is kept in the journal, said whole: the rig
+  // fails its case on it where it holds or lets go of the block (tests/support/named.ts, tests/support/lives.ts), and
+  // every case fails at its end on one not yet said (tests/support/journal.ts).
+  let pin: { number: bigint; kept: Promise<string | null> } | null = null;
+  const later = (work: () => Promise<void>) => {
+    const p: Promise<void> = work()
+      .catch(() => undefined)
+      .finally(() => journal.checking.delete(p));
+    journal.checking.add(p);
+  };
+  /** A block answered at the held height, or none answered for it, held to the hash the block had when it was held. */
+  function checkHeld(method: string, params: unknown[], text: string | null): void {
+    const held = pin;
+    if (held === null || text === null || method !== 'eth_getBlockByNumber') return;
+    const named = String(params[0]);
+    const forHeld = named === 'finalized' || (/^0x[0-9a-fA-F]+$/.test(named) && BigInt(named) === held.number);
+    let answered: { number: bigint; hash: string } | 'none' | null = null;
+    try {
+      const parsed = JSON.parse(text) as { result?: { number?: string; hash?: string } | null };
+      if (parsed.result === null) answered = forHeld ? 'none' : null;
+      else if (typeof parsed.result?.number === 'string' && typeof parsed.result.hash === 'string') answered = { number: BigInt(parsed.result.number), hash: parsed.result.hash.toLowerCase() };
+    } catch {
+      answered = null;
+    }
+    if (answered === null || (answered !== 'none' && answered.number !== held.number)) return;
+    const seen = answered === 'none' ? 'no block' : answered.hash;
+    later(async () => {
+      const kept = await held.kept;
+      if (kept !== null && kept !== seen) journal.held.push(`${new Date().toISOString()}: the final block held at ${held.number}, whose hash was ${kept} when it was held, was answered with ${seen}, to a request for ${named}`);
+    });
+  }
+
+  /** The chain's block at a number, read past the proxy: its hash, `no block` where the chain has none there, or null where it could not be read. */
+  async function chainBlock(number: bigint): Promise<string | null> {
+    try {
+      const parsed = JSON.parse(await upstream(JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'eth_getBlockByNumber', params: [`0x${number.toString(16)}`, false] }))) as { result?: { hash?: string } | null };
+      if (parsed.result === null) return 'no block';
+      return typeof parsed.result?.hash === 'string' ? parsed.result.hash.toLowerCase() : null;
+    } catch {
+      return null;
+    }
+  }
 
   async function upstream(body: string): Promise<string> {
     const target = new URL(upstreamUrl);
@@ -289,6 +342,7 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
             entry.answeredAt = Date.now();
             entry.how = answers[i]?.how ?? 'passed';
             entry.answer = answerOf(entry.method, answers[i]?.text ?? null);
+            checkHeld(entry.method, list[i]?.params ?? [], answers[i]?.text ?? null);
           });
           if (answers.some((a) => a.text === null)) {
             // Dropped: the connection is closed with no answer at all.
@@ -343,7 +397,31 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
     },
     setFinal(number) {
       changed(number === null ? 'the final block no longer held at a number' : `the final block held at ${number}`, number ?? undefined);
+      // The hold let go, or moved: the block at the height it held has the hash it had when it was held, or the change is kept.
+      const was = pin;
+      if (was !== null) {
+        later(async () => {
+          const kept = await was.kept;
+          const now = await chainBlock(was.number);
+          if (kept !== null && now !== null && kept !== now) journal.held.push(`${new Date().toISOString()}: the final block held at ${was.number}, whose hash was ${kept} when it was held, has ${now} at the release`);
+        });
+      }
+      if (number === null) pin = null;
+      else {
+        // A height with no block yet, or one not read, keeps no hash, and nothing is held to one there.
+        const kept = chainBlock(number).then((h) => (h === 'no block' ? null : h));
+        pin = { number, kept };
+        later(async () => {
+          await kept;
+        });
+      }
       finalNumber = number;
+    },
+    heldFinalChanged() {
+      return takeHeld(journal);
+    },
+    heldFinalChecked() {
+      return heldChecked(journal);
     },
     finalFollows(lag) {
       changed(lag === null ? 'the final block no longer follows the head' : `the final block follows the head, ${lag} below it`);

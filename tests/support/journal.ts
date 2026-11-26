@@ -1,7 +1,12 @@
+import { afterEach } from 'node:test';
+
 // What a chain proxy of the tests saw (tests/support/proxy.ts), kept for the print of a failed case alone
 // (tests/support/courier.ts): each request's method, the block or the transaction it named, when it arrived and when it
 // was answered, how, and what its answer said in typed form; and each change of the proxy's rules, with its time. Never
 // a transaction's signed bytes, a node's own words, or any value a key setting holds.
+//
+// With them, each change seen of a final block the test held at a height: a case in which one is seen fails at its end,
+// saying so, whatever else it did.
 
 export interface JournalEntry {
   n: number;
@@ -28,13 +33,18 @@ export interface Journal {
   rules: RuleChange[];
   /** The hash of the chain's block at a number, read from the chain itself, past the proxy; null where it has none. */
   blockHash(number: bigint): Promise<string | null>;
+  /** Each change seen of a final block the test held at a height, said whole; the first `heldTaken` of them already said. */
+  held: string[];
+  heldTaken: number;
+  /** The checks of a held final block that have begun and are not done. */
+  checking: Set<Promise<void>>;
 }
 
 const journals: Journal[] = [];
 
 /** A journal for one proxy, kept for this test process's life. */
 export function openJournal(label: string, blockHash: Journal['blockHash']): Journal {
-  const journal: Journal = { label, entries: [], rules: [], blockHash };
+  const journal: Journal = { label, entries: [], rules: [], blockHash, held: [], heldTaken: 0, checking: new Set() };
   journals.push(journal);
   return journal;
 }
@@ -43,6 +53,55 @@ export function openJournal(label: string, blockHash: Journal['blockHash']): Jou
 export function allJournals(): readonly Journal[] {
   return journals;
 }
+
+/** Resolves once every check of a held final block that has begun in the journal is done, those begun meanwhile too. */
+export async function heldChecked(journal: Journal): Promise<void> {
+  while (journal.checking.size > 0) await Promise.all([...journal.checking]);
+}
+
+/** The changes of a held final block not yet said; taking them says them, so each is said once. */
+export function takeHeld(journal: Journal): string[] {
+  const changes = journal.held.slice(journal.heldTaken);
+  journal.heldTaken = journal.held.length;
+  return changes;
+}
+
+/** A case's context, as its hooks read it: whether it passed, and where its notes are printed. */
+export interface CaseContext {
+  passed?: boolean;
+  diagnostic?: (message: string) => void;
+}
+
+const atEnd: Array<(failed: boolean, t: CaseContext) => Promise<void>> = [];
+
+/** Work for each case's end (the couriers' print, tests/support/courier.ts), told whether the case failed. */
+export function atCaseEnd(work: (failed: boolean, t: CaseContext) => Promise<void>): void {
+  atEnd.push(work);
+}
+
+// The one hook at each case's end: the checks of any held final block finished, the work for the case's end done with
+// what decides failure, and the case failed where a held final block changed, saying so. It is the last thing a case
+// runs, so the print comes before it.
+afterEach(async (context) => {
+  const t = context as unknown as CaseContext;
+  const changes: string[] = [];
+  for (const journal of journals) {
+    await heldChecked(journal);
+    for (const change of takeHeld(journal)) changes.push(`${journal.label}: ${change}`);
+  }
+  const failed = t.passed === false || changes.length > 0;
+  for (const work of atEnd) {
+    try {
+      await work(failed, t);
+    } catch {
+      // The work says its own failure; the case's own result stands.
+    }
+  }
+  if (changes.length > 0) {
+    for (const change of changes) t.diagnostic?.(`the final block the rig held changed: ${change}`);
+    throw new Error(`the final block the rig held changed: ${changes.join('; ')}`);
+  }
+});
 
 const decimal = (v: unknown): string => (typeof v === 'string' && /^0x[0-9a-fA-F]+$/.test(v) ? BigInt(v).toString() : String(v));
 

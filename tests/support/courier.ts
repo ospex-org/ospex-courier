@@ -1,9 +1,8 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { afterEach } from 'node:test';
 import pg from 'pg';
 import { isAddress, type Hex } from 'viem';
 import type { HoldPoint } from '../../courier/check/hooks';
-import { allJournals, type JournalEntry } from './journal';
+import { allJournals, atCaseEnd, type JournalEntry } from './journal';
 import { testKeystoreFor } from './keystore';
 
 // The courier under test, started as its own process through its real entry
@@ -217,21 +216,16 @@ const PRINT_LAST = 160;
 /** A longer line is cut, saying so. */
 const PRINT_WIDTH = 2_000;
 
-/** What the print reads of a case's context: whether the case passed (Node 22's TestContext.passed), and its diagnostic. */
-interface CaseContext {
-  passed?: unknown;
-  diagnostic?: (message: string) => void;
-}
-
 /** When the case before this one ended: the window of a failed case's print starts there. */
 let caseFrom = Date.now();
 
-afterEach(async (context) => {
-  const t = context as unknown as CaseContext;
+// At each case's end (tests/support/journal.ts): where the case failed, or a final block it held changed, the print of
+// its couriers, their records and the proxies' journals; and the marks the next case's print starts from.
+atCaseEnd(async (failed, t) => {
   const ends = started.map((s) => s.lines.length);
   const now = Date.now();
   try {
-    if (t.passed === false) {
+    if (failed) {
       const say = (m: string) => t.diagnostic?.(m);
       const databases = new Set<string>();
       for (const s of started) {

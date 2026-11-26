@@ -160,6 +160,8 @@ export function namedLives(stack: Stack, pool: pg.Pool) {
   async function until<T>(read: () => Promise<T>, done: (v: T) => boolean, ms: number, what: string): Promise<T> {
     const end = Date.now() + ms;
     for (;;) {
+      // A held final block whose hash changed fails the history while it waits.
+      heldUnchanged();
       const v = await read();
       if (done(v)) return v;
       if (Date.now() > end) throw new Error(`${what}: still ${JSON.stringify(v)} after ${ms} ms; the courier's last lines: ${stack.courier.lines.slice(-10).join(' | ')}`);
@@ -204,15 +206,30 @@ export function namedLives(stack: Stack, pool: pg.Pool) {
     assert.equal(await keyCount(), BigInt((ran.rows[0] as { n: string }).n), "the key's transactions on the chain are the Crosses the records hold as run");
   }
 
+  /**
+   * The final block the rig holds at a height keeps its hash (tests/support/proxy.ts): at every block the proxy answers
+   * at that height, and at the release. A change seen and not yet said fails the history where the rig holds or lets go
+   * of the block, saying what changed; one seen later fails it at its end (tests/support/journal.ts).
+   */
+  function heldUnchanged(): void {
+    const changes = stack.proxy.heldFinalChanged();
+    if (changes.length > 0) assert.fail(`the final block the rig held changed: ${changes.join('; ')}`);
+  }
+
   async function holdFinal(): Promise<void> {
+    await stack.proxy.heldFinalChecked();
+    heldUnchanged();
     const head = BigInt((await stack.rig.rpc('eth_blockNumber', [])) as string);
     stack.proxy.finalFollows(null);
     stack.proxy.setFinal(head);
+    // Its hash kept before the bet comes.
+    await stack.proxy.heldFinalChecked();
   }
 
   function followFinal(): void {
     stack.proxy.setFinal(null);
     stack.proxy.finalFollows(1n);
+    heldUnchanged();
   }
 
   /**

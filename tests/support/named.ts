@@ -78,6 +78,15 @@ export function namedWitnesses(stack: Stack, pool: pg.Pool, opts: { firstAccount
   let nextAccount = opts.firstAccount;
   let nextLine = 0;
   const hooks = () => stack.courier.hooks as HookControl;
+  /**
+   * The final block the rig holds at a height keeps its hash (tests/support/proxy.ts): at every block the proxy answers
+   * at that height, and at the release. A change seen and not yet said fails the case where the rig holds, moves or
+   * lets go of the block, saying what changed; one seen later fails it at its end (tests/support/journal.ts).
+   */
+  const heldUnchanged = (): void => {
+    const changes = stack.proxy.heldFinalChanged();
+    if (changes.length > 0) assert.fail(`the final block the rig held changed: ${changes.join('; ')}`);
+  };
   /** The file's accounts, funded once: the maker, the bettor whose bet meets the named error, one who waits, and one who comes next. */
   let people: { maker: HDAccount; bettor: HDAccount; waiter: HDAccount; next: HDAccount } | null = null;
   const who = () => {
@@ -106,6 +115,8 @@ export function namedWitnesses(stack: Stack, pool: pg.Pool, opts: { firstAccount
     async until<T>(read: () => Promise<T>, done: (v: T) => boolean, ms: number, what: string): Promise<T> {
       const end = Date.now() + ms;
       for (;;) {
+        // A held final block whose hash changed fails the case while it waits.
+        heldUnchanged();
         const v = await read();
         if (done(v)) return v;
         if (Date.now() > end) throw new Error(`${what}: still ${JSON.stringify(v)} after ${ms} ms; the courier's last lines: ${stack.courier.lines.slice(-6).join(' | ')}`);
@@ -199,18 +210,26 @@ export function namedWitnesses(stack: Stack, pool: pg.Pool, opts: { firstAccount
 
     /** The final block held at the head, before the bet comes: it stays there until it is let go or moved. */
     async holdFinal(): Promise<void> {
+      await stack.proxy.heldFinalChecked();
+      heldUnchanged();
       const head = BigInt((await rig.rpc('eth_blockNumber', [])) as string);
       stack.proxy.finalFollows(null);
       stack.proxy.setFinal(head);
+      // Its hash kept before the bet comes.
+      await stack.proxy.heldFinalChecked();
     },
 
+    /** The hold let go: the final block follows the head again. A held block whose hash changed fails the case here. */
     followFinal(): void {
       stack.proxy.setFinal(null);
       stack.proxy.finalFollows(1n);
+      heldUnchanged();
     },
 
     /** A block mined at exactly `time`, and the final block held there: the bet's expiry, to the second. */
     async finalAt(time: bigint): Promise<bigint> {
+      await stack.proxy.heldFinalChecked();
+      heldUnchanged();
       await rig.setNextBlockTime(time);
       await rig.rpc('anvil_mine', ['0x1']);
       // A block of the chain's own clock may have come first and taken the time: the one at exactly `time` is held.
@@ -220,6 +239,8 @@ export function namedWitnesses(stack: Stack, pool: pg.Pool, opts: { firstAccount
         if (BigInt(b.timestamp) === time) {
           stack.proxy.finalFollows(null);
           stack.proxy.setFinal(n);
+          await stack.proxy.heldFinalChecked();
+          heldUnchanged();
           return n;
         }
       }
