@@ -57,14 +57,18 @@ export async function onFinalChain(chain: ChainReader, rpc: JsonRpc, F: Header, 
     byHeight.set(at.number, at.hash.toLowerCase() as Hex);
     while (at.number > lowest) {
       const below = at.parentHash;
-      const height = at.number - 1n;
-      // Judged inside the read: a parent the node does not return, or not at the height below, is a read that is tried
-      // again, and twice is unavailable, as any read of the chain is; never a stop.
+      // A parent the node does not return is a read that is tried again inside the reader, and twice is unavailable, as
+      // any read of the chain is: no proof yet, never a stop.
       const parent = await chain.ask(F, async () => {
         const h = await headerByHash(rpc, below);
-        if (h === null || h.number !== height) throw new NodeFailure('malformed', 'eth_getBlockByHash', null, "a parent of the final block is not the block below it");
+        if (h === null) throw new NodeFailure('malformed', 'eth_getBlockByHash', null, 'a parent of the final block was not returned');
         return h;
       });
+      // One it returns at another height, or under another hash than the one asked for, contradicts the link: it is never
+      // read again as if it were missing, and its own parents are never followed.
+      if (parent.number !== at.number - 1n || parent.hash.toLowerCase() !== below.toLowerCase()) {
+        throw new NodeFailure('malformed', 'eth_getBlockByHash', null, "a parent of the final block is not the block below it, or not the block asked for");
+      }
       at = parent;
       byHeight.set(at.number, at.hash.toLowerCase() as Hex);
     }

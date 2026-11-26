@@ -352,3 +352,100 @@ test("the walk of the final block's parents after a quiet spell of 300 blocks: o
   assert.equal((await final(bet))?.state, 'confirmed');
   assert.equal((await final(next.bet))?.state, 'confirmed');
 });
+
+/**
+ * A Cross whose receipt lies further below F than the chain's own hash of a height reaches, when it is first looked
+ * at as final: F held at the head while the Cross is sent and mined, then 300 blocks, then F one behind the head again.
+ * That look shows the receipt's block on F's chain by walking F's parents by hash.
+ */
+async function deepReceipt(): Promise<{ bet: string; head: bigint; receiptBlock: bigint }> {
+  stack.proxy.finalFollows(null);
+  stack.proxy.setFinal(BigInt((await stack.rig.rpc('eth_blockNumber', [])) as string));
+  const c = await quoteAndBet();
+  const mined = await until(
+    async () => {
+      const r = await row(c.bet);
+      return r?.tx_hash === null || r?.tx_hash === undefined ? null : ((await stack.rig.rpc('eth_getTransactionReceipt', [r.tx_hash])) as { blockNumber: Hex } | null);
+    },
+    (r) => r !== null,
+    60_000,
+    'mined',
+  );
+  await until(() => row(c.bet), (r) => r?.state === 'pending', 30_000, 'pending above the held final block');
+  await stack.rig.rpc('anvil_mine', ['0x12c']);
+  const head = BigInt((await stack.rig.rpc('eth_blockNumber', [])) as string);
+  return { bet: c.bet, head, receiptBlock: BigInt((mined as { blockNumber: Hex }).blockNumber) };
+}
+
+/** A parent the walk asks for: well past the window below the head, and above the receipt's own block. */
+const deepParent = (d: { head: bigint; receiptBlock: bigint }, result: unknown): bigint | null => {
+  const at = result === null ? null : BigInt((result as { number: Hex }).number);
+  return at !== null && at + 260n < d.head && at > d.receiptBlock + 5n ? at : null;
+};
+const unavailableLooks = () => stack.courier.lines.filter((l) => /could not be read whole/.test(l)).length;
+
+test("a parent of the final block missing on both of the reader's attempts, in a look's walk past the window: the look is unavailable and writes nothing final; at a later look the node returns it, and the Cross is confirmed; the process goes on, with one hand-off", async () => {
+  const before = { stops: stops(), handOffs: handOffs(), unavailable: unavailableLooks() };
+  const d = await deepReceipt();
+  let missing = 0;
+  let asked: string | null = null;
+  stack.proxy.rule('eth_getBlockByHash', {
+    kind: 'rewriteResult',
+    result: (p, result) => {
+      const hash = String(p[0]).toLowerCase();
+      if (missing < 2 && deepParent(d, result) !== null && (asked === null || asked === hash)) {
+        asked = hash;
+        missing++;
+        return null;
+      }
+      return result;
+    },
+  });
+  try {
+    stack.proxy.setFinal(null);
+    stack.proxy.finalFollows(1n);
+    await until(async () => missing, (n) => n >= 2, 60_000, 'a parent missing on both attempts');
+    await until(async () => stops() > before.stops || unavailableLooks() > before.unavailable, (v) => v, 30_000, "the look's answer to the missing parent");
+    assert.equal(stops(), before.stops, 'the process did not stop');
+    assert.ok(!FINAL.includes(String((await row(d.bet))?.state)), 'nothing final is written while the walk is incomplete');
+  } finally {
+    stack.proxy.rule('eth_getBlockByHash', null);
+    stack.proxy.setFinal(null);
+    stack.proxy.finalFollows(1n);
+  }
+  const r = await final(d.bet);
+  assert.equal(r?.state, 'confirmed', JSON.stringify(r));
+  assert.equal(stops(), before.stops, 'the process did not stop');
+  assert.equal(handOffs() - before.handOffs, 1, 'one hand-off');
+});
+
+for (const wrong of ['height', 'hash'] as const) {
+  test(`a parent of the final block returned with the wrong ${wrong} in a look's walk past the window: a contradiction, never read again as if it were missing and never followed; no ancestry is shown from it, nothing final is written, and the process stops sending; started again with the node answering as asked, the Cross is confirmed`, async () => {
+    const before = stops();
+    const d = await deepReceipt();
+    let served = 0;
+    stack.proxy.rule('eth_getBlockByHash', {
+      kind: 'rewriteResult',
+      result: (_p, result) => {
+        const at = deepParent(d, result);
+        if (served > 0 || at === null) return result;
+        served++;
+        return wrong === 'height' ? { ...(result as Record<string, unknown>), number: `0x${(at - 1n).toString(16)}` } : { ...(result as Record<string, unknown>), hash: `0x${'ab'.repeat(32)}` };
+      },
+    });
+    try {
+      stack.proxy.setFinal(null);
+      stack.proxy.finalFollows(1n);
+      await until(async () => served, (n) => n === 1, 60_000, `the parent with the wrong ${wrong} served`);
+      await until(async () => stops() > before || FINAL.includes(String((await row(d.bet))?.state)), (v) => v, 60_000, `the lane's answer to the wrong ${wrong}`);
+      assert.ok(!FINAL.includes(String((await row(d.bet))?.state)), `no outcome from a walk that met a parent with the wrong ${wrong}`);
+      assert.equal(stops(), before + 1, 'the process stops sending');
+    } finally {
+      stack.proxy.rule('eth_getBlockByHash', null);
+      stack.proxy.setFinal(null);
+      stack.proxy.finalFollows(1n);
+      await stack.restartCourier({ hooked: true });
+    }
+    assert.equal((await final(d.bet))?.state, 'confirmed');
+  });
+}
