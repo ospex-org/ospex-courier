@@ -239,7 +239,10 @@ test("an orphan: the Cross mined in a block the chain then takes back, and mined
     // its height read at F, not by F's own hash, and it is not on F's chain; no outcome is written from it.
     await rig.rpc('anvil_mine', ['0x2']);
     stack.proxy.setFinal(BigInt(winning.blockNumber) + 2n);
-    await until(() => reasonsOf(bet.hash), (r) => r.includes('RECEIPT_ORPHANED'), 90_000, 'the orphan set aside');
+    // Ends at the orphan set aside, or at an outcome: an outcome written from the orphan's receipt fails at once, by name.
+    const seen = await until(() => reasonsOf(bet.hash), (r) => r.includes('RECEIPT_ORPHANED') || r.includes('CONFIRMED'), 90_000, 'the orphan set aside, or an outcome');
+    assert.ok(!seen.includes('CONFIRMED'), `no outcome from the orphan's receipt: ${JSON.stringify(seen)}`);
+    assert.ok(seen.includes('RECEIPT_ORPHANED'), JSON.stringify(seen));
     assert.equal((await row(bet.hash))?.state, 'sent', 'back to sent');
     await new Promise((r) => setTimeout(r, 6_000));
     assert.ok(!FINAL.includes(String((await row(bet.hash))?.state)), 'no outcome from the orphan, look after look');
@@ -558,16 +561,17 @@ test("a receipt the state at the final block contradicts: the receipt whole and 
   });
   try {
     await hooks().go(handed);
+    // Ends at the incident, or at an outcome: an outcome written against the chain's own state fails at once, by name.
     const opened = await until(
-      async () => (await pool.query<{ facts: Record<string, unknown> }>(`SELECT facts FROM events WHERE kind = 'incident' AND reason = 'CHAIN_CONTRADICTS_RECORDS' AND bet_hash = $1 ORDER BY number`, [bet.hash.toLowerCase()])).rows,
-      (rows) => rows.length > 0,
+      async () => ({ rows: (await pool.query<{ facts: Record<string, unknown> }>(`SELECT facts FROM events WHERE kind = 'incident' AND reason = 'CHAIN_CONTRADICTS_RECORDS' AND bet_hash = $1 ORDER BY number`, [bet.hash.toLowerCase()])).rows, state: String((await row(bet.hash))?.state) }),
+      (v) => v.rows.length > 0 || FINAL.includes(v.state),
       90_000,
-      'the incident',
+      'the incident, or an outcome',
     );
-    assert.match(JSON.stringify(opened[0]?.facts), /filled amount/);
-    assert.ok(contradicted > 0, 'the read at the final block was the one answered');
     const r = await row(bet.hash);
     assert.ok(!FINAL.includes(String(r?.state)), `no outcome written: ${JSON.stringify(r)}`);
+    assert.match(JSON.stringify(opened.rows[0]?.facts), /filled amount/);
+    assert.ok(contradicted > 0, 'the read at the final block was the one answered');
     // The courier sends nothing more: a new bet is refused at the door, and nothing was handed off for it.
     const T = await rig.time();
     const late: Order = { ...orderOn(rig, await fresh(), { expiry: T + 25n, oddsTick: 196, riskAmount: 10_000n, ...market }), positionType: 1 };

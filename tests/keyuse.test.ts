@@ -107,12 +107,17 @@ for (const fault of [
   test(`the signer refuses ${fault.name}: nothing is signed, nothing is handed off, and the courier's own fault is an incident line`, async () => {
     const before = { s: allSigned().length, h: handOffs(), refused: Number(await incidents('SIGNATURE_REFUSED')) };
     await stack.courier.hooks?.fault(fault.set);
-    const bet = await quoteAndBet();
-    await until(() => incidents('SIGNATURE_REFUSED'), (n) => Number(n) > before.refused, 60_000, 'the refusal');
-    assert.equal(allSigned().length, before.s, 'no signature counted');
-    assert.equal(handOffs(), before.h, 'no hand-off');
-    assert.notEqual(await state(bet), 'signed');
-    await fresh_process();
+    try {
+      const bet = await quoteAndBet();
+      // Ends at the refusal, or at the first signature or hand-off counted: one where none may be fails at once, by name.
+      await until(async () => ({ refused: Number(await incidents('SIGNATURE_REFUSED')), s: allSigned().length, h: handOffs() }), (v) => v.refused > before.refused || v.s > before.s || v.h > before.h, 60_000, 'the refusal, or a signature or a hand-off');
+      assert.equal(allSigned().length, before.s, 'no signature counted');
+      assert.equal(handOffs(), before.h, 'no hand-off');
+      assert.notEqual(await state(bet), 'signed');
+      assert.ok(Number(await incidents('SIGNATURE_REFUSED')) > before.refused, "the courier's own fault, an incident line");
+    } finally {
+      await fresh_process();
+    }
   });
 }
 
@@ -121,28 +126,46 @@ test('a result from an earlier reservation, after the lane moved on, is refused;
   await until(() => state(control), (s) => s === 'confirmed', 60_000, 'the control');
   const before = { s: allSigned().length, h: handOffs(), refused: Number(await incidents('SIGNATURE_REFUSED')) };
   await stack.courier.hooks?.fault({ signer: { substitute: 'earlier' } });
-  await quoteAndBet();
-  await until(() => incidents('SIGNATURE_REFUSED'), (n) => Number(n) > before.refused, 60_000, 'the refusal');
-  assert.deepEqual({ s: allSigned().length - before.s, h: handOffs() - before.h }, { s: 0, h: 0 });
-  await fresh_process();
+  try {
+    await quoteAndBet();
+    // Ends at the refusal, or at the first signature or hand-off counted: one where none may be fails at once, by name.
+    await until(async () => ({ refused: Number(await incidents('SIGNATURE_REFUSED')), s: allSigned().length, h: handOffs() }), (v) => v.refused > before.refused || v.s > before.s || v.h > before.h, 60_000, 'the refusal, or a signature or a hand-off');
+    assert.deepEqual({ s: allSigned().length - before.s, h: handOffs() - before.h }, { s: 0, h: 0 });
+    assert.ok(Number(await incidents('SIGNATURE_REFUSED')) > before.refused, "the courier's own fault, an incident line");
+  } finally {
+    await fresh_process();
+  }
 });
 
 for (const how of ['reorder', 'swap', 'gas'] as const) {
   test(`the snapshot is sealed: after the check and before the signature, a try to ${how === 'reorder' ? 'reorder the quotes' : how === 'swap' ? 'swap an order with its hash and signature for another' : 'change the gas'} changes nothing; the bytes signed are the sealed ones`, async () => {
     const before = allSigned().length;
+    const refusedBefore = Number(await incidents('SIGNATURE_REFUSED'));
     await stack.courier.hooks?.fault({ signer: { tamper: how } });
-    const bet = await quoteAndBet(2);
-    await until(() => state(bet), (s) => s === 'confirmed', 60_000, 'the Cross');
-    await stack.courier.hooks?.fault({ signer: { tamper: null } });
-    const tries = stack.courier.hooks?.tampered.filter((t) => t.how === how) ?? [];
-    assert.ok(tries.length >= 1 && tries.every((t) => t.result !== 'changed'), JSON.stringify(tries));
-    const raw = allSigned()[before] as Hex;
-    const tx = parseTransaction(raw);
-    const legs = await pool.query<{ order_hash: string }>('SELECT order_hash FROM legs WHERE bet_hash = $1 ORDER BY position', [bet.toLowerCase()]);
-    const { args } = decodeFunctionData({ abi: RELAY_ABI, data: tx.data as Hex });
-    const [taking, resting] = args as unknown as [{ order: OrderFields }, Array<{ order: OrderFields }>];
-    assert.equal(orderHash(taking.order, 31337n, stack.rig.addresses.matching).toLowerCase(), bet.toLowerCase());
-    assert.deepEqual(resting.map((r) => orderHash(r.order, 31337n, stack.rig.addresses.matching).toLowerCase()), legs.rows.map((l) => l.order_hash));
+    let finished = false;
+    try {
+      const bet = await quoteAndBet(2);
+      // Ends at the Cross confirmed, or at a refusal of the signer's: a tamper that reached the snapshot fails at once, by name.
+      await until(async () => ({ s: await state(bet), refused: Number(await incidents('SIGNATURE_REFUSED')) }), (v) => v.s === 'confirmed' || v.refused > refusedBefore, 60_000, 'the Cross, or a refusal');
+      assert.equal(await state(bet), 'confirmed', 'the Cross confirmed: no tamper reached what the signer signs');
+      await stack.courier.hooks?.fault({ signer: { tamper: null } });
+      const tries = stack.courier.hooks?.tampered.filter((t) => t.how === how) ?? [];
+      assert.ok(tries.length >= 1 && tries.every((t) => t.result !== 'changed'), JSON.stringify(tries));
+      const raw = allSigned()[before] as Hex;
+      const tx = parseTransaction(raw);
+      const legs = await pool.query<{ order_hash: string }>('SELECT order_hash FROM legs WHERE bet_hash = $1 ORDER BY position', [bet.toLowerCase()]);
+      const { args } = decodeFunctionData({ abi: RELAY_ABI, data: tx.data as Hex });
+      const [taking, resting] = args as unknown as [{ order: OrderFields }, Array<{ order: OrderFields }>];
+      assert.equal(orderHash(taking.order, 31337n, stack.rig.addresses.matching).toLowerCase(), bet.toLowerCase());
+      assert.deepEqual(resting.map((r) => orderHash(r.order, 31337n, stack.rig.addresses.matching).toLowerCase()), legs.rows.map((l) => l.order_hash));
+      finished = true;
+    } finally {
+      // A case that did not finish may have left the courier stopped: the next case has a process of its own.
+      if (!finished) {
+        await stack.courier.hooks?.fault({ signer: { tamper: null } });
+        await fresh_process();
+      }
+    }
   });
 }
 
