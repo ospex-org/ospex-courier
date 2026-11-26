@@ -142,6 +142,10 @@ test('the replacement, by the plan\'s own case: Cross 1 kept from the chain unti
     await stack.rig.rpc('eth_sendRawTransaction', [kept.kept[0]]);
     const r1 = await until(() => crossOf(first.hash), (c) => c?.state === 'reverted', 90_000, 'Cross 1 reverted');
     assert.equal(r1?.state, 'reverted');
+    // Its line, the one the pause will count, carries the gas it paid, as any revert's line does.
+    const line = (await pool.query<{ facts: Record<string, unknown> }>(`SELECT facts FROM events WHERE kind = 'cross reverted' AND bet_hash = $1`, [first.hash.toLowerCase()])).rows[0]?.facts;
+    const paid = (await pool.query<{ gas_used: string; effective_gas_price: string }>('SELECT gas_used::text AS gas_used, effective_gas_price::text AS effective_gas_price FROM crosses WHERE bet_hash = $1', [first.hash.toLowerCase()])).rows[0];
+    assert.deepEqual([line?.wasExpiredUnmined, line?.gasUsed, line?.effectiveGasPrice], [true, paid?.gas_used, paid?.effective_gas_price], JSON.stringify(line));
     const r2 = await final(second.hash, 90_000);
     assert.equal(r2?.state, 'replaced', JSON.stringify(r2));
     const by = await pool.query<{ replaced_by: string; replaced_by_ours: boolean }>('SELECT replaced_by, replaced_by_ours FROM crosses WHERE bet_hash = $1', [second.hash.toLowerCase()]);

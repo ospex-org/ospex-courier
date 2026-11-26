@@ -338,7 +338,7 @@ export function createSettler(deps: SettleDeps): Settler {
         c,
         async (client) => {
           if (!(await writeFinal(client, c.betHash, outcome, 'expired unmined'))) return false;
-          await lineOf(client, bet, 'cross reverted', reason.name, { txHash: c.txHash, nonce: s(c.nonce as bigint), block: { number: s(receipt.blockNumber), hash: receipt.blockHash }, final: finalNamed(F), betFilled: s(betFilled as bigint), ...facts, wasExpiredUnmined: true });
+          await lineOf(client, bet, 'cross reverted', reason.name, { txHash: c.txHash, nonce: s(c.nonce as bigint), block: { number: s(receipt.blockNumber), hash: receipt.blockHash }, final: finalNamed(F), betFilled: s(betFilled as bigint), gasUsed: s(receipt.gasUsed), effectiveGasPrice: s(receipt.effectiveGasPrice), ...facts, wasExpiredUnmined: true });
           return true;
         },
         'epoch',
