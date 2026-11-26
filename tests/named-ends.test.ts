@@ -142,6 +142,57 @@ test('its own receipt not given though the final block is past its block: the Cr
   assert.equal(((end.recorded ?? {}).totals as { taker?: string } | undefined)?.taker, '9984');
 });
 
+const STOPPED_LINE = /takes no more bets until it restarts|sends nothing more until it restarts/;
+
+test("its Cross ran, and its second read is refused: the node takes the request and answers with a named error; the receipt is final; the bet's filled amount at the final block, a ran Cross's second read, is refused twice; nothing final is written and nothing else is sent meanwhile, and the process goes on; then the outcome is whole, and the next bet is sent and fills", async () => {
+  const market = w.market();
+  await w.quoteIn(market);
+  const B = w.people().bettor;
+  const made = await w.betOf(B, market);
+  await w.holdFinal();
+  stack.proxy.rule('eth_getTransactionReceipt', { kind: 'answer', result: () => null });
+  const passed = stack.proxy.passThenError('eth_sendRawTransaction', { code: -32000, message: nodeText('transaction underpriced') }, carries(made.signature));
+  const stops = () => stack.courier.lines.filter((l) => STOPPED_LINE.test(l)).length;
+  const stoppedBefore = stops();
+  let refused = 0;
+  let bet!: Awaited<ReturnType<typeof w.post>>;
+  try {
+    bet = await w.post(B, made);
+    await w.heldUnknown(bet, 'transaction underpriced');
+    passed.stop();
+    stack.proxy.rule('eth_getTransactionReceipt', null);
+    // The ran Cross's second read: the bet's filled amount at the final block, refused twice, with the receipt final.
+    const filledOfBet = encodeFunctionData({ abi: stack.rig.abis.OspexMatching as Abi, functionName: 's_filledRisk', args: [bet.hash as Hex] }).slice(2).toLowerCase();
+    stack.proxy.rule('eth_call', { kind: 'refuseIf', refuse: (p) => JSON.stringify(p).toLowerCase().includes(filledOfBet) && (refused++, true), code: -32000, message: 'the node is busy' });
+    const sendsBefore = stack.proxy.count('eth_sendRawTransaction');
+    const linesBefore = stack.courier.lines.length;
+    w.followFinal();
+    await w.until(async () => refused, (n) => n >= 2, 60_000, "the bet's filled amount refused twice");
+    await w.until(async () => stack.courier.lines.slice(linesBefore).some((l) => /looked at again|failed twice/.test(l)), (v) => v, 30_000, "the lane's answer to the failed read");
+    const meanwhile = await w.cross(bet.hash);
+    assert.ok(meanwhile !== null && !FINAL.includes(meanwhile.state), `nothing final while the read is refused: ${JSON.stringify(meanwhile)}`);
+    assert.equal(stack.proxy.count('eth_sendRawTransaction'), sendsBefore, 'nothing else sent meanwhile');
+    assert.equal(stops(), stoppedBefore, 'the process did not stop');
+    assert.equal((await w.lane()).shut_line, null, 'and no hold of the key');
+  } finally {
+    passed.stop();
+    stack.proxy.rule('eth_getTransactionReceipt', null);
+    stack.proxy.rule('eth_call', null);
+    w.followFinal();
+  }
+  const end = await w.final(bet.hash);
+  assert.equal(end.state, 'confirmed', JSON.stringify(end));
+  assert.equal(typeof (end.recorded ?? {}).betFilled, 'string', "the bet's filled amount at the final block, read and recorded");
+  assert.equal(((end.recorded ?? {}).totals as { taker?: string } | undefined)?.taker, '9984', 'what it filled, from its receipt');
+  assert.equal(w.signedCarrying(bet.signature), 1, 'one signature');
+  assert.equal(w.requestsOf(end.tx_hash as string), 1, 'one request of its bytes');
+  assert.equal(stops(), stoppedBefore, 'the process did not stop');
+  const next = w.market();
+  await w.quoteIn(next);
+  const nextBet = await w.post(w.people().next, await w.betOf(w.people().next, next));
+  assert.equal((await w.final(nextBet.hash)).state, 'confirmed', 'the next bet is sent and fills');
+});
+
 test("a different transaction at its nonce, the courier's own: Cross 1 kept from the chain until it is expired unmined; Cross 2, the next bet, at the same nonce, refused by the node with a named error before the chain has it; then Cross 1 let through: Cross 1 reverted and Cross 2 replaced, by the courier's own transaction, with its total at that block and no hold of the key", async () => {
   const kept = stack.proxy.withhold();
   let first!: Awaited<ReturnType<typeof w.post>>;
