@@ -9,8 +9,8 @@ import { getAddress, isAddress, type Address, type Hex } from 'viem';
 // courier sends from: an address, not a secret. The bet's check is made from
 // it, its lane is named by it, and the relay's sender is held to it at every
 // check, so it is required, and never taken from the chain. The key itself
-// (COURIER_KEYSTORE_JSON, COURIER_KEYSTORE_PASSWORD) arrives with the sender,
-// which is the build that first holds one.
+// (COURIER_KEYSTORE_JSON, COURIER_KEYSTORE_PASSWORD) is read at the start, in
+// courier/startup.ts, and kept only inside the signer.
 
 export interface CourierConfig {
   /** The courier's own Postgres. */

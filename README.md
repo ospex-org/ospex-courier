@@ -44,7 +44,7 @@ measured against the plan's three books in both maintenance states (`docs/COST.m
 settings set from the measurement. And on the first build's: the repository, the settings, the schema, the
 start-up against the set read from a signpost, the local chain rig and the proxy, the runs and the status address,
 what a node does with a block's hash and with an override, and the store's TLS check. What it does not yet do is
-listed on its own status address under `notYetBuilt`: the sender and the key, and the incidents' cursor.
+listed on its own status address under `notYetBuilt`: the incidents and their cursor.
 
 ## Running it
 
@@ -59,7 +59,7 @@ a value in this repository (`.env.example` lists them).
 | `COURIER_ADDRESS` | The courier's key's address: an address, never a key. Required: the courier does not start without it. A bet's check judges the relay's sender against it, and the node's check makes its calls from it. |
 | `COURIER_KEYSTORE_JSON`, `COURIER_KEYSTORE_PASSWORD` | The key: an encrypted keystore, as `cast wallet new` writes one (Web3 Secret Storage v3, scrypt and AES-128-CTR), and its password. Required. The keystore's address must be `COURIER_ADDRESS`, or the start is refused, naming the settings and no value. At start the keystore is opened, the key kept only inside the signer, and both settings leave the process's environment. |
 | `COURIER_LOW_POL` | Under this many POL the key's wallet is reported low. 3 unless set. |
-| `TRACE_CHECK_TRANSACTION` | Optional: a transaction of the chain that reverted, which the node's check traces to show the node gives a reverted Cross's reason. |
+| `TRACE_CHECK_TRANSACTION` | Optional: a transaction of the chain that reverted with a named error, which the node's check traces to show the node gives a reverted Cross's reason. |
 | `PORT` | Where the process listens. 0 is any free port, which is how the tests start it. |
 | `DATABASE_CA_FILE` | Optional: a file holding the certificate authority the database is verified against, in place of the pinned `db/database-ca.pem`. It can name another authority and nothing else; verification is never off. |
 | `PUBLISHED_REPORTERS_FILE` | Optional: a file holding the published list of reporters, in place of the repository's `published-reporters.json`; the tests name the rig's reporter. It can name another list and nothing else; the game rule is never off. |
@@ -168,9 +168,10 @@ not admitted, and the row counts how many and when last.
 
 `GET /v1/orders/{hash}` is the courier's record of one order. Its `state` is `resting` for a quote the courier has
 not marked ended, else how the order ended here: `stopped`, `expired`, `filled`, or `cancelled`, with `endedAt` and,
-for `cancelled`, `endedBlock`, the block the chain was read at. A bet's is `queued` while it waits (`turn: waiting`)
-or is being checked (`turn: checking`), and then its first end: `refused` or `lapsed` with its verdict, `not sent`
-with its Cross, or `stopped`. An order that ended twice keeps the first end. For a hash stopped ahead of its order, which holds no order here, the
+for `cancelled`, `endedBlock`, the block the chain was read at. A bet's is `queued` while it waits (`turn: waiting`),
+is being checked (`turn: checking`) or is being signed and handed to the chain (`turn: sending`); then `refused` or
+`lapsed` with its verdict, `stopped`, or its Cross's state with the Cross: `unknown`, `sent`, `pending`, `confirmed`,
+`reverted`, `expired unmined`, `replaced` or `not sent` (`docs/API.md`, part 3a). An order that ended twice keeps the first end. For a hash stopped ahead of its order, which holds no order here, the
 answer is `state: "stopped ahead"` with `stoppedAt` and no field of the order: the signed original a stop ahead
 was recorded with is served on no route.
 
@@ -251,7 +252,10 @@ courier waits on; Node's own default is five minutes.
   they stand, right once any request has asked the chain about the quotes, and the market's page is the one checked
   against the chain.
 
-One standing condition is raised in this build: `chain-unreachable`. It opens when the records process a read of
+Two standing conditions are raised in this build. `cross-unreconciled` opens where a nonce of the courier's key is
+used at a final block by a transaction its records do not explain; it shuts that key's lane until the operator clears
+it with every nonce explained, or a rotation read at a final block retires the key. `chain-unreachable` opens when
+the records process a read of
 the chain that failed and failed again on its one retry, including a required header or state value that cannot be
 decoded or a refusal to read the named block; it clears when the records next process a usable read that succeeded
 while it is open, whichever process made the read. An intelligible negative answer from a contract (a game the set
@@ -282,7 +286,7 @@ lines are the writing transaction's, diagnostics: neither is proof of the order 
 The courier's own Postgres, `db/schema.sql`: eleven tables (orders, stop_messages, stops, lanes, crosses, legs,
 events, conditions, accounts, runs, games) and the indexes the book, the door and the stop read along. A bet's
 check writes `lanes` (which run owns the lane, its epoch, the bet it holds) and, for a bet found ready, `crosses`
-and `legs`: the Cross it would have sent, `not sent` with its reason, and what the check found. The process holds
+and `legs`: the Cross it sends, from its intent to what became of it on the chain, and what the check found. The process holds
 three pools on it: four
 connections for the reads and the records, one for the lane's steps, and one for the door, on which a post's admission transaction (the
 budgets' rows locked, through the record's commit, a read of the chain inside it) runs one post at a time in the
@@ -362,12 +366,13 @@ courier/
   server.ts  config.ts  startup.ts
   http/      service.ts  routes.ts  limits.ts
   chain/     abi.ts  set.ts  snapshot.ts  rpc.ts  node.ts  reads.ts
-  orders/    order.ts  door.ts  standing.ts  budgets.ts  published.ts  stop.ts  stops.ts
+  orders/    order.ts  door.ts  standing.ts  budgets.ts  published.ts  stop.ts  stops.ts  wire.ts
   check/     lane.ts  precheck.ts  walk.ts  pull.ts  decode.ts  sentences.ts  hooks.ts
-  records/   store.ts  orders.ts  stops.ts  lanes.ts  events.ts  runs.ts  conditions.ts
+  send/      signer.ts  checks.ts  chain.ts  outcome.ts  settle.ts  reason.ts  marks.ts  recovery.ts  operator.ts
+  records/   store.ts  orders.ts  stops.ts  lanes.ts  crosses.ts  events.ts  runs.ts  conditions.ts
   status/    status.ts
   book/      read.ts
-scripts/     apply-schema.ts  check-node.ts
+scripts/     apply-schema.ts  check-node.ts  operator.ts
 docs/        API.md  INCIDENT_NOTES.md  FILL_PRIORITY.md  COST.md
 tests/       the suite, its support (the rig, the proxy, the TLS front, the tests' start file) and fixtures
 contracts/   a submodule: the contracts repository at the pinned commit, for the tests only

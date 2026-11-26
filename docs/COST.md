@@ -245,6 +245,54 @@ level of it, and the test holds them there.
 The marks waiting for the final block: one pass reads at most 200 of a backlog of 10,000 among 100,000 quotes, 20
 buffers, through the partial index `orders_marks_not_final`.
 
+### One sent bet's statements, on the three books
+
+Every statement the courier's own sessions run for one sent bet, from its post to its outcome and the outcome's marks,
+each from its own `EXPLAIN (ANALYZE, BUFFERS)`, made by the database's `auto_explain` as the statement runs, on the
+book scan's three books, each in a market of its own: ten live quotes; 50,000 and 500,000 orders ended by the mark,
+ahead of ten live quotes; and 50,000 and 500,000 expired quotes not yet marked, behind the bet's live quote
+(`tests/cost-sent.test.ts`). Ahead of its live quote, as the book scan's figures lay it, the backlog leaves no bet to
+send: the check meets the bound of 2,000 rows first, and refuses the bet there. Each book is measured before vacuum,
+with the dead versions its marking leaves, and after `VACUUM`; the backlog also with the final block held behind its
+expiry while the bet is checked. Buffers: all the statements' shared buffer accesses, a statement's largest call each,
+and in brackets their scans' alone, the book scan's measure.
+
+| book | size | state | statements, calls | buffers (scans) | candidate statement | outcome's marks | nonce's floor | marks' read |
+| -- | -- | -- | -- | -- | -- | -- | -- | -- |
+| ten live quotes | 10 | before vacuum | 45, 116 | 523 (98) | 12 (3) | 12 (4) | 2 (2) | 4 (1) |
+| | 10 | after vacuum | 45, 118 | 373 (47) | 3 (3) | 10 (2) | 1 (1) | 1 (1) |
+| ended by the mark, ahead of ten live quotes | 50,000 | before vacuum, 50,000 dead planted | 45, 117 | 6,366 (5,939) | 5,848 (5,842) | 21 (8) | 1 (1) | 1 (1) |
+| | 50,000 | after vacuum | 45, 118 | 460 (97) | 8 (8) | 20 (8) | 2 (2) | 1 (1) |
+| | 500,000 | before vacuum, 500,000 dead planted | 45, 117 | 58,908 (58,449) | 58,346 (58,340) | 26 (10) | 2 (2) | 1 (1) |
+| | 500,000 | after vacuum | 45, 118 | 481 (104) | 4 (4) | 28 (10) | 2 (2) | 1 (1) |
+| expired, not yet marked, behind the bet's live quote | 50,000 | the final block held behind them: nothing marked | 45, 117 | 797 (303) | 195 (189) | 24 (8) | 3 (3) | 1 (1) |
+| | 50,000 | the final block past them, before vacuum: 1,999 marked | 45, 118 | 41,064 (16,280) | 40,608 (16,175) | 20 (8) | 4 (4) | 1 (1) |
+| | 50,000 | after vacuum: the next 1,999 marked | 45, 118 | 43,248 (16,281) | 42,761 (16,180) | 20 (8) | 4 (4) | 1 (1) |
+| | 500,000 | held behind | 45, 117 | 816 (316) | 200 (191) | 29 (10) | 4 (4) | 1 (1) |
+| | 500,000 | past, before vacuum | 45, 118 | 49,096 (20,290) | 48,603 (20,172) | 22 (10) | 4 (4) | 1 (1) |
+| | 500,000 | after vacuum | 45, 118 | 51,280 (20,289) | 50,769 (20,180) | 27 (10) | 4 (4) | 1 (1) |
+
+What the figures show:
+
+- **Dead versions before vacuum.** The bet's own scan is the first to meet the dead entries the mark left, so it reads
+  each one's page: 5,848 buffers at 50,000 and 58,346 at 500,000. The book scan's figures above, 1,253 and 12,504, are
+  taken after an earlier scan has marked those entries dead. After vacuum, 8 and 4.
+- **A request that marks the bound.** Where the final block has passed the backlog, the candidate statement marks the
+  1,999 quotes its page returned, and its own writes are most of the bet's work: 40,608 to 50,769 buffers in all, about
+  20 a quote marked, of which its scans are 16,175 to 20,180. Its scans walk the primary key twice a quote marked, once
+  to lock it and once to write it, so at 500,000, a level deeper, they read 4,000 more. The book scan's figures above
+  count its scan node alone.
+- **The rest stays small.** The outcome's marks, the nonce's floor and the marks' read stay within a few buffers at
+  every size and in both states.
+- **The planner's choice at 50,000.** At 50,000 the planner may lock the quotes a page marks by reading the table
+  whole, where that costs less than walking the primary key a quote at a time: one run read 50,005 rows in 3,334
+  buffers that way, and another walked the key. At 500,000 it walks the key, and the test holds that no statement there
+  reads more of the table by a sequential scan than the bound of 2,000 rows.
+
+After vacuum, the test holds each statement that reads the orders table and is planned the same way at both sizes to
+its figure at 50,000, within one page a level of each index for each walk it makes of it from its root. A write's own
+accesses (the heap's free space, index entries, page splits) are reported and not held to that.
+
 ### The lane, measured
 
 Twenty bets posted at once, each against its own quote on a market of its own, on the rig's two-second clock with
@@ -276,10 +324,16 @@ Each grows with the gap it covers, not with the history.
   by hash, and the bet after it none, the watermark raised by the bet before. On Polygon's two-second blocks a quiet
   hour is about 1,800 such reads before the next bet can be sent.
 - **The search for what used a nonce:** about log₂ of the gap in blocks for the counts that find the block, then that
-  block in full, then its place on the final block's chain.
+  block in full, then its place on the final block's chain. Measured once, across a gap of 4 blocks, where a restored
+  database's courier finds its intent's transaction (`tests/restore.test.ts`): from its start to the intent settled,
+  3 headers read by height, 6 counts of the key at a header's hash, the start's own among them, and the block found
+  read in full.
 - **A backlog of marks:** 200 a pass, at each read of the final block the courier makes anyway.
 - **The first start after a restore:** the count check read from the lane's older watermark; recovery looks again at a
-  gap widening to 30 seconds for as long as the process runs, and writes only what it finds.
+  gap widening to 30 seconds for as long as the process runs, and writes only what it finds. Measured in the same case:
+  the start, 56 requests to the node (28 `eth_call`, 11 `eth_getCode`, 6 `eth_getBlockByNumber`, 5 `eth_estimateGas`,
+  3 `eth_getTransactionCount`, and one each of `eth_chainId`, `eth_getStorageAt` and `eth_maxPriorityFeePerGas`) and 18
+  commands to the database; then, to the intent settled, 16 requests and 44 commands.
 
 ### Idle
 
@@ -344,12 +398,12 @@ row, before their messages and lines; a stop of carried orders is bounded by the
 about 296 bytes on top of each stopped order's 1,306, and one message row a message, about 9,500 bytes for one of
 a hundred hashes.
 
-### The shape this build does not yet write
+### The shape of a sent Cross
 
-A Cross sent, with its transaction, its receipt and its lines, is written by no build yet: this build closes a Cross
-not sent, with its legs and one line. Measured from fixture rows the same test lays in the schema's shape: every column as the schema has it, and the free parts (a line's `facts`, a Cross's `node_answer`, both
-`jsonb`) holding what this fixture puts there, small objects of a few fields. These are fixture figures, to be read
-again from real rows once the sender's build writes them.
+A Cross sent, with its transaction, its receipt and its lines, is what this build writes; the figures here are still
+the fixture's. Measured from fixture rows the same test lays in the schema's shape: every column as the schema has it, and the free parts (a line's `facts`, a Cross's `node_answer`, both
+`jsonb`) holding what this fixture puts there, small objects of a few fields. These are fixture figures, not yet read
+again from real rows.
 
 | shape | rows | bytes with indexes |
 | -- | -- | -- |

@@ -231,7 +231,7 @@ test('the other states: sending, unknown, sent and pending wait with N1; the thr
 
 test("the wallet's form of COURIER_CANNOT_SEND takes N7, and it is told from the relay's sender form by its fields, not its sentence", () => {
   assert.ok(VERDICT.COURIER_CANNOT_SEND_WALLET('5', '0.01', '0.02').endsWith(NEXT.N7));
-  assert.doesNotMatch(VERDICT.COURIER_CANNOT_SEND('5'), /Next:/, "the relay's sender form is C4's, unchanged");
+  assert.doesNotMatch(VERDICT.COURIER_CANNOT_SEND('5'), /Next:/, "the relay's sender form is the earlier build's, unchanged");
 });
 
 test("every row above, served: written as the sender writes a Cross's row, beside its bet and its quote, and read back through GET /v1/orders/{hash}; the record's message is the same text, word for word, the database's restore hold read for the restored ones", async () => {

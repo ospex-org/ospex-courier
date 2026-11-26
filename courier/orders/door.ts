@@ -64,8 +64,8 @@ export interface BetOutcome {
 /**
  * A bet's state, by its first end: `stopped` where a stop's mark came before any judgment (while it waited, or while
  * it was held, with the verdict STOPPED); otherwise the judgment's own state, with `ended` showing a later stop beside
- * it: `refused`, `lapsed`, or the Cross's state, `not sent` in this build. `queued` while it waits its turn or its
- * check runs.
+ * it: `refused`, `lapsed`, or the Cross's state as the wire names it. `queued` while it waits its turn, its check
+ * runs or its Cross is being signed.
  */
 function betState(row: OrderRow, outcome: BetOutcome | null): string {
   const verdict = outcome?.verdict ?? null;

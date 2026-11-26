@@ -1,8 +1,8 @@
 # The courier's wire contract
 
 What a maker's or a bettor's program sends the courier, what it is answered, and what each answer means. This wire
-contract covers order submission, signed stops and the read routes. This build records bets but does not send them to
-the chain.
+contract covers order submission, signed stops and the read routes. This build sends a bet it finds ready to the
+chain once, as a Cross, and the bet's record says what became of it.
 
 JSON under `/v1`, over https only. No sign-in and no secret: a signed order is its own permission, and the book is
 public. Amounts are decimal strings in the coin's smallest unit; addresses are hex; an order is known by its hash,
@@ -570,6 +570,14 @@ record of the bet's fill. A chain cancellation supplies this assurance only once
 block. A local stop binds only this courier and only while retained; a restore can lose it and another courier is
 not bound by it.
 
+**For makers.** While this courier retains the stop, a `stopped` answer with no `handOff` means nothing this courier
+sends can fill that order from the answer on. Next: the replacement can be posted now. With a `handOff`, the old order
+may still fill in that one transaction, and a replacement posted at once may fill beside it. Next: read the bet named
+by handOff.bet until its Cross is final before posting the replacement, or post now only if you accept that both may
+fill. To rule out a later fill of the old order at every courier, obtain a final on-chain cancellation or expiry proof
+and read its total before replacing it. A database restore can lose a stop; an on-chain cancellation is not lost with
+this courier's database.
+
 ### What a stop does not do
 
 - **A signed stop is not a one-use budget authorization.** When an admitted budgeted message creates no stop, its
@@ -618,8 +626,9 @@ All public, and each bounded: no read returns a list without a limit.
   and the door takes no new bet. `node` says whether the node traces a transaction. `chainLimits` holds the most gas one transaction may carry
   on the chain. What the node can do (`node`) is each request the check makes, at the latest block's hash, at a
   block 50 back and at a hash no block has; the relay's storage slot 0 held to its sender; whether an override of
-  that slot is taken; a call whose answer depends on the block's time, at two hashes of two times; and the
-  finalized tag. While the node fails one the check needs, the door takes no order.
+  that slot is taken; a call whose answer depends on the block's time, at two hashes of two times; the finalized
+  tag; and the latest block's base fee and the tip the node suggests, which a Cross's fees are set from. While the
+  node fails one the check needs, the door takes no order.
 - `GET /v1/runs?after=&limit=`: the runs of the process, 100 to a page.
 - `GET /v1/book?gameId=[&after=scorer:lineTicks&limit=]`: the markets of a game that hold a live quote, 100 to a
   page, each side's count, at one block named by number, hash and time, with the final block beside it.

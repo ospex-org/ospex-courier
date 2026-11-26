@@ -77,6 +77,23 @@ test('the port is a whole number up to 65535, 0 for any free port', () => {
   assert.ok(!readCourierConfig({ ...GOOD, PORT: '80a' }).ok);
 });
 
+test('the transaction the node check traces: a hash of 64 hex characters, read in lower case; anything else is named by its setting, and never echoed', () => {
+  const good = `0x${'Ab'.repeat(32)}`;
+  const read = readCourierConfig({ ...GOOD, TRACE_CHECK_TRANSACTION: good });
+  assert.ok(read.ok);
+  assert.equal(read.ok ? read.config.traceCheckTransaction : null, good.toLowerCase());
+  const unset = readCourierConfig(GOOD);
+  assert.ok(unset.ok && unset.config.traceCheckTransaction === undefined, 'not set: none named');
+  for (const bad of ['0x1234', `0x${'g'.repeat(64)}`, 'ab'.repeat(32), `0x${'a'.repeat(65)}`]) {
+    const r = readCourierConfig({ ...GOOD, TRACE_CHECK_TRANSACTION: bad });
+    assert.ok(!r.ok, bad);
+    if (!r.ok) {
+      assert.deepEqual(r.problems, ['TRACE_CHECK_TRANSACTION must be a transaction hash: 0x and 64 hex characters']);
+      assert.ok(!r.problems.join(' ').includes(bad), 'the value itself is never echoed');
+    }
+  }
+});
+
 test('the entry number is a whole number', () => {
   assert.ok(readCourierConfig({ ...GOOD, BETTING_ENTRY_ID: '0' }).ok);
   assert.ok(!readCourierConfig({ ...GOOD, BETTING_ENTRY_ID: '-1' }).ok);

@@ -194,7 +194,7 @@ test("a Cross's row written straight into the database, as intent and as signed,
   assert.deepEqual({ s: allSigned().length - before.s, h: handOffs() - before.h }, { s: 0, h: 0 });
 });
 
-test('after every other case: every signed attempt, refused and unmined ones included, and every transaction the key sent on the chain, is to the relay with the Cross\'s selector and no value, on the set\'s chain, at the nonce, gas and fees of the sealed send the signer was handed and of the record that holds it, and decodes to a bet and quotes the records hold', async () => {
+test('Every signed attempt, including refused or unmined attempts, and every mined transaction matches its sealed Cross envelope.', async () => {
   const relay = stack.rig.addresses.relay.toLowerCase();
   const key = stack.rig.accounts.sender.address.toLowerCase();
   const attempts = allAttempts();

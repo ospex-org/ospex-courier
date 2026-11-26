@@ -185,8 +185,8 @@ export async function checkNode(rpc: JsonRpc, targets: NodeCheckTargets, now: ()
     ),
   );
 
-  // The exact call, from the sender to the relay. This build holds no key and signs nothing, so the call is the
-  // relay's own read of its sender: the method and the block parameter are the same ones the Cross's call uses.
+  // The exact call, from the sender to the relay. The check signs nothing, so the call is the relay's own read of
+  // its sender: the method and the block parameter are the same ones the Cross's call uses.
   verdicts.push(
     await three(
       'eth_call from the sender to the relay',
