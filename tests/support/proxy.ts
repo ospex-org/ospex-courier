@@ -19,7 +19,7 @@ export interface Counted {
   /** The answer's bytes once answered; 0 while the request is still being answered. */
   answerBytes: number;
   /** How the proxy dealt with it: `arrived` until it has been answered. */
-  how: 'arrived' | 'passed' | 'refused' | 'answered' | 'held' | 'dropped' | 'withheld';
+  how: 'arrived' | 'passed' | 'refused' | 'answered' | 'held' | 'dropped' | 'withheld' | 'passedThenRefused';
   /** A raw transaction's own bytes, as the request carried them, so that one transaction's requests are counted by its bytes. */
   sent?: string;
   /** Any other request's params, as it carried them: the block a count or a block's read names, among them. */
@@ -68,7 +68,13 @@ export type Rule =
    * A raw transaction answered taken by the proxy itself, with its hash, and kept from the chain: the courier is told
    * the node took it while the chain never sees it, until the test hands it on.
    */
-  | { kind: 'withhold'; kept: (raw: string) => void };
+  | { kind: 'withhold'; kept: (raw: string) => void }
+  /**
+   * Pass the request on to the chain, and answer it with this error in place of the chain's answer, where `when` picks
+   * it by its params (every request of the method without it): the node has the request, and the client hears a named
+   * error. `forwarded` is told the chain's own answer to each, in the order they came.
+   */
+  | { kind: 'passThenError'; code: number; message: string; when?: (params: unknown[]) => boolean; forwarded: (answer: string) => void };
 
 export interface ChainProxy {
   url: string;
@@ -116,6 +122,12 @@ export interface ChainProxy {
    * the chain's answers; `stop` lifts the rule, so later ones pass as usual.
    */
   withhold(): { kept: string[]; arrived: Promise<void>; forward(): Promise<unknown[]>; stop(): void };
+  /**
+   * The requests of the method that `when` picks by their params (every one without it) are passed on to the chain,
+   * and each is answered with this error in place of the chain's answer: the node has the request, and the client
+   * hears a named error. `forwarded` holds the chain's own answers, in the order they came; `stop` lifts the rule.
+   */
+  passThenError(method: string, error: { code: number; message: string }, when?: (params: unknown[]) => boolean): { forwarded: unknown[]; stop(): void };
   close(): Promise<void>;
 }
 
@@ -189,6 +201,12 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
     }
     if (rule?.kind === 'refuse') {
       return { text: JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: rule.code, message: rule.message } }), how: 'refused' };
+    }
+    if (rule?.kind === 'passThenError' && (rule.when === undefined || rule.when(params))) {
+      // The chain has the request first, and answers it; then the client hears the error in place of that answer.
+      const text = await upstream(raw);
+      rule.forwarded(text);
+      return { text: JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: rule.code, message: rule.message } }), how: 'passedThenRefused' };
     }
     if (rule?.kind === 'refuseWhen') {
       // This request is already counted as arrived, so the nth is the count since the rule less the ones before it.
@@ -336,6 +354,16 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
       const released = new Promise<{ drop: boolean }>((resolve) => (releaseResolve = resolve));
       rules.set(method, { kind: 'passHold', passed: () => passedResolve(), released });
       return { passed, release: (how = {}) => releaseResolve({ drop: how.drop === true }) };
+    },
+    passThenError(method, error, when) {
+      const forwarded: unknown[] = [];
+      rules.set(method, { kind: 'passThenError', code: error.code, message: error.message, ...(when === undefined ? {} : { when }), forwarded: (answer) => forwarded.push(JSON.parse(answer) as unknown) });
+      return {
+        forwarded,
+        stop: () => {
+          if (rules.get(method)?.kind === 'passThenError') rules.delete(method);
+        },
+      };
     },
     withhold() {
       const kept: string[] = [];

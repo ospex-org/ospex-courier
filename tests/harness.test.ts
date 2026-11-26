@@ -5,7 +5,7 @@ import pg from 'pg';
 import { bytesToHex, concat, decodeErrorResult, encodeFunctionData, keccak256, type Abi, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { MATCHING_ABI, RELAY_ABI } from '../courier/chain/abi';
-import { createJsonRpc, NodeFailure } from '../courier/chain/rpc';
+import { createJsonRpc, handOff, NodeFailure } from '../courier/chain/rpc';
 import { testServer } from './support/database';
 import { testAccountKey, testKeystoreFor } from './support/keystore';
 import { orderOn, sign } from './support/orders';
@@ -207,6 +207,25 @@ test("the database's relay drops a commit's acknowledgement after the commit: th
     await plain.end();
     await relay.close();
     await db.end();
+  }
+});
+
+test("the chain's proxy passes a raw transaction on and answers it with a named error: the chain has these exact bytes, by their own hash, before the client hears the error; a transaction the rule does not pick passes as usual", async () => {
+  const client = createJsonRpc(proxy.url, 2_000);
+  const coin = rig.abis.TestCoin as Abi;
+  const data = encodeFunctionData({ abi: coin, functionName: 'transfer', args: [rig.accounts.stranger.address, 1n] });
+  const raw = await rawFrom(rig, 2, rig.addresses.coin, data, { gas: 100_000n, tip: 1_000_000_000n });
+  const rule = proxy.passThenError('eth_sendRawTransaction', { code: -32000, message: 'nonce too low' }, (params) => params[0] === raw);
+  try {
+    assert.deepEqual(await handOff(client, raw), { kind: 'unknown', words: 'nonce too low' }, 'the client hears the named error');
+    // By the time the client hears it, the chain has answered these bytes with their own hash.
+    assert.deepEqual(rule.forwarded.map((a) => (a as { result?: unknown }).result), [keccak256(raw)], "the chain's own answer, recorded before the error");
+    assert.notEqual(await minedReceipt(rig, keccak256(raw)), null, 'the chain has it, mined');
+    const other = await rawFrom(rig, 2, rig.addresses.coin, data, { gas: 100_000n, tip: 1_000_000_000n });
+    assert.deepEqual(await handOff(client, other), { kind: 'taken' }, 'one the rule does not pick passes as usual');
+    assert.equal(rule.forwarded.length, 1);
+  } finally {
+    rule.stop();
   }
 });
 
