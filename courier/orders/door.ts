@@ -101,7 +101,8 @@ function crossRecord(c: NonNullable<BetOutcome['cross']>, outcome: BetOutcome, b
   return {
     state: wireState(row, outcome.restored).state,
     handOffs: c.handOffs,
-    reason: c.reason,
+    // A not-sent Cross's reason, where the record holds one; a revert's comes with its evidence below. Absent otherwise.
+    ...(c.reason === null ? {} : { reason: c.reason }),
     message: crossMessage(row, terms, outcome.legs, outcome.restored),
     block: c.block,
     takerRisk: checked.takerRisk ?? null,

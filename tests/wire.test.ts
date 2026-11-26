@@ -90,6 +90,9 @@ const EXPIRY = 1_000n;
 const TERMS: BetTerms = { expiry: EXPIRY, riskAmount: STAKE, minFill: 1_000_000n, gameId: 7n, relay: '0x' + '5e'.repeat(20), decimals: 6 };
 const LEGS: LegForRecord[] = [{ position: 0, orderHash: h(9), account: '0x' + '0a'.repeat(20), oddsTick: 204, makerRisk: '9600000', takerRisk: '9984000', recordedMakerRisk: null, recordedTakerRisk: null, skip: null }];
 
+/** Every Cross the served case read back, with the row it was written from. */
+const SERVED: Array<{ row: CrossRow; restored: boolean; cross: Record<string, unknown> }> = [];
+
 /** Every message a case builds, with the row, the legs and the hold it was built from: each is served at the end. */
 const BUILT: Array<{ row: CrossRow; legs: readonly LegForRecord[]; restored: boolean }> = [];
 const render = crossMessage;
@@ -288,10 +291,21 @@ test("every row above, served: written as the sender writes a Cross's row, besid
       assert.equal(served.status, 200, JSON.stringify(served.body));
       const message = (served.body.cross as { message?: string } | null)?.message;
       assert.equal(message, render(r, terms, legs, c.restored), `row ${i + 1}, ${state}${c.restored ? ', restored' : ''}: ${JSON.stringify(served.body.cross)}`);
+      SERVED.push({ row: r, restored: c.restored, cross: served.body.cross as Record<string, unknown> });
     }
     console.log(`# every row served: ${cases.length} records read back, ${cases.filter((c) => c.restored).length} of them under the restore's hold`);
   } finally {
     await pool.end();
     await stack.close();
+  }
+});
+
+test("every Cross served above carries a reason only where its record holds one: a not-sent Cross its not-sent reason, a reverted one the chain's reason or unavailable; on every other state the field is absent, never null", () => {
+  assert.equal(SERVED.length, BUILT.length, 'every row was served');
+  for (const { row, restored, cross } of SERVED) {
+    const what = `${row.state}${restored ? ', restored' : ''}: ${JSON.stringify(cross)}`;
+    if (row.state === 'not sent') assert.equal(cross.reason, row.notSentReason, what);
+    else if (row.state === 'reverted') assert.equal(cross.reason, row.revertReason ?? 'unavailable', what);
+    else assert.equal('reason' in cross, false, what);
   }
 });

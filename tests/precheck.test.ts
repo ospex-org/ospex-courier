@@ -156,7 +156,7 @@ test("the worked bet: a maker who holds the other side is listed with an empty w
   const cross = record.cross as Record<string, unknown>;
   assert.equal(cross.state, 'confirmed');
   assert.equal(cross.handOffs, 1);
-  assert.equal(cross.reason, null);
+  assert.equal('reason' in cross, false, 'no reason on a confirmed Cross: the field is absent');
   const block = cross.block as { number: string; hash: string; time: string };
   const receipt = (cross.receipt as { block: { number: string } }).block;
   assert.ok(
