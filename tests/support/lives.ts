@@ -66,6 +66,92 @@ export function namedLives(stack: Stack, pool: pg.Pool) {
     return rows[0] ?? { held_bet: null, reservation: null, open_cross: null };
   }
 
+  /**
+   * The lane's committed history, watched in the test's own database: a trigger on the lane's row writes each change
+   * of it, with what the row held before and the state of the Cross it had open, to a table of the test's, in the
+   * change's own transaction. A change that aborts writes nothing there, so only reservations that committed are read,
+   * and never the sequence: an attempt that aborted took a number and is not a reservation. The lane's row is changed
+   * under its lock, so the history's order is the order its changes committed in. No line of the courier's code changes
+   * for it. Made once in the file's database; each history reads the rows after its own start.
+   */
+  let watching: Promise<void> | null = null;
+  function watchLane(): Promise<void> {
+    watching ??= (async () => {
+      await pool.query(`CREATE TABLE IF NOT EXISTS test_lane_watch (
+        n bigserial PRIMARY KEY, at timestamptz NOT NULL DEFAULT clock_timestamp(), sender text NOT NULL, epoch bigint,
+        held_bet text, reservation bigint, open_cross text, was_held text, was_reservation bigint, was_open_cross text, was_open_state text)`);
+      await pool.query(`CREATE OR REPLACE FUNCTION test_lane_watch() RETURNS trigger LANGUAGE plpgsql AS $w$
+        BEGIN
+          INSERT INTO test_lane_watch (sender, epoch, held_bet, reservation, open_cross, was_held, was_reservation, was_open_cross, was_open_state)
+          VALUES (NEW.sender, NEW.epoch, NEW.held_bet, NEW.reservation, NEW.open_cross,
+                  CASE WHEN TG_OP = 'UPDATE' THEN OLD.held_bet END, CASE WHEN TG_OP = 'UPDATE' THEN OLD.reservation END,
+                  CASE WHEN TG_OP = 'UPDATE' THEN OLD.open_cross END,
+                  CASE WHEN TG_OP = 'UPDATE' THEN (SELECT c.state FROM crosses c WHERE c.bet_hash = OLD.open_cross) END);
+          RETURN NEW;
+        END $w$`);
+      await pool.query('DROP TRIGGER IF EXISTS test_lane_watch ON lanes');
+      await pool.query('CREATE TRIGGER test_lane_watch AFTER INSERT OR UPDATE ON lanes FOR EACH ROW EXECUTE FUNCTION test_lane_watch()');
+    })();
+    return watching;
+  }
+
+  interface Watched {
+    n: string;
+    held_bet: string | null;
+    reservation: string | null;
+    open_cross: string | null;
+    was_open_cross: string | null;
+    was_open_state: string | null;
+  }
+
+  /** Where the lane's watched history stands now: a history reads the rows after it. */
+  async function watchMark(): Promise<bigint> {
+    await watchLane();
+    const { rows } = await pool.query<{ last: string | null }>('SELECT max(n)::text AS last FROM test_lane_watch');
+    return BigInt(rows[0]?.last ?? '0');
+  }
+
+  /** The lane's committed changes after `from`, in the order they committed. */
+  async function watched(from: bigint): Promise<Watched[]> {
+    const { rows } = await pool.query<Watched>(
+      'SELECT n, held_bet, reservation, open_cross, was_open_cross, was_open_state FROM test_lane_watch WHERE n > $1 AND sender = $2 ORDER BY n',
+      [from.toString(), stack.rig.accounts.sender.address.toLowerCase()],
+    );
+    return rows.map((r) => ({ ...r, n: String(r.n), reservation: r.reservation === null ? null : String(r.reservation) }));
+  }
+
+  /** The first bet's reservation, read from the committed change that made the lane hold it. */
+  async function firstReservation(from: bigint, first: string): Promise<string> {
+    const took = (await watched(from)).find((w) => w.held_bet === first);
+    assert.ok(took !== undefined && took.reservation !== null, `the lane's committed change that took the first bet: ${JSON.stringify(await watched(from))}`);
+    return took.reservation as string;
+  }
+
+  /**
+   * The whole interval, in both lives, from the lane's committed history: while the lane holds the first bet, its
+   * reservation is the first's own; and after it, no reservation commits, for any bet, before the first Cross's outcome
+   * does. The change that ends the first bet's hold is the one that frees the lane, in the transaction that wrote its
+   * Cross's outcome; only then is the second bet reserved.
+   */
+  async function wholeInterval(from: bigint, first: string, second: string, reservation: string): Promise<void> {
+    const history = await watched(from);
+    const shown = JSON.stringify(history);
+    const i0 = history.findIndex((w) => w.held_bet === first);
+    assert.ok(i0 >= 0, `the lane took the first bet: ${shown}`);
+    for (const w of history) if (w.held_bet === first) assert.equal(w.reservation, reservation, `the lane holds the first bet under its own reservation at every committed change, in both lives: ${shown}`);
+    const i1 = history.findIndex((w, i) => i > i0 && w.held_bet !== first);
+    assert.ok(i1 > i0, `the first bet's hold ends: ${shown}`);
+    const freed = history[i1] as Watched;
+    assert.deepEqual(
+      [freed.held_bet, freed.reservation, freed.open_cross, freed.was_open_cross],
+      [null, null, null, first],
+      `no reservation committed before the first Cross's outcome: the change after the first bet's hold frees the lane: ${shown}`,
+    );
+    assert.ok(freed.was_open_state !== null && FINAL.includes(freed.was_open_state), `and frees it in the transaction of the first Cross's outcome: ${shown}`);
+    const i2 = history.findIndex((w) => w.held_bet === second);
+    assert.ok(i2 > i1, `the second bet is reserved only after: ${shown}`);
+  }
+
   async function crossRow(bet: string): Promise<Row | null> {
     const { rows } = await pool.query<Row>('SELECT state, hand_offs, tx_hash, nonce::text AS nonce, node_answer FROM crosses WHERE bet_hash = $1', [bet.toLowerCase()]);
     return rows[0] ?? null;
@@ -146,7 +232,7 @@ export function namedLives(stack: Stack, pool: pg.Pool) {
    * After the restart, the bet that waited is reserved only once the first is settled, and both are sent once: the
    * first's Cross the same, at the same nonce, as before the process died.
    */
-  async function afterTheRestart(first: string, second: string, held: Row, history: History, s0: number, handOffLines: 0 | 1): Promise<void> {
+  async function afterTheRestart(first: string, second: string, held: Row, history: History, s0: number, handOffLines: 0 | 1, from: bigint, reservation: string): Promise<void> {
     // F held a while longer: the new life settles nothing and reserves nothing while the outcome cannot be proved.
     await new Promise((r) => setTimeout(r, 4_000));
     const waiting = await crossRow(first);
@@ -154,6 +240,7 @@ export function namedLives(stack: Stack, pool: pg.Pool) {
     assert.equal(await crossRow(second), null, 'nothing reserved before the outcome');
     const lane = await laneRow();
     assert.deepEqual([lane.held_bet, lane.open_cross], [first, first], `the lane still holds the first bet and its Cross, and no other is reserved: ${JSON.stringify(lane)}`);
+    assert.equal(lane.reservation, reservation, `in the new life, the lane holds the first bet under its own reservation: ${JSON.stringify(lane)}`);
     followFinal();
     const row = await final(first);
     const row2 = await final(second);
@@ -161,12 +248,8 @@ export function namedLives(stack: Stack, pool: pg.Pool) {
     assert.deepEqual([row?.tx_hash, row?.nonce, row?.hand_offs], [held.tx_hash, held.nonce, 1], 'the same Cross, nonce and hand-off');
     assert.deepEqual({ first: requestsOf(row?.tx_hash), second: requestsOf(row2?.tx_hash) }, { first: 1, second: 1 }, 'one request for each bet: the first never sent again');
     assert.equal(signed() - s0, 2, 'one signature for each bet, across both lives');
-    const settled = await pool.query<{ outcome: Date; intent: Date | null }>(
-      `SELECT a.outcome_at AS outcome, b.intent_at AS intent FROM crosses a LEFT JOIN crosses b ON b.bet_hash = $2 WHERE a.bet_hash = $1`,
-      [first, second],
-    );
-    const t = settled.rows[0] as { outcome: Date; intent: Date | null };
-    assert.ok(t.intent === null || t.intent >= t.outcome, 'the lane reserved the second bet only after the first was settled');
+    // The reservation's identity and the whole interval, from the reservations that committed, in both lives.
+    await wholeInterval(from, first, second, reservation);
     assert.equal(row2?.state, 'confirmed', JSON.stringify(row2));
     // The hand-off's line, written once where the answer was recorded before the process died, and never again: the
     // new life's looks and its outcome add none. Nothing names the reserved reason.
@@ -183,6 +266,7 @@ export function namedLives(stack: Stack, pool: pg.Pool) {
   return {
     /** The answer recorded, then a restart with F held. */
     async recordedThenRestart(history: History): Promise<void> {
+      const from = await watchMark();
       const s0 = signed();
       await holdFinal();
       const lift = named(history);
@@ -196,14 +280,17 @@ export function namedLives(stack: Stack, pool: pg.Pool) {
       }
       assert.ok(['unknown', 'pending'].includes(held.state), JSON.stringify(held));
       assert.deepEqual(held.node_answer, { kind: 'unknown', words: WORDS }, 'not known, with the fixed words alone');
+      const reservation = await firstReservation(from, c.betHash);
       // A second bet waits behind it, and is reserved only after the first is settled.
       const second = await quoteAndBet();
+      assert.equal((await laneRow()).reservation, reservation, 'in the old life, the lane holds the first bet under its own reservation');
       await killAndRestart();
-      await afterTheRestart(c.betHash, second.betHash, held, history, s0, 1);
+      await afterTheRestart(c.betHash, second.betHash, held, history, s0, 1, from, reservation);
     },
 
     /** Killed after the hand-off was answered and before the answer's record, with F held. */
     async killedBeforeRecord(history: History): Promise<void> {
+      const from = await watchMark();
       const s0 = signed();
       await holdFinal();
       const lift = named(history);
@@ -217,13 +304,16 @@ export function namedLives(stack: Stack, pool: pg.Pool) {
       }
       const held = (await crossRow(c.betHash)) as Row;
       assert.deepEqual([held.state, held.hand_offs, held.node_answer], ['handing off', 1, null], 'handed once, its answer not recorded');
+      const reservation = await firstReservation(from, c.betHash);
       const second = await quoteAndBet();
+      assert.equal((await laneRow()).reservation, reservation, 'in the old life, the lane holds the first bet under its own reservation');
       await killAndRestart();
-      await afterTheRestart(c.betHash, second.betHash, held, history, s0, 0);
+      await afterTheRestart(c.betHash, second.betHash, held, history, s0, 0, from, reservation);
     },
 
     /** Killed at once after the answer was committed, with F held. */
     async killedAfterCommit(history: History): Promise<void> {
+      const from = await watchMark();
       const s0 = signed();
       await holdFinal();
       const lift = named(history);
@@ -236,14 +326,17 @@ export function namedLives(stack: Stack, pool: pg.Pool) {
         lift();
       }
       assert.deepEqual(held.node_answer, { kind: 'unknown', words: WORDS });
+      const reservation = await firstReservation(from, c.betHash);
       const second = await quoteAndBet();
+      assert.equal((await laneRow()).reservation, reservation, 'in the old life, the lane holds the first bet under its own reservation');
       // Killed at once, with the answer committed and nothing yet settled.
       await killAndRestart();
-      await afterTheRestart(c.betHash, second.betHash, held, history, s0, 1);
+      await afterTheRestart(c.betHash, second.betHash, held, history, s0, 1, from, reservation);
     },
 
     /** The answer's record: its commit acknowledged to nobody, committed; or cut before its commit, not committed. */
     async answerCut(committed: boolean, history: History): Promise<void> {
+      const from = await watchMark();
       const s0 = signed();
       await holdFinal();
       const lift = named(history);
@@ -265,6 +358,7 @@ export function namedLives(stack: Stack, pool: pg.Pool) {
       const held = (await until(() => crossRow(c.betHash), (r) => r !== null && r.hand_offs === 1, 10_000, 'handed once')) as Row;
       if (committed) assert.deepEqual([held.state, held.node_answer], ['unknown', { kind: 'unknown', words: WORDS }], 'the record committed');
       else assert.deepEqual([held.state, held.node_answer], ['handing off', null], 'the record not committed');
+      const reservation = await firstReservation(from, c.betHash);
       // The process that lost its answer's record sends nothing more: the bet that waits is not reserved, signed or handed off.
       const r0 = requests();
       const s1 = signed();
@@ -272,8 +366,9 @@ export function namedLives(stack: Stack, pool: pg.Pool) {
       assert.deepEqual({ signed: signed() - s1, requests: requests() - r0, second: await crossRow(second.betHash) }, { signed: 0, requests: 0, second: null }, 'no new sending right');
       const lane = await laneRow();
       assert.deepEqual([lane.held_bet, lane.open_cross], [c.betHash, c.betHash], `the lane still holds the first bet and its Cross, and the bet that waits is not reserved: ${JSON.stringify(lane)}`);
+      assert.equal(lane.reservation, reservation, `in the old life, the lane holds the first bet under its own reservation: ${JSON.stringify(lane)}`);
       await killAndRestart();
-      await afterTheRestart(c.betHash, second.betHash, held, history, s0, committed ? 1 : 0);
+      await afterTheRestart(c.betHash, second.betHash, held, history, s0, committed ? 1 : 0, from, reservation);
     },
   };
 }
