@@ -33,6 +33,12 @@ export interface TcpRelay {
    * each execute of the extended protocol, as PostgreSQL counts a command, BEGIN, COMMIT and ROLLBACK included.
    */
   commands(): number;
+  /**
+   * The notices the database has sent the clients through the relay since the last call, on every connection: each
+   * NoticeResponse's message, with the time it passed, in milliseconds since the epoch. They are read as they pass;
+   * what the clients receive is not changed.
+   */
+  takeNotices(): Array<{ at: number; message: string }>;
   close(): Promise<void>;
 }
 
@@ -63,6 +69,39 @@ function commandCounter(count: () => void): (chunk: Buffer) => void {
   };
 }
 
+/**
+ * Reads the notices in what the database sends a client: its typed messages, each a type byte and a length, after the
+ * one untyped byte that answers an SSL or GSS request where the client made one. Each NoticeResponse's message field is
+ * handed on; nothing is changed.
+ */
+function noticeReader(askedFirst: () => boolean, notice: (message: string) => void): (chunk: Buffer) => void {
+  let first = true;
+  let pending: Buffer = Buffer.alloc(0);
+  return (chunk) => {
+    pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
+    if (first && pending.length > 0) {
+      first = false;
+      if (askedFirst()) pending = pending.subarray(1);
+    }
+    for (;;) {
+      if (pending.length < 5) return;
+      const length = pending.readInt32BE(1);
+      if (pending.length < 1 + length) return;
+      if (pending[0] === 0x4e) {
+        // Its fields: a code byte and a zero-terminated text each, ended by a zero byte.
+        let at = 5;
+        while (at < 1 + length && pending[at] !== 0) {
+          const stop = pending.indexOf(0, at + 1);
+          if (stop < 0 || stop > length) break;
+          if (pending[at] === 0x4d) notice(pending.subarray(at + 1, stop).toString('utf8'));
+          at = stop + 1;
+        }
+      }
+      pending = pending.subarray(1 + length);
+    }
+  };
+}
+
 /** A simple query whose text is COMMIT, as pg sends it: the type byte, the length, the text and its terminating zero. */
 const COMMIT = Buffer.concat([Buffer.from('Q'), Buffer.from([0, 0, 0, 11]), Buffer.from('COMMIT', 'utf8'), Buffer.from([0])]);
 
@@ -73,6 +112,7 @@ export async function startTcpRelay(upstreamPort: number): Promise<TcpRelay> {
   let dropAfter: { marker: Buffer; done: () => void } | null = null;
   let commitAfter: { marker: Buffer; done: () => void } | null = null;
   let commands = 0;
+  let notices: Array<{ at: number; message: string }> = [];
   const server: Server = createServer((socket) => {
     if (isCut) {
       socket.destroy();
@@ -83,6 +123,12 @@ export async function startTcpRelay(upstreamPort: number): Promise<TcpRelay> {
     sockets.add(up);
     socket.pipe(up).pipe(socket);
     socket.on('data', commandCounter(() => commands++));
+    // Whether the client opened with an SSL or GSS request, whose answer is one untyped byte before the typed messages.
+    let asked: boolean | null = null;
+    socket.once('data', (chunk: Buffer) => {
+      asked = chunk.length >= 4 && chunk.readInt32BE(0) === 8;
+    });
+    up.on('data', noticeReader(() => asked === true, (message) => notices.push({ at: Date.now(), message })));
     socket.on('data', (chunk: Buffer) => {
       const armed = dropAfter;
       if (armed === null || !chunk.includes(armed.marker)) return;
@@ -156,6 +202,11 @@ export async function startTcpRelay(upstreamPort: number): Promise<TcpRelay> {
       for (const s of sockets) s.resume();
     },
     commands: () => commands,
+    takeNotices() {
+      const taken = notices;
+      notices = [];
+      return taken;
+    },
     dropAnswerAfter(marker) {
       return new Promise<void>((resolve) => {
         dropAfter = { marker: Buffer.from(marker, 'utf8'), done: resolve };
