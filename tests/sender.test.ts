@@ -31,7 +31,12 @@ const get = (u: string, path: string) => getFrom(u, path, from);
 const postStop = (...a: Parameters<typeof postStopFrom>) => postStopFrom(a[0], a[1], a[2], a[3], a[4], a[5] ?? from);
 
 before(async () => {
-  stack = await startStack('sender', { hooked: true, blockTime: 2, sending: true });
+  stack = await startStack('sender', {
+    hooked: true,
+    blockTime: 2,
+    sending: true,
+    sendsApart: { unsent: "the gate's acknowledgement lost leaves a hand-off in the records that never reached the node" },
+  });
   stack.proxy.finalFollows(1n);
   pool = new pg.Pool({ connectionString: stack.databaseUrl, max: 2 });
 });
