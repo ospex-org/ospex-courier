@@ -1,7 +1,7 @@
 import type pg from 'pg';
 import { decodeFunctionData, type Address, type Hex } from 'viem';
 import { RELAY_ABI } from '../chain/abi';
-import { byHash, receiptOf, transactionCountAt, transactionOf, type Header, type JsonRpc } from '../chain/rpc';
+import { byHash, receiptOf, transactionCountAt, transactionOf, type Header, type JsonRpc, type TransactionSeen } from '../chain/rpc';
 import type { BettingSet } from '../chain/set';
 import { ChainUnreachable, type ChainReader } from '../chain/snapshot';
 import { orderHash, type OrderFields } from '../orders/order';
@@ -9,9 +9,10 @@ import { crossesOfKey, crossRow, freeLaneOf, legsOf, writeActionOnce, writeFinal
 import { lockLane, raiseWatermark, readLane } from '../records/lanes';
 import type { OrderRow } from '../records/orders';
 import type { Store } from '../records/store';
-import { filledAtF, onFinalChain, readCrossReceipt, type Named } from './chain';
+import { filledAtF, onFinalChain, type Named } from './chain';
 import { blocksToShow, explainingBlock } from './checks';
-import { searchNonce } from './outcome';
+import { ran, searchNonce, type Expected } from './outcome';
+import { ranWrite } from './settle';
 
 // Recovery under a restore's hold. Nothing is reserved, signed or handed off
 // on the restored database, and nothing here releases its hold: retained rows
@@ -136,7 +137,7 @@ export async function reconcileRestored(deps: RecoveryDeps, key: Address, restor
       if (tx === null) return { done: false, missing: `nonce ${n}: the transaction the search found could not be read` };
       const taking = tx.to !== null && tx.to.toLowerCase() === deps.set.relay.toLowerCase() ? takingOf(deps.set, tx.input) : null;
       if (intent !== null && taking !== null && taking === intent.betHash.toLowerCase()) {
-        const closed = await closeIntentFound(deps, key, intent, F, n, found.found);
+        const closed = await closeIntentFound(deps, key, intent, F, n, count, found.found, tx);
         if (closed === 'unresolved') return { done: false, missing: `nonce ${n}: the found transaction's outcome could not be read whole` };
         intent = null;
         continue;
@@ -191,47 +192,63 @@ export async function reconcileRestored(deps: RecoveryDeps, key: Address, restor
   }
 }
 
-/** A retained intent whose transaction the search found at nonce n, in a block on F's chain: its outcome from that receipt, the key, nonce and hash written with it. */
-async function closeIntentFound(deps: RecoveryDeps, key: Address, intent: CrossRow, F: Header, n: bigint, found: { hash: Hex; block: Named }): Promise<'closed' | 'unresolved'> {
-  const receipt = await deps.chain.ask(F, () => receiptOf(deps.rpc, found.hash));
-  if (receipt === null || receipt.blockHash.toLowerCase() !== found.block.hash.toLowerCase()) return 'unresolved';
+/**
+ * A retained intent whose transaction the search found at nonce n, in a block on F's chain: closed as the settling
+ * closes any Cross, with the same checks at F, its record from the receipt, its quotes' marks at F and, for a revert,
+ * the reason from one trace; the key, nonce and hash written with it. Under recovery's own guard: the hold stands,
+ * and the intent's hand-offs stay as recorded.
+ */
+async function closeIntentFound(deps: RecoveryDeps, key: Address, intent: CrossRow, F: Header, n: bigint, count: bigint, found: { hash: Hex; block: Named }, tx: TransactionSeen): Promise<'closed' | 'unresolved'> {
   const bet = await deps.store.orders.get(intent.betHash, deps.store.lane);
   if (bet === null) throw new Error('a retained intent has no bet');
-  const filled = (await filledAtF(deps.chain, deps.set, F, [intent.betHash])).get(intent.betHash.toLowerCase());
-  if (filled === undefined) return 'unresolved';
-  const legs = await legsOf(deps.store.lane, intent.betHash);
-  const record = receipt.status === 'success' ? readCrossReceipt(deps.set, receipt, intent.betHash) : null;
-  if (record !== null && (record.legs.length !== legs.length || record.legs.some((l, i) => l.orderHash.toLowerCase() !== (legs[i] as { orderHash: Hex }).orderHash.toLowerCase()))) return 'unresolved';
-  const state = receipt.status === 'success' ? 'confirmed' : 'reverted';
-  await owned(deps, key, async (client) => {
-    const wrote = await writeFinal(
-      client,
-      intent.betHash,
-      {
-        state,
-        final: { number: F.number, hash: F.hash },
-        receipt: { number: receipt.blockNumber, hash: receipt.blockHash },
-        gasUsed: receipt.gasUsed,
-        effectiveGasPrice: receipt.effectiveGasPrice,
-        ...(state === 'reverted' ? { revert: { reason: 'unavailable', evidence: 'unavailable' as const, data: null } } : {}),
-        recorded: { betFilled: s(filled), final: finalNamed(F), restored: 'intent', foundBySearch: true },
-        ...(record === null ? {} : { legs: record.legs.map((e, i) => ({ position: i, makerRisk: e.kind === 'filled' ? e.makerRisk : null, takerRisk: e.kind === 'filled' ? e.takerRisk : null, skip: e.kind === 'skipped' ? e.reason : null })) }),
-        associate: { sender: key, nonce: n, txHash: found.hash },
-      },
-      'intent',
-    );
-    if (!wrote) return;
-    await lineOn(deps, client, bet, state === 'confirmed' ? 'cross confirmed' : 'cross reverted', state === 'confirmed' ? 'CONFIRMED' : 'unavailable', {
-      restored: 'intent',
-      txHash: found.hash,
-      nonce: s(n),
-      block: { number: s(receipt.blockNumber), hash: receipt.blockHash },
-      final: finalNamed(F),
-      betFilled: s(filled),
-      handOffs: intent.handOffs,
+  /** Evidence that conflicts with what the search found: an incident line with the reads judged, once; the intent stays unresolved. */
+  const conflicting = async (facts: Record<string, unknown>): Promise<'unresolved'> => {
+    await owned(deps, key, async (client) => {
+      const { rowCount } = await client.query(`SELECT 1 FROM events WHERE kind = 'incident' AND reason = 'CHAIN_CONTRADICTS_RECORDS' AND bet_hash = $1`, [bet.hash.toLowerCase()]);
+      if ((rowCount ?? 0) > 0) return;
+      await lineOn(deps, client, bet, 'incident', 'CHAIN_CONTRADICTS_RECORDS', { lane: key, betHash: bet.hash, restored: 'intent', final: finalNamed(F), ...facts });
     });
+    deps.log(`recovery: the evidence for a retained intent's found transaction conflicts (${String(facts.why)}); it stays unresolved`);
+    return 'unresolved';
+  };
+  // Bound to one another before any of the settling's checks, as the settling's look binds them: the transaction the
+  // search found from this key at this nonce, its receipt by its own hash, and that receipt's block, the one the search
+  // found, shown on F's chain.
+  if (tx.hash.toLowerCase() !== found.hash.toLowerCase() || tx.from.toLowerCase() !== key.toLowerCase() || tx.nonce !== n) {
+    return conflicting({ why: 'the transaction read by the found hash is not the one the search found from the key at this nonce', found: found.hash, nonce: s(n), read: { hash: tx.hash, from: tx.from, nonce: s(tx.nonce) } });
+  }
+  const receipt = await deps.chain.ask(F, () => receiptOf(deps.rpc, found.hash));
+  if (receipt === null) return 'unresolved';
+  if (receipt.transactionHash.toLowerCase() !== found.hash.toLowerCase()) {
+    return conflicting({ why: 'the receipt read by the found hash is of another transaction', asked: found.hash, got: receipt.transactionHash });
+  }
+  if (receipt.blockNumber !== found.block.number || receipt.blockHash.toLowerCase() !== found.block.hash.toLowerCase()) {
+    return conflicting({ why: "the receipt's block is not the block the search found", found: { number: s(found.block.number), hash: found.block.hash }, receipt: { number: s(receipt.blockNumber), hash: receipt.blockHash } });
+  }
+  const [shown] = await onFinalChain(deps.chain, deps.rpc, F, [{ number: receipt.blockNumber, hash: receipt.blockHash }]);
+  if (shown !== true) return 'unresolved';
+  const legs = await legsOf(deps.store.lane, intent.betHash);
+  // The Cross as the search found it: this transaction, at this nonce.
+  const asFound: CrossRow = { ...intent, nonce: n, txHash: found.hash };
+  const ranDeps = { chain: deps.chain, rpc: deps.rpc, set: deps.set, key };
+  const atH = typeof intent.checked.betFilled === 'string' ? { block: { number: intent.block.number, hash: intent.block.hash }, betFilled: BigInt(intent.checked.betFilled) } : null;
+  const expected: Expected = { betHash: bet.hash, account: bet.order.account, expiry: bet.order.expiry, legs: legs.map((l) => ({ orderHash: l.orderHash })), atH };
+  const l = await ran(ranDeps, F, asFound, expected, receipt, count);
+  // The chain's own state at F contradicts the receipt, as the settling judges it. Under the hold nothing is sent in any case.
+  if (l.kind === 'contradiction') return conflicting(l.facts);
+  if (l.kind !== 'ran') return 'unresolved';
+  const w = await ranWrite(ranDeps, bet, asFound, legs, l);
+  // The association, the record, the legs, the marks and the line commit together, or none of them: under the lane's
+  // owner and the move from intent alone. A stale owner, or a Cross already moved, writes nothing.
+  let wrote = false;
+  const mine = await owned(deps, key, async (client) => {
+    wrote = await writeFinal(client, intent.betHash, { ...w.outcome, recorded: { ...w.outcome.recorded, restored: 'intent', foundBySearch: true }, associate: { sender: key, nonce: n, txHash: found.hash } }, 'intent');
+    if (!wrote) return;
+    if (w.marks.length > 0) await deps.store.orders.markEndedAtFinal(client, w.marks, { number: F.number, hash: F.hash });
+    await lineOn(deps, client, bet, w.line.kind, w.line.reason, { ...w.line.facts, restored: 'intent', handOffs: intent.handOffs });
     await freeLaneOf(client, key, intent.betHash);
   });
+  if (!mine || !wrote) deps.log(`recovery: a retained intent's found transaction was not written by this process: ${mine ? 'its Cross had already moved from intent' : 'the lane is not this process\'s now'}`);
   return 'closed';
 }
 

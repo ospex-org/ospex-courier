@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { after, before, beforeEach, test } from 'node:test';
-import { encodeFunctionData, type Abi, type Hex } from 'viem';
+import { decodeFunctionData, decodeFunctionResult, encodeFunctionData, encodeFunctionResult, type Abi, type Hex } from 'viem';
 import type { HDAccount } from 'viem/accounts';
 import pg from 'pg';
-import { RELAY_SENDER_SLOT } from '../courier/chain/abi';
-import { startHookedCourier, type CourierProcess, type HookControl } from './support/courier';
+import { MULTICALL_ABI, RELAY_SENDER_SLOT } from '../courier/chain/abi';
+import { coinAmount } from '../courier/orders/order';
+import { get, startHookedCourier, type CourierProcess, type HookControl } from './support/courier';
 import { testKeystoreFor } from './support/keystore';
 import { orderOn, postOrder as postOrderFrom, type Order } from './support/orders';
 import { closeEach } from './support/close';
@@ -533,6 +534,266 @@ test("a stop recorded after the copy: lost with the restore, the stated exceptio
     assert.equal(await zeroReservations(copy.pool), '0');
     assert.deepEqual({ s: signed() - before.s, h: handOffs() - before.h }, { s: 0, h: 0 });
   } finally {
+    await stopAll();
+    await stack.restartCourier({ hooked: true });
+  }
+});
+
+/** A transaction of `who`, signed here and sent to the chain's pool at this tip, not waited for. */
+async function sendFrom(who: HDAccount, to: Hex, data: Hex, tip: bigint): Promise<Hex> {
+  const nonce = Number(BigInt((await stack.rig.rpc('eth_getTransactionCount', [who.address, 'pending'])) as string));
+  const block = (await stack.rig.rpc('eth_getBlockByNumber', ['latest', false])) as { baseFeePerGas: Hex };
+  const raw = await who.signTransaction({ type: 'eip1559', chainId: 31337, to, data, value: 0n, nonce, gas: 200_000n, maxFeePerGas: BigInt(block.baseFeePerGas) * 3n + tip, maxPriorityFeePerGas: tip });
+  return (await stack.rig.rpc('eth_sendRawTransaction', [raw])) as Hex;
+}
+
+interface Found {
+  bet: string;
+  B: HDAccount;
+  quote: string;
+  copy: { url: string; pool: pg.Pool };
+  /** The Cross as the database that went on settled it, by the ordinary path. */
+  settled: { state: string; txHash: string; recorded: Record<string, unknown> };
+  /** Each listed quote's mark on the database that went on, after the ordinary path's outcome. */
+  marks: Array<{ hash: string; ended: string | null; ended_final: boolean }>;
+}
+
+/**
+ * A found intent's set-up: the copy taken while B's Cross is at its intent on the database that goes on; that courier
+ * then sends B, which fills, or, with `revert`, reverts by B's own allowance taken back in the Cross's block and before
+ * it; every courier stopped, and the operator's shut on the copy. The copy's courier is the case's to start.
+ */
+async function foundIntent(prefix: string, revert = false): Promise<Found> {
+  await backToTheOriginal();
+  const hooks = stack.courier.hooks as HookControl;
+  const listed = await quote(await fresh(), url());
+  await hooks.arm('after-intent', 1);
+  if (revert) {
+    await hooks.arm('after-gate', 1);
+    await hooks.arm('after-hand-off', 1);
+  }
+  const B = await fresh();
+  const b = await bet(B, url());
+  assert.equal(b.status, 202, JSON.stringify(b.body));
+  const atIntent = await hooks.reached('after-intent');
+  const copy = await copyDatabase(prefix);
+  assert.equal(await crossState(copy.pool, b.hash), 'intent');
+  await hooks.go(atIntent);
+  if (revert) {
+    const gate = await hooks.reached('after-gate');
+    await stack.rig.rpc('evm_setIntervalMining', [0]);
+    await hooks.go(gate);
+    const handed = await hooks.reached('after-hand-off');
+    try {
+      await sendFrom(B, stack.rig.addresses.coin, encodeFunctionData({ abi: stack.rig.abis.TestCoin as Abi, functionName: 'approve', args: [stack.rig.addresses.positions, 0n] }), 50_000_000_000n);
+      await stack.rig.rpc('anvil_mine', ['0x1']);
+    } finally {
+      await stack.rig.rpc('evm_setIntervalMining', [2]);
+      await hooks.go(handed);
+    }
+  }
+  const state = await until(() => crossState(original, b.hash), (s) => s === (revert ? 'reverted' : 'confirmed'), 90_000, 'B settled on the database that went on');
+  const row = (await original.query<{ tx_hash: string; recorded: Record<string, unknown> }>('SELECT tx_hash, recorded FROM crosses WHERE bet_hash = $1', [b.hash.toLowerCase()])).rows[0] as { tx_hash: string; recorded: Record<string, unknown> };
+  const marks = (await original.query<{ hash: string; ended: string | null; ended_final: boolean }>('SELECT o.hash, o.ended, o.ended_final FROM legs l JOIN orders o ON o.hash = l.order_hash WHERE l.bet_hash = $1 ORDER BY l.position', [b.hash.toLowerCase()])).rows;
+  await stopAll();
+  const shut = await operator(copy.url, ['shut', '--copy-time', new Date().toISOString()]);
+  assert.equal(shut.status, 0, shut.out);
+  return { bet: b.hash, B, quote: listed, copy, settled: { state: String(state), txHash: row.tx_hash, recorded: row.recorded }, marks };
+}
+
+/** One listed quote's mark on the copy, by hash. */
+const copyMarks = async (f: Found) =>
+  (await f.copy.pool.query<{ hash: string; ended: string | null; ended_final: boolean }>('SELECT o.hash, o.ended, o.ended_final FROM legs l JOIN orders o ON o.hash = l.order_hash WHERE l.bet_hash = $1 ORDER BY l.position', [f.bet.toLowerCase()])).rows;
+const conflicts = async (f: Found) => (await f.copy.pool.query<{ facts: Record<string, unknown> }>(`SELECT facts FROM events WHERE kind = 'incident' AND reason = 'CHAIN_CONTRADICTS_RECORDS' AND bet_hash = $1`, [f.bet.toLowerCase()])).rows;
+const outcomeLines = async (f: Found) => (await f.copy.pool.query(`SELECT 1 FROM events WHERE kind IN ('cross confirmed', 'cross reverted') AND bet_hash = $1`, [f.bet.toLowerCase()])).rows.length;
+
+/** The copy's lanes as they stand: what each holds and under which reservation. */
+const lanesOf = async (pool: pg.Pool) => (await pool.query<{ sender: string; reservation: string | null; held_bet: string | null }>('SELECT sender, reservation::text AS reservation, held_bet FROM lanes ORDER BY sender')).rows;
+
+/**
+ * While the found intent is unresolved on the copy: no outcome, no mark, no line, the hand-offs the copy kept, and
+ * nothing reserved, signed or handed off: the lanes hold only what the copy held when its courier started, the
+ * retained intent's reservation among it.
+ */
+async function unresolvedAndHeld(f: Found, before: { s: number; h: number; lanes: Awaited<ReturnType<typeof lanesOf>> }): Promise<void> {
+  const row = (await f.copy.pool.query<{ state: string; hand_offs: number; tx_hash: string | null }>('SELECT state, hand_offs, tx_hash FROM crosses WHERE bet_hash = $1', [f.bet.toLowerCase()])).rows[0];
+  assert.deepEqual(row, { state: 'intent', hand_offs: 0, tx_hash: null }, 'unresolved, with nothing associated');
+  assert.ok((await copyMarks(f)).every((m) => m.ended === null), `no mark: ${JSON.stringify(await copyMarks(f))}`);
+  assert.equal(await outcomeLines(f), 0, 'no outcome line');
+  assert.deepEqual(await lanesOf(f.copy.pool), before.lanes, 'no new reservation: the lanes hold what the copy held');
+  assert.deepEqual({ s: signed() - before.s, h: handOffs() - before.h }, { s: 0, h: 0 }, 'nothing signed or handed off');
+}
+
+/** The found intent settled on the copy as the database that went on settled it: the record, the marks, the served amount and cash. */
+async function settledAsTheOriginal(f: Found, courier: CourierProcess): Promise<void> {
+  const row = (await f.copy.pool.query<{ state: string; recorded: Record<string, unknown>; hand_offs: number; tx_hash: string | null }>('SELECT state, recorded, hand_offs, tx_hash FROM crosses WHERE bet_hash = $1', [f.bet.toLowerCase()])).rows[0];
+  const recorded = row?.recorded as Record<string, unknown>;
+  assert.equal(row?.state, f.settled.state);
+  assert.equal(row?.tx_hash, f.settled.txHash, 'the found transaction associated');
+  assert.equal(row?.hand_offs, 0, 'the hand-offs the copy kept');
+  for (const k of ['totals', 'pulls', 'paysBack', 'paysBackRefused', 'skipped', 'marketCreated']) assert.deepEqual(recorded[k], f.settled.recorded[k], `the record's ${k}`);
+  assert.deepEqual(await copyMarks(f), f.marks, "the listed quotes' marks, as the ordinary path made them");
+  const served = await get(courier.url, `/v1/orders/${f.bet}`);
+  const cross = served.body.cross as Record<string, unknown>;
+  const filled = coinAmount(BigInt((f.settled.recorded.totals as { taker: string }).taker), 6);
+  assert.ok(String(cross.message).includes(`It filled ${filled} USDC of this bet's`), String(cross.message));
+  assert.deepEqual(cross.recordedPulls, f.settled.recorded.pulls, 'the cash the receipt moved, served');
+  assert.equal(await zeroReservations(f.copy.pool), '0', 'the hold stands');
+}
+
+/** The copy's courier started, with the signatures and hand-offs counted from its start. */
+async function startOnCopy(f: Found): Promise<{ courier: CourierProcess & { hooks: HookControl }; before: { s: number; h: number; lanes: Awaited<ReturnType<typeof lanesOf>> } }> {
+  const before = { s: signed(), h: handOffs(), lanes: await lanesOf(f.copy.pool) };
+  const courier = await startHookedCourier({ ...stack.env, DATABASE_URL: f.copy.url });
+  extra.push(courier);
+  return { courier, before };
+}
+
+test("a copy taken at the bet's intent, its transaction then sent and filled by the courier that went on: found by the search, the restored Cross is settled as any Cross is, with the receipt's totals, pulls and pay-backs, its quotes marked at the final block as the ordinary path marked them, and the bet told what this transaction filled; the hand-offs the copy kept, and the hold stands", async () => {
+  const f = await foundIntent('restored_found');
+  try {
+    const { courier, before } = await startOnCopy(f);
+    await until(() => crossState(f.copy.pool, f.bet), (s) => s === 'confirmed', 90_000, 'the found intent settled');
+    await settledAsTheOriginal(f, courier);
+    assert.deepEqual({ s: signed() - before.s, h: handOffs() - before.h }, { s: 0, h: 0 }, 'nothing signed or handed off');
+  } finally {
+    await stopAll();
+    await stack.restartCourier({ hooked: true });
+  }
+});
+
+test("a copy taken at the bet's intent, its transaction then sent by the courier that went on and reverted by the bettor's own allowance taken back in the same block: found by the search, the restored Cross is reverted with the reason one trace gives, pinned on the bettor, with the gas it paid on its line, and no quote marked; the hand-offs the copy kept, and the hold stands", async () => {
+  const f = await foundIntent('restored_found_reverted', true);
+  try {
+    const { before } = await startOnCopy(f);
+    await until(() => crossState(f.copy.pool, f.bet), (s) => s === 'reverted', 90_000, 'the found intent settled');
+    const row = (await f.copy.pool.query<{ revert_reason: string | null; revert_evidence: string | null; hand_offs: number }>('SELECT revert_reason, revert_evidence, hand_offs FROM crosses WHERE bet_hash = $1', [f.bet.toLowerCase()])).rows[0];
+    assert.deepEqual([row?.revert_reason, row?.revert_evidence], ['TakerPullRefused', 'trace'], JSON.stringify(row));
+    const line = (await f.copy.pool.query<{ facts: Record<string, unknown> }>(`SELECT facts FROM events WHERE kind = 'cross reverted' AND bet_hash = $1`, [f.bet.toLowerCase()])).rows[0]?.facts;
+    assert.deepEqual(line?.pinnedOn, [{ account: f.B.address, role: 'bettor', act: 'its approval to the positions contract was too low' }], JSON.stringify(line));
+    assert.equal(typeof line?.gasUsed, 'string', 'the gas paid, on its line');
+    assert.equal(row?.hand_offs, 0, 'the hand-offs the copy kept');
+    assert.ok((await copyMarks(f)).every((m) => m.ended === null), 'no quote marked for a reverted Cross');
+    assert.equal(await zeroReservations(f.copy.pool), '0', 'the hold stands');
+    assert.deepEqual({ s: signed() - before.s, h: handOffs() - before.h }, { s: 0, h: 0 }, 'nothing signed or handed off');
+  } finally {
+    await stopAll();
+    await stack.restartCourier({ hooked: true });
+  }
+});
+
+for (const wrong of ['transaction hash', 'block number'] as const) {
+  test(`a found intent whose receipt the node answers with the wrong ${wrong}, every other field whole: the evidence conflicts with what the search found; an incident line, once, and the intent stays unresolved, with no mark, no outcome and nothing sent; answered as asked at a later look, it is settled as the database that went on settled it`, async () => {
+    const f = await foundIntent(`restored_found_${wrong === 'transaction hash' ? 'hash' : 'block'}`);
+    const other = `0x${'cd'.repeat(32)}`;
+    stack.proxy.rule('eth_getTransactionReceipt', {
+      kind: 'rewriteResult',
+      result: (p, result) => {
+        if (String(p[0]).toLowerCase() !== f.settled.txHash.toLowerCase() || result === null) return result;
+        const r = result as { blockNumber: Hex; logs: Array<Record<string, unknown>> };
+        if (wrong === 'transaction hash') return { ...r, transactionHash: other, logs: r.logs.map((l) => ({ ...l, transactionHash: other })) };
+        return { ...r, blockNumber: `0x${(BigInt(r.blockNumber) + 1n).toString(16)}`, logs: r.logs.map((l) => ({ ...l, blockNumber: `0x${(BigInt(r.blockNumber) + 1n).toString(16)}` })) };
+      },
+    });
+    try {
+      const { courier, before } = await startOnCopy(f);
+      await until(async () => (await conflicts(f)).length > 0 || (await crossState(f.copy.pool, f.bet)) !== 'intent', (v) => v, 90_000, 'the conflict recorded, or an outcome');
+      assert.equal(await crossState(f.copy.pool, f.bet), 'intent', 'no outcome from evidence that conflicts with the search');
+      const found = await conflicts(f);
+      assert.match(String(found[0]?.facts.why), wrong === 'transaction hash' ? /of another transaction/ : /not the block the search found/);
+      await unresolvedAndHeld(f, before);
+      stack.proxy.rule('eth_getTransactionReceipt', null);
+      await until(() => crossState(f.copy.pool, f.bet), (s) => s === 'confirmed', 90_000, 'settled once the node answers as asked');
+      await settledAsTheOriginal(f, courier);
+      assert.equal((await conflicts(f)).length, 1, 'the incident once');
+    } finally {
+      stack.proxy.rule('eth_getTransactionReceipt', null);
+      await stopAll();
+      await stack.restartCourier({ hooked: true });
+    }
+  });
+}
+
+test("a found intent whose bet's total at the final block the node cannot give, twice: the intent stays unresolved, with no mark, no outcome and nothing sent; given at a later look, it is settled whole; and a listed quote the copy holds stopped is left stopped", async () => {
+  const f = await foundIntent('restored_found_total');
+  const totalOf = encodeFunctionData({ abi: stack.rig.abis.OspexMatching as Abi, functionName: 's_filledRisk', args: [f.bet as Hex] }).slice(2).toLowerCase();
+  // The case's own quote, stopped on the copy: a mark the ordinary rules leave alone.
+  await f.copy.pool.query(`UPDATE orders SET ended = 'stopped', ended_at = now() WHERE hash = $1`, [f.quote.toLowerCase()]);
+  let refused = 0;
+  stack.proxy.rule('eth_call', { kind: 'refuseIf', refuse: (p) => JSON.stringify(p).toLowerCase().includes(totalOf) && (refused++, true), code: -32000, message: 'the node could not answer' });
+  try {
+    const { courier, before } = await startOnCopy(f);
+    await until(async () => refused, (n) => n >= 2, 90_000, "the bet's total refused twice");
+    await until(async () => courier.lines.some((l) => /not yet reconciled: .*failed twice/.test(l)), (v) => v, 60_000, 'the recovery says what it lacks');
+    const row = (await f.copy.pool.query<{ state: string; hand_offs: number }>('SELECT state, hand_offs FROM crosses WHERE bet_hash = $1', [f.bet.toLowerCase()])).rows[0];
+    assert.deepEqual(row, { state: 'intent', hand_offs: 0 });
+    assert.ok((await copyMarks(f)).every((m) => m.ended === null || m.hash === f.quote.toLowerCase()), 'no mark while the total is missing');
+    assert.equal(await outcomeLines(f), 0, 'no outcome line');
+    assert.deepEqual({ s: signed() - before.s, h: handOffs() - before.h }, { s: 0, h: 0 }, 'nothing signed or handed off');
+    stack.proxy.rule('eth_call', null);
+    await until(() => crossState(f.copy.pool, f.bet), (s) => s === 'confirmed', 90_000, 'settled once the total is given');
+    const recorded = (await f.copy.pool.query<{ recorded: Record<string, unknown> }>('SELECT recorded FROM crosses WHERE bet_hash = $1', [f.bet.toLowerCase()])).rows[0]?.recorded as Record<string, unknown>;
+    assert.deepEqual(recorded.totals, f.settled.recorded.totals, 'the record whole');
+    const stopped = (await f.copy.pool.query<{ ended: string | null }>('SELECT ended FROM orders WHERE hash = $1', [f.quote.toLowerCase()])).rows[0];
+    assert.equal(stopped?.ended, 'stopped', 'the quote held stopped is left stopped');
+    assert.equal(await zeroReservations(f.copy.pool), '0', 'the hold stands');
+  } finally {
+    stack.proxy.rule('eth_call', null);
+    await stopAll();
+    await stack.restartCourier({ hooked: true });
+  }
+});
+
+test("a found intent whose bet's total at the final block falls short of what its receipt filled: the chain's own state contradicts the receipt; an incident line, once, and the intent stays unresolved, with no mark, no outcome and nothing sent", async () => {
+  const f = await foundIntent('restored_found_short');
+  const totalOf = encodeFunctionData({ abi: stack.rig.abis.OspexMatching as Abi, functionName: 's_filledRisk', args: [f.bet as Hex] }).toLowerCase();
+  stack.proxy.rule('eth_call', {
+    kind: 'rewriteResult',
+    result: (p, result) => {
+      const data = String((p[0] as { data?: string }).data ?? '').toLowerCase();
+      if (!data.includes(totalOf.slice(2)) || typeof result !== 'string') return result;
+      try {
+        const calls = (decodeFunctionData({ abi: MULTICALL_ABI, data: data as Hex }).args[0] ?? []) as ReadonlyArray<{ callData: Hex }>;
+        const at = calls.findIndex((c) => c.callData.toLowerCase() === totalOf);
+        if (at < 0) return result;
+        const answers = decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', data: result as Hex }) as ReadonlyArray<{ success: boolean; returnData: Hex }>;
+        return encodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', result: answers.map((a, i) => (i === at ? { success: a.success, returnData: `0x${'0'.repeat(64)}` } : a)) } as never);
+      } catch {
+        return result;
+      }
+    },
+  });
+  try {
+    const { before } = await startOnCopy(f);
+    await until(async () => (await conflicts(f)).length > 0 || (await crossState(f.copy.pool, f.bet)) !== 'intent', (v) => v, 90_000, 'the contradiction recorded, or an outcome');
+    assert.equal(await crossState(f.copy.pool, f.bet), 'intent', 'no outcome from a receipt the chain contradicts');
+    const found = await conflicts(f);
+    assert.match(String(found[0]?.facts.why), /filled amount at the final block is below/);
+    await unresolvedAndHeld(f, before);
+    await new Promise((r) => setTimeout(r, 3_000));
+    assert.equal((await conflicts(f)).length, 1, 'the incident once, look after look');
+  } finally {
+    stack.proxy.rule('eth_call', null);
+    await stopAll();
+    await stack.restartCourier({ hooked: true });
+  }
+});
+
+test("a found intent recovered by two processes on the copy, the first of them overtaken by the second's start while it reads the receipt: the stale owner writes nothing, and the Cross is settled once, with one outcome line and the hand-offs the copy kept", async () => {
+  const f = await foundIntent('restored_found_two');
+  const held = stack.proxy.hold('eth_getTransactionReceipt', (p) => String(p[0]).toLowerCase() === f.settled.txHash.toLowerCase());
+  try {
+    const { courier: first } = await startOnCopy(f);
+    await held.arrived;
+    // The second process's start raises every lane's epoch: the first, held at its read of the receipt, is overtaken.
+    const { courier: second } = await startOnCopy(f);
+    held.release();
+    await until(() => crossState(f.copy.pool, f.bet), (s) => s === 'confirmed', 90_000, 'settled once');
+    await until(async () => first.lines.some((l) => /not written by this process: the lane is not this process's now/.test(l)), (v) => v, 60_000, 'the stale owner wrote nothing');
+    assert.equal(await outcomeLines(f), 1, 'one outcome line');
+    await settledAsTheOriginal(f, second);
+  } finally {
+    held.release();
     await stopAll();
     await stack.restartCourier({ hooked: true });
   }

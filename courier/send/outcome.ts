@@ -163,8 +163,12 @@ export async function look(deps: OutcomeDeps, cross: CrossRow, expected: Expecte
   }
 }
 
-/** The second reads of a ran Cross, held against the chain's own state at the same F, and the record from the receipt's module events. */
-async function ran(deps: OutcomeDeps, F: Header, cross: CrossRow, expected: Expected, receipt: Receipt, count: bigint): Promise<Look> {
+/**
+ * The second reads of a ran Cross, held against the chain's own state at the same F, and the record from the receipt's
+ * module events. The settling's look makes them, and so does recovery for a retained intent whose transaction the
+ * search found.
+ */
+export async function ran(deps: OutcomeDeps, F: Header, cross: CrossRow, expected: Expected, receipt: Receipt, count: bigint): Promise<Look> {
   const base = { final: finalFacts(F), receipt: { number: s(receipt.blockNumber), hash: receipt.blockHash }, txHash: receipt.transactionHash };
   if (count <= (cross.nonce as bigint)) return { kind: 'contradiction', F, facts: { ...base, why: "the key's count at the final block is not above the Cross's nonce", countAtFinal: s(count), nonce: s(cross.nonce as bigint) } };
   if (receipt.from.toLowerCase() !== deps.key.toLowerCase() || receipt.to === null || receipt.to.toLowerCase() !== deps.set.relay.toLowerCase()) {

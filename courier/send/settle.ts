@@ -65,6 +65,110 @@ export interface Settler {
   readExpiredAgain(F: Header): Promise<'none' | 'written' | 'stop'>;
 }
 
+/** A Cross's listed occurrences as the records hold them. */
+type Legs = Awaited<ReturnType<typeof legsOf>>;
+
+/** What a ran Cross's final write reads beyond the look: the node, the set, the key that sent it, and the reader at F. */
+export interface RanDeps {
+  chain: ChainReader;
+  rpc: JsonRpc;
+  set: BettingSet;
+  key: Address;
+}
+
+/** The reason of a reverted Cross, from one trace, with the expiry beside it where the receipt's block is at or past it. */
+export async function revertFactsOf(deps: RanDeps, bet: OrderRow, cross: CrossRow, legs: Legs, receipt: Receipt, F: Header): Promise<{ reason: Reason & { why?: string }; facts: Record<string, unknown> }> {
+  const reason = await reasonOf(deps.rpc, deps.set, deps.key, receipt, {
+    bettor: bet.order.account,
+    positions: deps.set.positions,
+    legs: legs.map((l) => ({ orderHash: l.orderHash, account: l.account })),
+    calldataHash: typeof cross.checked.calldataHash === 'string' ? (cross.checked.calldataHash as Hex) : null,
+  });
+  let blockTime: bigint | null = null;
+  try {
+    const h = await deps.chain.ask(F, () => headerByHash(deps.rpc, receipt.blockHash));
+    blockTime = h?.timestamp ?? null;
+  } catch (err) {
+    if (!(err instanceof ChainUnreachable)) throw err;
+  }
+  const expiry = blockTime !== null && blockTime >= bet.order.expiry ? { expiry: s(bet.order.expiry), blockTime: s(blockTime) } : null;
+  return { reason, facts: { ...reasonFacts(reason), ...(expiry === null ? {} : { expired: expiry }), blockTime: blockTime === null ? null : s(blockTime) } };
+}
+
+/** A ran Cross's final write, made but not written: its outcome, its quotes' marks at F, and its line. */
+export interface RanWrite {
+  outcome: FinalOutcome;
+  marks: Array<{ hash: Hex; how: 'filled' | 'cancelled' }>;
+  line: { kind: 'cross confirmed' | 'cross reverted'; reason: string; facts: Record<string, unknown> };
+}
+
+/**
+ * The final write of a ran Cross, as the settling makes it and as recovery makes it for a retained intent whose
+ * transaction the search found: the receipt's figures, the legs as the chain recorded them, the quotes' marks at F,
+ * the reason from one trace for a revert, and the line. It writes nothing; the caller writes it under its own guard.
+ */
+export async function ranWrite(deps: RanDeps, bet: OrderRow, cross: CrossRow, legs: Legs, l: Ran & { F: Header }): Promise<RanWrite> {
+  const F = l.F;
+  const receipt = l.receipt;
+  let receiptBlockTime: string | null = null;
+  try {
+    const h = await deps.chain.ask(F, () => headerByHash(deps.rpc, receipt.blockHash));
+    receiptBlockTime = h === null ? null : s(h.timestamp);
+  } catch (err) {
+    if (!(err instanceof ChainUnreachable)) throw err;
+  }
+  const base = { txHash: receipt.transactionHash, nonce: s(cross.nonce as bigint), block: { number: s(receipt.blockNumber), hash: receipt.blockHash, ...(receiptBlockTime === null ? {} : { time: receiptBlockTime }) }, final: finalNamed(F), betFilled: s(l.betFilled), gasUsed: s(receipt.gasUsed), effectiveGasPrice: s(receipt.effectiveGasPrice) };
+  if (l.status === 'confirmed') {
+    const r = l.record;
+    if (r === null || r.crossed === null) throw new Error('a confirmed Cross has its record');
+    const recordedLegs = r.legs.map((e, i) => ({ position: i, makerRisk: e.kind === 'filled' ? e.makerRisk : null, takerRisk: e.kind === 'filled' ? e.takerRisk : null, skip: e.kind === 'skipped' ? e.reason : null }));
+    const recorded = {
+      betFilled: s(l.betFilled),
+      final: finalNamed(F),
+      ...(receiptBlockTime === null ? {} : { receiptBlockTime }),
+      totals: { maker: s(r.crossed.totalMakerRisk), taker: s(r.crossed.totalTakerRisk), marketId: s(r.crossed.marketId) },
+      marketCreated: r.marketCreated === null ? null : s(r.marketCreated),
+      pulls: Object.fromEntries([...r.pulls].map(([a, v]) => [a, s(v)])),
+      paysBack: Object.fromEntries([...r.paysBack].map(([a, v]) => [a, s(v)])),
+      paysBackRefused: r.paysBackRefused.map((p) => ({ account: p.account, amount: s(p.amount), held: s(p.held), logIndex: p.logIndex })),
+      skipped: r.legs.flatMap((e, i) => (e.kind === 'skipped' ? [{ position: i, orderHash: e.orderHash, reason: e.reason }] : [])),
+    };
+    // The quotes after the outcome, at F: less than a lot of its stake left is filled; skipped Cancelled or GrantGone is cancelled.
+    const marks = new Map<string, 'filled' | 'cancelled'>();
+    for (const leg of legs) {
+      const e = r.legs[leg.position];
+      if (e === undefined) continue;
+      const q = leg.orderHash.toLowerCase();
+      if (e.kind === 'skipped' && (e.reason === 'Cancelled' || e.reason === 'GrantGone')) marks.set(q, 'cancelled');
+      else if (e.kind === 'filled' && leg.riskAmount - (l.quotesFilled.get(q) ?? 0n) < ORDER_RULES.lot && !marks.has(q)) marks.set(q, 'filled');
+    }
+    return {
+      outcome: { state: 'confirmed', final: { number: F.number, hash: F.hash }, receipt: { number: receipt.blockNumber, hash: receipt.blockHash }, gasUsed: receipt.gasUsed, effectiveGasPrice: receipt.effectiveGasPrice, recorded, legs: recordedLegs },
+      marks: [...marks].map(([hash, how]) => ({ hash: hash as Hex, how })),
+      line: { kind: 'cross confirmed', reason: 'CONFIRMED', facts: { ...base, totals: recorded.totals, legs: recordedLegs.map((g) => ({ position: g.position, makerRisk: g.makerRisk === null ? null : s(g.makerRisk), takerRisk: g.takerRisk === null ? null : s(g.takerRisk), skip: g.skip })), marks: Object.fromEntries(marks) } },
+    };
+  }
+  // Reverted: the failed receipt alone establishes it; the reason from one trace, or unavailable.
+  const { reason, facts } = await revertFactsOf(deps, bet, cross, legs, receipt, F);
+  const recorded = { betFilled: s(l.betFilled), final: finalNamed(F), reason: facts, ...(receiptBlockTime === null ? {} : { receiptBlockTime }) };
+  const action = reason.needsLook
+    ? { action: { case: 'refusal-needs-look', evidence: { betHash: bet.hash.toLowerCase(), reason: reason.name, evidence: reason.evidence, data: reason.data, final: finalNamed(F), txHash: receipt.transactionHash }, unknown: ['why the chain refused it, in terms the courier knows'] } }
+    : {};
+  return {
+    outcome: {
+      state: 'reverted',
+      final: { number: F.number, hash: F.hash },
+      receipt: { number: receipt.blockNumber, hash: receipt.blockHash },
+      gasUsed: receipt.gasUsed,
+      effectiveGasPrice: receipt.effectiveGasPrice,
+      revert: { reason: reason.name, evidence: reason.evidence, data: reason.data },
+      recorded,
+    },
+    marks: [],
+    line: { kind: 'cross reverted', reason: reason.name, facts: { ...base, ...facts, ...action } },
+  };
+}
+
 export function createSettler(deps: SettleDeps): Settler {
   const { store, key } = deps;
   const outcomeDeps = { chain: deps.chain, rpc: deps.rpc, set: deps.set, key };
@@ -109,88 +213,13 @@ export function createSettler(deps: SettleDeps): Settler {
     return { expected: { betHash: bet.hash, account: bet.order.account, expiry: bet.order.expiry, legs: legs.map((l) => ({ orderHash: l.orderHash })), atH }, legs };
   }
 
-  /** The reason of a reverted Cross, with the expiry beside it where the receipt's block is at or past it. */
-  async function revertFacts(bet: OrderRow, cross: CrossRow, legs: Awaited<ReturnType<typeof legsOf>>, receipt: Receipt, F: Header): Promise<{ reason: Reason & { why?: string }; facts: Record<string, unknown> }> {
-    const reason = await reasonOf(deps.rpc, deps.set, key, receipt, {
-      bettor: bet.order.account,
-      positions: deps.set.positions,
-      legs: legs.map((l) => ({ orderHash: l.orderHash, account: l.account })),
-      calldataHash: typeof cross.checked.calldataHash === 'string' ? (cross.checked.calldataHash as Hex) : null,
-    });
-    let blockTime: bigint | null = null;
-    try {
-      const h = await deps.chain.ask(F, () => headerByHash(deps.rpc, receipt.blockHash));
-      blockTime = h?.timestamp ?? null;
-    } catch (err) {
-      if (!(err instanceof ChainUnreachable)) throw err;
-    }
-    const expiry = blockTime !== null && blockTime >= bet.order.expiry ? { expiry: s(bet.order.expiry), blockTime: s(blockTime) } : null;
-    return { reason, facts: { ...reasonFacts(reason), ...(expiry === null ? {} : { expired: expiry }), blockTime: blockTime === null ? null : s(blockTime) } };
-  }
-
   /** The final write of a ran Cross: the receipt's figures, the legs as the chain recorded them, the marks at F, the line, the lane freed. */
-  async function writeRan(bet: OrderRow, cross: CrossRow, legs: Awaited<ReturnType<typeof legsOf>>, l: Ran & { F: Header }): Promise<'written' | 'unchanged' | 'lost'> {
-    const F = l.F;
-    const receipt = l.receipt;
-    let receiptBlockTime: string | null = null;
-    try {
-      const h = await deps.chain.ask(F, () => headerByHash(deps.rpc, receipt.blockHash));
-      receiptBlockTime = h === null ? null : s(h.timestamp);
-    } catch (err) {
-      if (!(err instanceof ChainUnreachable)) throw err;
-    }
-    const base = { txHash: receipt.transactionHash, nonce: s(cross.nonce as bigint), block: { number: s(receipt.blockNumber), hash: receipt.blockHash, ...(receiptBlockTime === null ? {} : { time: receiptBlockTime }) }, final: finalNamed(F), betFilled: s(l.betFilled), gasUsed: s(receipt.gasUsed), effectiveGasPrice: s(receipt.effectiveGasPrice) };
-    if (l.status === 'confirmed') {
-      const r = l.record;
-      if (r === null || r.crossed === null) throw new Error('a confirmed Cross has its record');
-      const recordedLegs = r.legs.map((e, i) => ({ position: i, makerRisk: e.kind === 'filled' ? e.makerRisk : null, takerRisk: e.kind === 'filled' ? e.takerRisk : null, skip: e.kind === 'skipped' ? e.reason : null }));
-      const recorded = {
-        betFilled: s(l.betFilled),
-        final: finalNamed(F),
-        ...(receiptBlockTime === null ? {} : { receiptBlockTime }),
-        totals: { maker: s(r.crossed.totalMakerRisk), taker: s(r.crossed.totalTakerRisk), marketId: s(r.crossed.marketId) },
-        marketCreated: r.marketCreated === null ? null : s(r.marketCreated),
-        pulls: Object.fromEntries([...r.pulls].map(([a, v]) => [a, s(v)])),
-        paysBack: Object.fromEntries([...r.paysBack].map(([a, v]) => [a, s(v)])),
-        paysBackRefused: r.paysBackRefused.map((p) => ({ account: p.account, amount: s(p.amount), held: s(p.held), logIndex: p.logIndex })),
-        skipped: r.legs.flatMap((e, i) => (e.kind === 'skipped' ? [{ position: i, orderHash: e.orderHash, reason: e.reason }] : [])),
-      };
-      // The quotes after the outcome, at F: less than a lot of its stake left is filled; skipped Cancelled or GrantGone is cancelled.
-      const marks = new Map<string, 'filled' | 'cancelled'>();
-      for (const leg of legs) {
-        const e = r.legs[leg.position];
-        if (e === undefined) continue;
-        const q = leg.orderHash.toLowerCase();
-        if (e.kind === 'skipped' && (e.reason === 'Cancelled' || e.reason === 'GrantGone')) marks.set(q, 'cancelled');
-        else if (e.kind === 'filled' && leg.riskAmount - (l.quotesFilled.get(q) ?? 0n) < ORDER_RULES.lot && !marks.has(q)) marks.set(q, 'filled');
-      }
-      const outcome: FinalOutcome = { state: 'confirmed', final: { number: F.number, hash: F.hash }, receipt: { number: receipt.blockNumber, hash: receipt.blockHash }, gasUsed: receipt.gasUsed, effectiveGasPrice: receipt.effectiveGasPrice, recorded, legs: recordedLegs };
-      return guarded(cross, async (client) => {
-        if (!(await writeFinal(client, bet.hash, outcome))) return false;
-        if (marks.size > 0) await store.orders.markEndedAtFinal(client, [...marks].map(([hash, how]) => ({ hash: hash as Hex, how })), { number: F.number, hash: F.hash });
-        await lineOf(client, bet, 'cross confirmed', 'CONFIRMED', { ...base, totals: recorded.totals, legs: recordedLegs.map((g) => ({ position: g.position, makerRisk: g.makerRisk === null ? null : s(g.makerRisk), takerRisk: g.takerRisk === null ? null : s(g.takerRisk), skip: g.skip })), marks: Object.fromEntries(marks) });
-        await freeLaneOf(client, key, bet.hash);
-        return true;
-      });
-    }
-    // Reverted: the failed receipt alone establishes it; the reason from one trace, or unavailable.
-    const { reason, facts } = await revertFacts(bet, cross, legs, receipt, F);
-    const recorded = { betFilled: s(l.betFilled), final: finalNamed(F), reason: facts, ...(receiptBlockTime === null ? {} : { receiptBlockTime }) };
-    const outcome: FinalOutcome = {
-      state: 'reverted',
-      final: { number: F.number, hash: F.hash },
-      receipt: { number: receipt.blockNumber, hash: receipt.blockHash },
-      gasUsed: receipt.gasUsed,
-      effectiveGasPrice: receipt.effectiveGasPrice,
-      revert: { reason: reason.name, evidence: reason.evidence, data: reason.data },
-      recorded,
-    };
-    const action = reason.needsLook
-      ? { action: { case: 'refusal-needs-look', evidence: { betHash: bet.hash.toLowerCase(), reason: reason.name, evidence: reason.evidence, data: reason.data, final: finalNamed(F), txHash: receipt.transactionHash }, unknown: ['why the chain refused it, in terms the courier knows'] } }
-      : {};
+  async function writeRan(bet: OrderRow, cross: CrossRow, legs: Legs, l: Ran & { F: Header }): Promise<'written' | 'unchanged' | 'lost'> {
+    const w = await ranWrite(outcomeDeps, bet, cross, legs, l);
     return guarded(cross, async (client) => {
-      if (!(await writeFinal(client, bet.hash, outcome))) return false;
-      await lineOf(client, bet, 'cross reverted', reason.name, { ...base, ...facts, ...action });
+      if (!(await writeFinal(client, bet.hash, w.outcome))) return false;
+      if (w.marks.length > 0) await store.orders.markEndedAtFinal(client, w.marks, { number: l.F.number, hash: l.F.hash });
+      await lineOf(client, bet, w.line.kind, w.line.reason, w.line.facts);
       await freeLaneOf(client, key, bet.hash);
       return true;
     });
@@ -288,7 +317,7 @@ export function createSettler(deps: SettleDeps): Settler {
         return 'stop';
       }
       const legs = await legsOf(store.lane, c.betHash);
-      const { reason, facts } = await revertFacts(bet, c, legs, receipt, F);
+      const { reason, facts } = await revertFactsOf(outcomeDeps, bet, c, legs, receipt, F);
       let betFilled: bigint | null = null;
       try {
         betFilled = (await filledAtF(deps.chain, deps.set, F, [c.betHash])).get(c.betHash.toLowerCase()) ?? null;
