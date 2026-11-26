@@ -171,6 +171,15 @@ test("the hand-off's transport and the binding of its answer: a refused connecti
     ['already known beside a named error', (r, res) => json(res, { jsonrpc: '2.0', id: r.id, error: { code: -32000, message: 'nonce too low: already known' } }), { kind: 'unknown', words: 'nonce too low' }],
     ['a named error to another request', (r, res) => json(res, { jsonrpc: '2.0', id: Number(r.id) + 1, error: { code: -32000, message: 'nonce too low' } }), { kind: 'unknown' }],
     ['an error with no message', (r, res) => json(res, { jsonrpc: '2.0', id: r.id, error: { code: -32000 } }), { kind: 'unknown' }],
+    // The envelope's own form: a member that is present counts, whatever its value; and an error is taken only as an
+    // object, not an array, with an integer code and a string message.
+    ["this transaction's own hash beside an error of null", (r, res) => json(res, { jsonrpc: '2.0', id: r.id, result: own, error: null }), { kind: 'unknown' }],
+    ['already known with no code', (r, res) => json(res, { jsonrpc: '2.0', id: r.id, error: { message: 'already known' } }), { kind: 'unknown' }],
+    ['already known with a code that is a string', (r, res) => json(res, { jsonrpc: '2.0', id: r.id, error: { code: '-32000', message: 'already known' } }), { kind: 'unknown' }],
+    ['already known with a code that is not whole', (r, res) => json(res, { jsonrpc: '2.0', id: r.id, error: { code: -32000.5, message: 'already known' } }), { kind: 'unknown' }],
+    ['already known inside an array', (r, res) => json(res, { jsonrpc: '2.0', id: r.id, error: [{ code: -32000, message: 'already known' }] }), { kind: 'unknown' }],
+    ['already known as a message that is not a string', (r, res) => json(res, { jsonrpc: '2.0', id: r.id, error: { code: -32000, message: ['already known'] } }), { kind: 'unknown' }],
+    ['a named error with no code', (r, res) => json(res, { jsonrpc: '2.0', id: r.id, error: { message: 'nonce too low' } }), { kind: 'unknown', words: 'nonce too low' }],
     ['not JSON', (_r, res) => json(res, 'Planted Marker {not json'), { kind: 'unknown' }],
     ['an array', (r, res) => json(res, [{ jsonrpc: '2.0', id: r.id, result: own }]), { kind: 'unknown' }],
     ['an HTTP failure after the request reached the node', (_r, res) => {

@@ -437,9 +437,11 @@ export type HandOff = { kind: 'taken' } | { kind: 'unknown'; words?: NamedError 
 
 /**
  * The node's answer to this request, read inside the client: this request's own answer only, JSON-RPC 2.0 with its id,
- * and a result or an error, never both. Taken where the result is this transaction's own hash, or where the error's
- * whole message, in any letter case and with the space around it, is "already known". Every other answer is not known,
- * with the list's fixed words where the error names one. Only those words come out.
+ * and a result or an error, never both: a member that is present counts, whatever its value, so a result beside
+ * `"error": null` is both. Taken where the result is this transaction's own hash, or where the error is an object,
+ * not an array, with an integer code and a string message, and that whole message, in any letter case and with the
+ * space around it, is "already known". Every other answer is not known, with the list's fixed words where the error
+ * names one. Only those words come out.
  */
 function readHandOff(text: string, requestId: number, expected: string): HandOff {
   let body: unknown;
@@ -452,12 +454,13 @@ function readHandOff(text: string, requestId: number, expected: string): HandOff
   const envelope = body as Record<string, unknown>;
   if (envelope.jsonrpc !== '2.0' || envelope.id !== requestId) return { kind: 'unknown' };
   const hasResult = 'result' in envelope;
-  const hasError = envelope.error !== undefined && envelope.error !== null;
+  const hasError = 'error' in envelope;
   if (hasResult === hasError) return { kind: 'unknown' };
   if (hasResult) return typeof envelope.result === 'string' && envelope.result.toLowerCase() === expected ? { kind: 'taken' } : { kind: 'unknown' };
   const error = envelope.error;
   const message = typeof error === 'object' && error !== null && typeof (error as { message?: unknown }).message === 'string' ? (error as { message: string }).message : '';
-  if (message.trim().toLowerCase() === 'already known') return { kind: 'taken' };
+  const wellFormed = typeof error === 'object' && error !== null && !Array.isArray(error) && Number.isInteger((error as { code?: unknown }).code) && typeof (error as { message?: unknown }).message === 'string';
+  if (wellFormed && message.trim().toLowerCase() === 'already known') return { kind: 'taken' };
   const lower = message.toLowerCase();
   const found = NAMED.find(([match]) => lower.includes(match));
   return found === undefined ? { kind: 'unknown' } : { kind: 'unknown', words: found[1] };
@@ -466,7 +469,7 @@ function readHandOff(text: string, requestId: number, expected: string): HandOff
 /**
  * The hand-off: one eth_sendRawTransaction of the signed bytes, made once, with no retry and no redirect followed, its
  * time-out running through the answer's body. Taken only where the node's answer to this request is this
- * transaction's own hash, or an error whose whole message is "already known"; every other answer is not known: a
+ * transaction's own hash, or a well-formed error whose whole message is "already known"; every other answer is not known: a
  * time-out, a failure of the connection, an HTTP failure or a redirect, an answer that is not this request's, and a
  * named error, which keeps only the list's words. It never throws for the node, and nothing of the node's text leaves
  * it.
