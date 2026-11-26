@@ -436,11 +436,12 @@ async function linesOf(databaseUrl: string | undefined, numbers: number[]): Prom
   const client = new pg.Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000, query_timeout: 5_000 });
   try {
     await client.connect();
-    const { rows } = await client.query<{ number: string; at: Date; kind: string; reason: string | null; facts: unknown }>(
-      'SELECT number::text AS number, at, kind, reason, facts FROM events WHERE number = ANY($1::bigint[]) ORDER BY number',
+    // Ordered by the column itself, a number: the text output has a name of its own, so the order is never by text.
+    const { rows } = await client.query<{ line: string; at: Date; kind: string; reason: string | null; facts: unknown }>(
+      'SELECT number::text AS line, at, kind, reason, facts FROM events WHERE number = ANY($1::bigint[]) ORDER BY number',
       [numbers],
     );
-    return JSON.stringify(rows.map((r) => ({ line: Number(r.number), at: r.at.toISOString(), kind: r.kind, reason: r.reason, facts: r.facts })));
+    return JSON.stringify(rows.map((r) => ({ line: Number(r.line), at: r.at.toISOString(), kind: r.kind, reason: r.reason, facts: r.facts })));
   } catch (err) {
     return `not read: ${err instanceof Error ? err.name : typeof err}`;
   } finally {
