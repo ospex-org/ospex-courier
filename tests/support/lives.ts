@@ -57,6 +57,15 @@ export function namedLives(stack: Stack, pool: pg.Pool) {
     return who;
   }
 
+  /** The lane of the courier's key, as its row stands: the bet it holds, its reservation and its open Cross. */
+  async function laneRow(): Promise<{ held_bet: string | null; reservation: string | null; open_cross: string | null }> {
+    const { rows } = await pool.query<{ held_bet: string | null; reservation: string | null; open_cross: string | null }>(
+      'SELECT held_bet, reservation::text AS reservation, open_cross FROM lanes WHERE sender = $1',
+      [stack.rig.accounts.sender.address.toLowerCase()],
+    );
+    return rows[0] ?? { held_bet: null, reservation: null, open_cross: null };
+  }
+
   async function crossRow(bet: string): Promise<Row | null> {
     const { rows } = await pool.query<Row>('SELECT state, hand_offs, tx_hash, nonce::text AS nonce, node_answer FROM crosses WHERE bet_hash = $1', [bet.toLowerCase()]);
     return rows[0] ?? null;
@@ -143,6 +152,8 @@ export function namedLives(stack: Stack, pool: pg.Pool) {
     const waiting = await crossRow(first);
     assert.ok(waiting !== null && !FINAL.includes(waiting.state), `no outcome while the final block is held: ${JSON.stringify(waiting)}`);
     assert.equal(await crossRow(second), null, 'nothing reserved before the outcome');
+    const lane = await laneRow();
+    assert.deepEqual([lane.held_bet, lane.open_cross], [first, first], `the lane still holds the first bet and its Cross, and no other is reserved: ${JSON.stringify(lane)}`);
     followFinal();
     const row = await final(first);
     const row2 = await final(second);
@@ -259,6 +270,8 @@ export function namedLives(stack: Stack, pool: pg.Pool) {
       const s1 = signed();
       await new Promise((r) => setTimeout(r, 4_000));
       assert.deepEqual({ signed: signed() - s1, requests: requests() - r0, second: await crossRow(second.betHash) }, { signed: 0, requests: 0, second: null }, 'no new sending right');
+      const lane = await laneRow();
+      assert.deepEqual([lane.held_bet, lane.open_cross], [c.betHash, c.betHash], `the lane still holds the first bet and its Cross, and the bet that waits is not reserved: ${JSON.stringify(lane)}`);
       await killAndRestart();
       await afterTheRestart(c.betHash, second.betHash, held, history, s0, committed ? 1 : 0);
     },
