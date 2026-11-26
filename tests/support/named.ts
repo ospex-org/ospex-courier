@@ -208,15 +208,31 @@ export function namedWitnesses(stack: Stack, pool: pg.Pool, opts: { firstAccount
 
     balance: (account: string) => rig.read<bigint>(rig.addresses.coin, rig.abis.TestCoin as Abi, 'balanceOf', [account]),
 
-    /** The final block held at the head, before the bet comes: it stays there until it is let go or moved. */
+    /**
+     * The final block held before the bet comes, at F: the block the case prepared, the head as the hold is made, with
+     * the state and the watermark the case set. F is held strictly below the head: where nothing has been mined on it
+     * yet, one empty block is made after it before it is exposed as final. It is held by its number, and its hash is
+     * kept (tests/support/proxy.ts); it stays there until it is let go or moved.
+     */
     async holdFinal(): Promise<void> {
       await stack.proxy.heldFinalChecked();
       heldUnchanged();
-      const head = BigInt((await rig.rpc('eth_blockNumber', [])) as string);
+      const F = (await rig.rpc('eth_getBlockByNumber', ['latest', false])) as { number: Hex; hash: Hex };
+      const f = BigInt(F.number);
+      if (BigInt((await rig.rpc('eth_blockNumber', [])) as string) === f) {
+        await rig.rpc('anvil_mine', ['0x1']);
+        const child = (await rig.rpc('eth_getBlockByNumber', [`0x${(f + 1n).toString(16)}`, false])) as { parentHash: Hex; transactions: unknown[] };
+        assert.deepEqual([child.parentHash, child.transactions.length], [F.hash, 0], 'one empty block made on F before it is held');
+      }
+      const atF = (await rig.rpc('eth_getBlockByNumber', [F.number, false])) as { hash: Hex } | null;
+      assert.equal(atF?.hash, F.hash, 'F unchanged at its height as it is held');
+      assert.ok(BigInt((await rig.rpc('eth_blockNumber', [])) as string) > f, 'F below the head as it is held');
       stack.proxy.finalFollows(null);
-      stack.proxy.setFinal(head);
-      // Its hash kept before the bet comes.
+      stack.proxy.setFinal(f);
+      // Its hash kept before the bet comes, read while F still had the hash it had when it was chosen.
       await stack.proxy.heldFinalChecked();
+      assert.equal(((await rig.rpc('eth_getBlockByNumber', [F.number, false])) as { hash: Hex } | null)?.hash, F.hash, 'F unchanged at its height once it is held');
+      heldUnchanged();
     },
 
     /** The hold let go: the final block follows the head again. A held block whose hash changed fails the case here. */
