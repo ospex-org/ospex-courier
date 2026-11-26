@@ -283,6 +283,13 @@ test("the pause's carries: the reserved code is on the page and issued by no pat
   await final(first.hash);
 });
 
+test("the reserved NODE_REFUSED is on the page as reserved, with its words, on a row apart from the two reasons a Cross is closed not sent before the gate; its name stays in the schema's and the API's vocabulary, so no file is searched for it", () => {
+  const api = readFileSync(new URL('../docs/API.md', import.meta.url), 'utf8');
+  assert.ok(api.includes("| `NODE_REFUSED` | — | reserved | Kept in the schema and API vocabulary; this build never issues it. A named error after the hand-off gate is unknown and is settled from the chain, not closed not sent. |"), 'the reserved row, word for word');
+  assert.ok(api.includes("| `STOPPED_AT_GATE`, `COURIER_RESTARTED` | — | a bet's record, `cross.reason` | Why its Cross was closed `not sent` before the hand-off gate: a stop found at the gate; or the courier restarted, or another of its processes took over, before the gate. |"), "the two produced reasons' row, word for word");
+  assert.ok(!api.includes('| `STOPPED_AT_GATE`, `COURIER_RESTARTED`, `NODE_REFUSED` |'), 'no row gives the three as one');
+});
+
 test("the full total, filled by another courier: the bet filled in full on the chain, through the rig's other relay, while ours is kept from the chain; then ours let through: it reverts TakingOrderFilled, and the record says the chain shows the bet filled in full, with no next step", async () => {
   // A game of its own, so the bet lists this quote and no other case's.
   const gameId = await stack.rig.createGame({ startWritten: true });
@@ -447,4 +454,10 @@ test("the maker's side: a quote stopped while no Cross lists it reads stopped wi
   const filledRisk = (h: string) => stack.rig.read<bigint>(stack.rig.addresses.matching, stack.rig.abis.OspexMatching as Abi, 's_filledRisk', [h]);
   assert.ok((await filledRisk(replacement.hash)) > 0n, 'the replacement filled');
   assert.equal(await filledRisk(old.hash), 0n, 'the stopped quote filled nothing');
+});
+
+test("the reserved NODE_REFUSED, produced by nothing in this file's runs: no row and no line holds it, after the named errors here, refused before forwarding and answered after the chain took the request", async () => {
+  const crosses = await pool.query(`SELECT 1 FROM crosses WHERE not_sent_reason = 'NODE_REFUSED'`);
+  const events = await pool.query(`SELECT 1 FROM events WHERE reason = 'NODE_REFUSED' OR facts::text LIKE '%NODE_REFUSED%'`);
+  assert.deepEqual([crosses.rowCount, events.rowCount], [0, 0]);
 });

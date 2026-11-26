@@ -213,7 +213,8 @@ courier waits on; Node's own default is five minutes.
   block the courier read, and when (a quiet courier reads no chain, so an old one means a quiet courier and nothing
   more); the set, every address, as read from the signpost at start, and the block it was read at; the relay's
   sender, the key's address (`COURIER_ADDRESS`), and the lane: the run that owns it, its epoch, and whether this
-  process takes bets; every lane's open Cross, its state, transaction and nonce, and each lane shut, with the line
+  process takes bets; every lane's open Cross, its state and, once recorded, its transaction and nonce, and no bet
+  hash; and each lane shut, with the line
   that shut it, a restore's hold among them; what the node can do, its trace included; the published bounds, and the
   chain's limits (the most gas one transaction may carry); the settings;
   this run's counts of requests refused before admission, by code; the database's size; and what is not yet built.
