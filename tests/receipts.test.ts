@@ -235,8 +235,10 @@ test("an orphan: the Cross mined in a block the chain then takes back, and mined
     const winning = (await rig.rpc('eth_getTransactionReceipt', [txHash])) as { blockNumber: Hex; blockHash: Hex };
     assert.equal(BigInt(winning.blockNumber), BigInt(orphan.blockNumber), 'mined again at the same height');
     assert.notEqual(winning.blockHash.toLowerCase(), orphan.blockHash.toLowerCase(), 'in another block');
-    // The final block passes the height: the orphan's receipt is not on its chain, and no outcome is written from it.
-    stack.proxy.setFinal(BigInt(winning.blockNumber));
+    // The final block passes the height, two blocks past it: the orphan's receipt is judged by the chain's own hash of
+    // its height read at F, not by F's own hash, and it is not on F's chain; no outcome is written from it.
+    await rig.rpc('anvil_mine', ['0x2']);
+    stack.proxy.setFinal(BigInt(winning.blockNumber) + 2n);
     await until(() => reasonsOf(bet.hash), (r) => r.includes('RECEIPT_ORPHANED'), 90_000, 'the orphan set aside');
     assert.equal((await row(bet.hash))?.state, 'sent', 'back to sent');
     await new Promise((r) => setTimeout(r, 6_000));
