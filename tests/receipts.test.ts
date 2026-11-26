@@ -468,12 +468,19 @@ test("a receipt the courier did not send, with two Crosses in one transaction, a
   const art = artifact('OspexCourierRelay.sol', 'OspexCourierRelay');
   const deployHash = await rig.wallet(rig.accounts.deployer).deployContract({ abi: art.abi, bytecode: art.bytecode, args: [rig.addresses.matching, rig.addresses.timelock], account: rig.accounts.deployer, chain: null });
   const batchRelay = (await rig.publicClient.waitForTransactionReceipt({ hash: deployHash })).contractAddress as Address;
-  const crosses: Array<{ data: Hex; betHash: Hex }> = [];
+  // Every account made, funded and registered first, and the first Cross's maker holding the other side so that its
+  // Cross pays it back: only then is T read, so no set-up block runs against the bets' short lives.
+  const pairs: Array<{ market: ReturnType<typeof ownMarket>; M: HDAccount; B: HDAccount }> = [];
   for (let i = 0; i < 2; i++) {
     const market = ownMarket();
     const [M, B] = [await fresh(), await fresh()];
     for (const who of [M, B]) await rig.write(who, rig.addresses.matching, rig.abis.OspexMatching as Abi, 'registerCourier', [batchRelay]);
-    const T = await rig.time();
+    if (i === 0) await holdsSideB(M, market);
+    pairs.push({ market, M, B });
+  }
+  const T = await rig.time();
+  const crosses: Array<{ data: Hex; betHash: Hex }> = [];
+  for (const [i, { market, M, B }] of pairs.entries()) {
     const quote: Order = { ...orderOn(rig, M, { expiry: T + 3_000n, oddsTick: 204, riskAmount: 4_800n * BigInt(i + 1), ...market }), positionType: 0 };
     // Signed for the block the batch runs in, past the timelock's delay: within the contract's longest life of it.
     const bet: Order = { ...orderOn(rig, B, { expiry: T + TIMELOCK_DELAY + 25n, oddsTick: 196, riskAmount: 5_000n * BigInt(i + 1), ...market }), positionType: 1 };
@@ -507,7 +514,13 @@ test("a receipt the courier did not send, with two Crosses in one transaction, a
     assert.ok(leg.logIndex > startAt && leg.logIndex < crossedAt, `Cross ${i + 1}: its leg within its own events`);
     const pulls = Object.fromEntries([...r.pulls].map(([a, v]) => [a.toLowerCase(), v]));
     assert.deepEqual(pulls, sumBy(within(o.held), (h: { pulled: bigint }) => h.pulled), `Cross ${i + 1}: its own pulls`);
+    const paysBack = Object.fromEntries([...r.paysBack].map(([a, v]) => [a.toLowerCase(), v]));
+    assert.deepEqual(paysBack, sumBy(within(o.held), (h: { paidBack: bigint }) => h.paidBack), `Cross ${i + 1}: its own pay-backs`);
+    assert.deepEqual(r.paysBackRefused.map((p) => p.logIndex), within(o.refused).map((p) => p.logIndex), `Cross ${i + 1}: its own refused pay-backs`);
   }
+  // The first Cross pays its maker back; the second pays nobody back, and keeps none of the first's.
+  assert.ok((records[0] as ReturnType<typeof readCrossReceipt>).paysBack.size > 0, 'Cross 1 pays its maker back');
+  assert.equal((records[1] as ReturnType<typeof readCrossReceipt>).paysBack.size, 0, "Cross 2's pay-backs are its own: none");
   assert.notDeepEqual(records[0]?.crossed, records[1]?.crossed, 'each its own');
   assert.equal(readCrossReceipt(set, receipt as Receipt, `0x${'ab'.repeat(32)}`).crossed, null, 'a bet the receipt does not cross has no record there');
 });
