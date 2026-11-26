@@ -12,6 +12,7 @@ import { orderOn, postOrder as postOrderFrom, type Order } from './support/order
 import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
 import { postStop as postStopFrom, stopMessage } from './support/stops';
+import { startTcpRelay, type TcpRelay } from './support/tcp';
 
 // A database restored from an older copy, from what the operator and the
 // bettor would see. Each timeline takes its own copy while a bet waits, then
@@ -646,23 +647,54 @@ async function settledAsTheOriginal(f: Found, courier: CourierProcess): Promise<
   assert.equal(await zeroReservations(f.copy.pool), '0', 'the hold stands');
 }
 
-/** The copy's courier started, with the signatures and hand-offs counted from its start. */
-async function startOnCopy(f: Found): Promise<{ courier: CourierProcess & { hooks: HookControl }; before: { s: number; h: number; lanes: Awaited<ReturnType<typeof lanesOf>> } }> {
+/** The copy's courier started, with the signatures and hand-offs counted from its start; through `relay` where one is given, so its commands are counted. */
+async function startOnCopy(f: Found, relay?: TcpRelay): Promise<{ courier: CourierProcess & { hooks: HookControl }; before: { s: number; h: number; lanes: Awaited<ReturnType<typeof lanesOf>> } }> {
   const before = { s: signed(), h: handOffs(), lanes: await lanesOf(f.copy.pool) };
-  const courier = await startHookedCourier({ ...stack.env, DATABASE_URL: f.copy.url });
+  const through = new URL(f.copy.url);
+  if (relay !== undefined) {
+    through.hostname = '127.0.0.1';
+    through.port = String(relay.port);
+  }
+  const courier = await startHookedCourier({ ...stack.env, DATABASE_URL: through.toString() });
   extra.push(courier);
   return { courier, before };
 }
 
 test("a copy taken at the bet's intent, its transaction then sent and filled by the courier that went on: found by the search, the restored Cross is settled as any Cross is, with the receipt's totals, pulls and pay-backs, its quotes marked at the final block as the ordinary path marked them, and the bet told what this transaction filled; the hand-offs the copy kept, and the hold stands", async () => {
   const f = await foundIntent('restored_found');
+  // The copy reached through a relay of its own, so the first start's commands are counted as the stack's are.
+  const relay = await startTcpRelay(Number(new URL(f.copy.url).port === '' ? 5432 : new URL(f.copy.url).port));
   try {
-    const { courier, before } = await startOnCopy(f);
+    // The first start after a restore, and the search across the gap from the intent's block, measured: the requests
+    // to the node at the proxy, by method, and the commands at the relay; no other courier runs meanwhile.
+    const at = { requests: stack.proxy.counted.length, commands: relay.commands() };
+    const { courier, before } = await startOnCopy(f, relay);
+    const started = { requests: stack.proxy.counted.length, commands: relay.commands() };
     await until(() => crossState(f.copy.pool, f.bet), (s) => s === 'confirmed', 90_000, 'the found intent settled');
+    const settled = { requests: stack.proxy.counted.length, commands: relay.commands() };
     await settledAsTheOriginal(f, courier);
     assert.deepEqual({ s: signed() - before.s, h: handOffs() - before.h }, { s: 0, h: 0 }, 'nothing signed or handed off');
+    const byMethod = (from: number, to: number) => {
+      const out: Record<string, number> = {};
+      for (const r of stack.proxy.counted.slice(from, to)) out[r.method] = (out[r.method] ?? 0) + 1;
+      return out;
+    };
+    const window = stack.proxy.counted.slice(at.requests, settled.requests);
+    const numbered = (v: unknown) => typeof v === 'string' && /^0x[0-9a-f]{1,16}$/i.test(v);
+    const kept = (await f.copy.pool.query<{ block_number: string; recorded: { final?: { number?: string } } }>('SELECT block_number::text AS block_number, recorded FROM crosses WHERE bet_hash = $1', [f.bet.toLowerCase()])).rows[0];
+    // The search's steps: a header read by its height, then the key's count at that header's hash; then the block found, in full.
+    const search = {
+      gapInBlocks: Number(BigInt(String(kept?.recorded.final?.number ?? '0')) - BigInt(kept?.block_number ?? '0')),
+      headersByHeight: window.filter((r) => r.method === 'eth_getBlockByNumber' && numbered(r.params?.[0]) && r.params?.[1] !== true).length,
+      countsAtABlocksHash: window.filter((r) => r.method === 'eth_getTransactionCount' && typeof r.params?.[1] === 'object' && r.params?.[1] !== null).length,
+      blocksReadInFull: window.filter((r) => r.method === 'eth_getBlockByNumber' && r.params?.[1] === true).length,
+    };
+    console.log(`# the first start after a restore, measured: ${JSON.stringify({ start: { requests: started.requests - at.requests, byMethod: byMethod(at.requests, started.requests), commands: started.commands - at.commands }, toSettled: { requests: settled.requests - started.requests, byMethod: byMethod(started.requests, settled.requests), commands: settled.commands - started.commands } })}`);
+    console.log(`# the search across a gap, measured: ${JSON.stringify(search)}`);
+    assert.ok(search.headersByHeight > 0 && search.blocksReadInFull > 0, `the search ran in the window: ${JSON.stringify(search)}`);
   } finally {
     await stopAll();
+    await relay.close();
     await stack.restartCourier({ hooked: true });
   }
 });

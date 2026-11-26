@@ -22,6 +22,8 @@ export interface Counted {
   how: 'arrived' | 'passed' | 'refused' | 'answered' | 'held' | 'dropped' | 'withheld';
   /** A raw transaction's own bytes, as the request carried them, so that one transaction's requests are counted by its bytes. */
   sent?: string;
+  /** Any other request's params, as it carried them: the block a count or a block's read names, among them. */
+  params?: unknown[];
 }
 
 /** The courier's sends, which this build must never make: counted at the proxy as they arrive. */
@@ -243,6 +245,7 @@ export async function startProxy(upstreamUrl: string): Promise<ChainProxy> {
         answerBytes: 0,
         how: 'arrived' as const,
         ...(r.method === 'eth_sendRawTransaction' && typeof r.params?.[0] === 'string' ? { sent: r.params[0] } : {}),
+        ...(r.method !== 'eth_sendRawTransaction' && Array.isArray(r.params) ? { params: r.params } : {}),
       }));
       counted.push(...arrived);
       Promise.all(list.map((r) => answerOne(r, JSON.stringify(r)))).then(
