@@ -7,6 +7,7 @@ import { get as getFrom } from './support/courier';
 import { orderOn, postOrder as postOrderFrom, type Order } from './support/orders';
 import { outcomes, postStop as postStopFrom, resultsOf, stopMessage } from './support/stops';
 import { closeEach } from './support/close';
+import { nodeText, PLANTED } from './support/named';
 import { startStack, type Stack } from './support/stack';
 
 // The sender, from what a user would see: signed orders posted over HTTP to the
@@ -56,6 +57,12 @@ interface CrossSeen {
   tx_hash: string | null;
   nonce: string | null;
   not_sent_reason: string | null;
+}
+
+/** The Cross's state and the node's answer as recorded. */
+async function answerOf(bet: string): Promise<{ state: string; node_answer: unknown } | null> {
+  const { rows } = await pool.query<{ state: string; node_answer: unknown }>('SELECT state, node_answer FROM crosses WHERE bet_hash = $1', [bet.toLowerCase()]);
+  return rows[0] ?? null;
 }
 
 async function crossRow(bet: string): Promise<CrossSeen | null> {
@@ -272,6 +279,31 @@ test('the node\'s answer lost: the request passed to the chain and its answer wi
   assert.deepEqual({ signed: counts().signed - before.signed, handOffs: counts().handOffs - before.handOffs }, { signed: 1, handOffs: 1 });
 });
 
+test('the node\'s answer a named error: the request passed to the chain, and the node\'s answer replaced by the named error "nonce too low"; the Cross is unknown with the error\'s fixed words alone, and the stop reads stopped with handOff state "uncertain"; the Cross fills and settles confirmed', async () => {
+  await laneFree();
+  const before = counts();
+  const named = stack.proxy.passThenError('eth_sendRawTransaction', { code: -32000, message: nodeText('nonce too low') });
+  let c: Awaited<ReturnType<typeof quoteAndBet>>;
+  try {
+    c = await quoteAndBet();
+    const unknown = await until(() => answerOf(c.betHash), (r) => r !== null && r.state !== 'intent' && r.state !== 'signed' && r.state !== 'handing off', 30_000, 'the answer');
+    assert.deepEqual(unknown, { state: 'unknown', node_answer: { kind: 'unknown', words: 'nonce too low' } }, 'not known, with the fixed words alone');
+    assert.equal(named.forwarded.length, 1, 'the chain had the request');
+  } finally {
+    named.stop();
+  }
+  const stop = await postStop(url(), stack.rig, c.M, stopMessage(c.M.address, [c.quoteHash as `0x${string}`]));
+  assert.equal(stop.status, 200, JSON.stringify(stop.body));
+  const result = resultsOf(stop)[0] as unknown as { status: string; handOff?: { state: string; bet: string } };
+  assert.equal(result.status, 'stopped');
+  assert.equal(result.handOff?.state, 'uncertain', JSON.stringify(result));
+  assert.equal(result.handOff?.bet, c.betHash.toLowerCase());
+  for (const needle of PLANTED) assert.ok(!JSON.stringify(stop.body).toLowerCase().includes(needle), `${needle} is not on the stop's answer`);
+  const settled = await until(() => crossRow(c.betHash), (r) => r !== null && FINAL.includes(r.state), 90_000, 'the Cross');
+  assert.equal(settled?.state, 'confirmed', JSON.stringify(settled));
+  assert.deepEqual({ signed: counts().signed - before.signed, handOffs: counts().handOffs - before.handOffs }, { signed: 1, handOffs: 1 });
+});
+
 test('a stop sent again after its answer was lost: the first commits after the gate and its answer goes unread; the second is answered already stopped with the same handOff, once with the Cross pending and once with it unknown', async () => {
   for (const how of ['pending', 'unknown'] as const) {
     await laneFree();
@@ -302,6 +334,32 @@ test('a stop sent again after its answer was lost: the first commits after the g
     stack.proxy.finalFollows(1n);
     await until(() => crossRow(c.betHash), (r) => r !== null && FINAL.includes(r.state), 90_000, 'the Cross');
   }
+});
+
+test('a stop sent again after a named error\'s answer: the node refuses the hand-off by the named error "txpool is full" and the chain never has it; the Cross is unknown with the error\'s fixed words alone; the second stop is answered already stopped with the same handOff, uncertain, as the first; the Cross ends expired unmined', async () => {
+  await laneFree();
+  const before = counts();
+  stack.proxy.rule('eth_sendRawTransaction', { kind: 'refuse', code: -32000, message: nodeText('txpool is full') });
+  let c: Awaited<ReturnType<typeof quoteAndBet>>;
+  try {
+    c = await quoteAndBet();
+    const unknown = await until(() => answerOf(c.betHash), (r) => r !== null && r.state !== 'intent' && r.state !== 'signed' && r.state !== 'handing off', 30_000, 'the answer');
+    assert.deepEqual(unknown, { state: 'unknown', node_answer: { kind: 'unknown', words: 'txpool is full' } }, 'not known, with the fixed words alone');
+  } finally {
+    stack.proxy.rule('eth_sendRawTransaction', null);
+  }
+  const first = await postStop(url(), stack.rig, c.M, stopMessage(c.M.address, [c.quoteHash as `0x${string}`]));
+  // The first answer is read here only to compare with the second: the case is that the maker never saw it.
+  const again = await postStop(url(), stack.rig, c.M, stopMessage(c.M.address, [c.quoteHash as `0x${string}`]));
+  assert.deepEqual(outcomes(again), ['already stopped']);
+  const h1 = (resultsOf(first)[0] as unknown as { handOff?: unknown }).handOff;
+  const h2 = (resultsOf(again)[0] as unknown as { handOff?: unknown }).handOff;
+  assert.deepEqual(h2, h1, 'the same handOff');
+  const cross = await crossRow(c.betHash);
+  assert.deepEqual(h2, { txHash: cross?.tx_hash, state: 'uncertain', bet: c.betHash.toLowerCase() }, JSON.stringify(h2));
+  const settled = await until(() => crossRow(c.betHash), (r) => r !== null && FINAL.includes(r.state), 120_000, 'the Cross');
+  assert.equal(settled?.state, 'expired unmined', JSON.stringify(settled));
+  assert.deepEqual({ signed: counts().signed - before.signed, handOffs: counts().handOffs - before.handOffs }, { signed: 1, handOffs: 1 });
 });
 
 test('the gate\'s acknowledgement lost, with no restart: the commit of handing off reaches the database and its answer is dropped; nothing is handed over, the uncertain session goes with its locks, a stop of a listed quote succeeds, the Cross settles from the final block, and the next new bet fills', async () => {
@@ -343,4 +401,10 @@ test('on the stack: a nonce of the key used at a final block by a transaction th
   assert.equal(bet.rows[0]?.bet_state, 'waiting');
   const after = await pool.query<{ to: string; at: string | null }>('SELECT verified_nonce_to::text AS to, verified_block_number::text AS at FROM lanes');
   assert.deepEqual(after.rows, wm.rows, 'the watermark did not move');
+});
+
+test("the reserved NODE_REFUSED, produced by nothing in this file's runs: no row and no line holds it, after every hand-off here, its answer taken, lost, dropped, refused by its connection or answered by a named error", async () => {
+  const crosses = await pool.query(`SELECT 1 FROM crosses WHERE not_sent_reason = 'NODE_REFUSED'`);
+  const events = await pool.query(`SELECT 1 FROM events WHERE reason = 'NODE_REFUSED' OR facts::text LIKE '%NODE_REFUSED%'`);
+  assert.deepEqual([crosses.rowCount, events.rowCount], [0, 0]);
 });

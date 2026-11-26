@@ -10,6 +10,7 @@ import { crossFromTheTest, orderOn, postOrder as postOrderFrom, sign, type Order
 import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
 import { outcomes, postStop as postStopFrom, resultsOf, stopMessage } from './support/stops';
+import { NEXT, SENTENCE } from '../courier/orders/wire';
 
 // The sender from a user's side, on a chain that mines a block every two
 // seconds and whose final block follows its head: one bet end to end, read to
@@ -66,6 +67,14 @@ async function until<T>(read: () => Promise<T>, done: (v: T) => boolean, ms: num
 const FINAL = ['confirmed', 'reverted', 'not sent', 'expired unmined', 'replaced'];
 const crossOf = async (bet: string) => (await pool.query<{ state: string; tx_hash: string | null; nonce: string | null; max_fee_per_gas: string | null; max_priority_fee: string | null; gas_used: string | null; effective_gas_price: string | null }>('SELECT state, tx_hash, nonce::text AS nonce, max_fee_per_gas::text AS max_fee_per_gas, max_priority_fee::text AS max_priority_fee, gas_used::text AS gas_used, effective_gas_price::text AS effective_gas_price FROM crosses WHERE bet_hash = $1', [bet.toLowerCase()])).rows[0] ?? null;
 const final = (bet: string, ms = 90_000) => until(() => crossOf(bet), (c) => c !== null && FINAL.includes(c.state), ms, `the Cross of ${bet}`);
+/** The Cross's row as the named-error cases read it: its state, reason, outcome's time, hand-offs, answer and record. */
+const crossFull = async (bet: string) =>
+  (
+    await pool.query<{ state: string; not_sent_reason: string | null; outcome_at: Date | null; hand_offs: number; node_answer: unknown; recorded: Record<string, unknown> | null }>(
+      'SELECT state, not_sent_reason, outcome_at, hand_offs, node_answer, recorded FROM crosses WHERE bet_hash = $1',
+      [bet.toLowerCase()],
+    )
+  ).rows[0] ?? null;
 const coin = () => stack.rig.abis.TestCoin as Abi;
 const balance = (who: string) => stack.rig.read<bigint>(stack.rig.addresses.coin, coin(), 'balanceOf', [who]);
 const pol = async (who: string) => BigInt((await stack.rig.rpc('eth_getBalance', [who, 'latest'])) as string);
@@ -311,41 +320,112 @@ test("the full total, filled by another courier: the bet filled in full on the c
   assert.doesNotMatch(cross.message, /Next:/, 'a bet filled in full has no next step');
 });
 
-test("the bettor's record of not sent's third reason: the node refuses the one hand-off by name, and the record reads not sent NODE_REFUSED with the refusal's words, handed once and never again, and nothing of the bet filled; the next bet is sent and fills the same quote", async () => {
+test("the bettor's named hand-off error: refused before forwarding, the record is unknown with diagnostic words until final expiry proves expired unmined; handed once and never again, nothing filled; only then the next eligible bet is sent and fills the same quote", async () => {
   // A game of its own, so the bet lists this quote and no other case's.
   const gameId = await stack.rig.createGame({ startWritten: true });
   const quote = await postQuote(await fresh(), { gameId });
   const B = await fresh();
   const paid = await balance(B.address);
-  // The node refuses, by one of the named refusals, the hand-off of the one transaction that carries B's order.
+  // The final block held at the head, before the bet's expiry, so the record before any proof can be read.
+  stack.proxy.finalFollows(null);
+  stack.proxy.setFinal(BigInt((await stack.rig.rpc('eth_blockNumber', [])) as string));
+  // The node refuses, by one of the named errors, the hand-off of the one transaction that carries B's order, before it reaches the chain.
   const ofB = B.address.slice(2).toLowerCase();
   stack.proxy.rule('eth_sendRawTransaction', { kind: 'refuseIf', refuse: (params) => typeof params[0] === 'string' && params[0].toLowerCase().includes(ofB), code: -32000, message: 'txpool is full' });
+  const expiry = (await stack.rig.time()) + 30n;
   let hash: string;
+  let txHash: string;
   try {
-    const bet = await postBet(B, { gameId });
+    const bet = await postBet(B, { gameId, expiry });
     assert.equal(bet.status, 202, JSON.stringify(bet.body));
     hash = bet.hash;
-    await final(hash);
+    // The first state past the hand-off: a premature end fails here at once, by name.
+    const answered = await until(() => crossFull(hash), (c) => c !== null && !['intent', 'signed', 'handing off'].includes(c.state), 30_000, 'the answer');
+    assert.deepEqual(
+      [answered?.state, answered?.not_sent_reason, answered?.outcome_at, answered?.hand_offs],
+      ['unknown', null, null, 1],
+      `not known, and no outcome: ${JSON.stringify(answered)}`,
+    );
+    const lane = (await pool.query<{ held_bet: string | null; open_cross: string | null }>('SELECT held_bet, open_cross FROM lanes')).rows[0];
+    assert.deepEqual([lane?.held_bet, lane?.open_cross], [hash.toLowerCase(), hash.toLowerCase()], 'the lane held, its open Cross this one');
+    const record = await get(`/v1/orders/${hash}`);
+    assert.equal(record.status, 200);
+    assert.equal(record.body.state, 'unknown', JSON.stringify(record.body));
+    const cross = record.body.cross as { state: string; handOffs: number; answer: unknown; message: string; txHash: string };
+    assert.deepEqual([cross.state, cross.handOffs], ['unknown', 1]);
+    assert.equal('reason' in cross, false, 'no reason: the property is absent');
+    assert.deepEqual(cross.answer, { kind: 'unknown', words: 'txpool is full' });
+    assert.equal(cross.message, SENTENCE.UNKNOWN(cross.txHash, expiry.toString()), 'the unknown sentence, whole, with N1');
+    txHash = cross.txHash;
   } finally {
     stack.proxy.rule('eth_sendRawTransaction', null);
+    stack.proxy.setFinal(null);
+    stack.proxy.finalFollows(1n);
   }
+  // The final evidence let go: a final block at or past the expiry, the nonce unused there.
+  const ended = await final(hash);
+  assert.equal(ended?.state, 'expired unmined', JSON.stringify(ended));
+  const full = await crossFull(hash);
+  const fin = (full?.recorded ?? {}).final as { number: string; time: string };
+  assert.ok(BigInt(fin.time) >= expiry, 'the final block at or past the expiry');
+  assert.deepEqual([full?.hand_offs, full?.not_sent_reason, (full?.recorded ?? {}).betFilled], [1, null, '0'], 'handed once; its total at that same block, nothing');
   const record = await get(`/v1/orders/${hash}`);
-  assert.equal(record.status, 200);
-  assert.equal(record.body.state, 'not sent', JSON.stringify(record.body));
-  const cross = record.body.cross as { state: string; reason: string | null; handOffs: number; answer: unknown; message: string; txHash: string };
-  assert.deepEqual([cross.state, cross.reason, cross.handOffs], ['not sent', 'NODE_REFUSED', 1]);
-  assert.deepEqual(cross.answer, { kind: 'refused', words: 'txpool is full' });
-  assert.match(cross.message, /^The courier handed this bet's fill to the chain once, and the node refused it: txpool is full\. It was not handed again, and this courier filled nothing of it\./);
+  assert.equal(record.body.state, 'expired unmined', JSON.stringify(record.body));
+  const cross = record.body.cross as { state: string; handOffs: number; answer: unknown; message: string; txHash: string };
+  assert.deepEqual([cross.state, cross.handOffs, cross.txHash], ['expired unmined', 1, txHash]);
+  assert.equal('reason' in cross, false, 'no reason: the property is absent');
+  assert.deepEqual(cross.answer, { kind: 'unknown', words: 'txpool is full' });
+  assert.equal(cross.message, `${SENTENCE.EXPIRED_UNMINED(txHash, fin.number, fin.time, expiry.toString())} ${SENTENCE.NOTHING_FILLED(fin.number)} ${NEXT.N4}`, 'expired unmined, nothing filled at that block, and its next step, whole');
   // What the record says, held to: one signature of B's order, one request carrying its bytes, nothing of the bet filled.
-  assert.deepEqual({ signed: signedFor(B.address), requests: requestsOf(cross.txHash) }, { signed: 1, requests: 1 });
+  assert.deepEqual({ signed: signedFor(B.address), requests: requestsOf(txHash) }, { signed: 1, requests: 1 });
   assert.equal(await balance(B.address), paid, 'the bettor paid nothing in');
-  // The lane goes on: the next bet is sent and fills the quote the refused one listed, and the refused transaction is not handed again.
+  // Only then the lane goes on: the next bet is sent and fills the quote the first listed, and the first's transaction is not handed again.
   const next = await postBet(await fresh(), { gameId });
   const filled = await final(next.hash);
   assert.equal(filled?.state, 'confirmed', JSON.stringify(filled));
   const legs = await pool.query<{ order_hash: string }>('SELECT order_hash FROM legs WHERE bet_hash = $1 ORDER BY position', [next.hash.toLowerCase()]);
   assert.deepEqual(legs.rows.map((l) => l.order_hash), [quote.hash.toLowerCase()]);
-  assert.equal(requestsOf(cross.txHash), 1, 'the refused transaction, never handed again');
+  assert.equal(requestsOf(txHash), 1, 'the first transaction, never handed again');
+});
+
+test("the bettor's named hand-off error after the chain took the request: the node passes the bet's transaction on and answers with the named error \"txpool is full\"; the record is unknown with those words while the receipt is withheld and the final block held; then confirmed from its own receipt, the bettor and the maker paid as it filled, handed once", async () => {
+  // A game of its own, so the bet lists this quote and no other case's.
+  const gameId = await stack.rig.createGame({ startWritten: true });
+  const M = await fresh();
+  await postQuote(M, { gameId });
+  const B = await fresh();
+  const before = { b: await balance(B.address), m: await balance(M.address) };
+  stack.proxy.finalFollows(null);
+  stack.proxy.setFinal(BigInt((await stack.rig.rpc('eth_blockNumber', [])) as string));
+  stack.proxy.rule('eth_getTransactionReceipt', { kind: 'answer', result: () => null });
+  const ofB = B.address.slice(2).toLowerCase();
+  const named = stack.proxy.passThenError('eth_sendRawTransaction', { code: -32000, message: 'txpool is full' }, (params) => typeof params[0] === 'string' && params[0].toLowerCase().includes(ofB));
+  let hash: string;
+  let txHash: string;
+  try {
+    const bet = await postBet(B, { gameId });
+    assert.equal(bet.status, 202, JSON.stringify(bet.body));
+    hash = bet.hash;
+    const answered = await until(() => crossFull(hash), (c) => c !== null && !['intent', 'signed', 'handing off'].includes(c.state), 30_000, 'the answer');
+    assert.deepEqual([answered?.state, answered?.not_sent_reason, answered?.outcome_at, answered?.hand_offs], ['unknown', null, null, 1], JSON.stringify(answered));
+    const record = await get(`/v1/orders/${hash}`);
+    const cross = record.body.cross as { state: string; answer: unknown; txHash: string };
+    assert.deepEqual([record.body.state, cross.state, 'reason' in cross], ['unknown', 'unknown', false]);
+    assert.deepEqual(cross.answer, { kind: 'unknown', words: 'txpool is full' });
+    txHash = cross.txHash;
+    assert.deepEqual(named.forwarded.map((a) => (a as { result?: unknown }).result), [txHash], 'the chain took these bytes, by their own hash');
+  } finally {
+    named.stop();
+    stack.proxy.rule('eth_getTransactionReceipt', null);
+    stack.proxy.setFinal(null);
+    stack.proxy.finalFollows(1n);
+  }
+  const ended = await final(hash);
+  assert.equal(ended?.state, 'confirmed', JSON.stringify(ended));
+  assert.equal(ended?.tx_hash, txHash, 'its own transaction');
+  assert.equal((await balance(B.address)) - before.b, -9_984n, "the bettor's coin, down 9,984, as it filled");
+  assert.equal((await balance(M.address)) - before.m, -9_600n, "the maker's coin, down 9,600");
+  assert.deepEqual({ signed: signedFor(B.address), requests: requestsOf(txHash) }, { signed: 1, requests: 1 });
 });
 
 test("the maker's side: a quote stopped while no Cross lists it reads stopped with no handOff; the replacement posted at once is filled by the next bet, and the stopped quote fills nothing", async () => {

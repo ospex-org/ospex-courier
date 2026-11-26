@@ -257,7 +257,11 @@ export async function writePending(on: Client, betHash: Hex, receipt: BlockNamed
   return (rowCount ?? 0) === 1;
 }
 
-/** A pending Cross whose receipt is an orphan's: back to sent where the node's answer took it, or to unknown where no answer is on record. Returns the state it went back to, or null. */
+/**
+ * A pending Cross whose receipt is an orphan's: back to sent where the node's answer on record is taken, and to
+ * unknown otherwise, where no answer is on record or the one on record is not known, a named error's words or none.
+ * Returns the state it went back to, or null.
+ */
 export async function writeOrphaned(on: Client, betHash: Hex): Promise<'sent' | 'unknown' | null> {
   const { rows } = await on.query<{ state: 'sent' | 'unknown' }>(
     `UPDATE crosses SET state = CASE WHEN node_answer->>'kind' = 'taken' THEN 'sent' ELSE 'unknown' END,

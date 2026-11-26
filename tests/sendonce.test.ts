@@ -260,3 +260,9 @@ test('a stop of a listed quote committed while the courier runs, then a kill aft
   // M's quote stays stopped; the case's own stays used up.
   await noForeignTransactions();
 });
+
+test("the reserved NODE_REFUSED, produced by nothing in this file's runs: no row and no line holds it, after every hand-off here, its answer taken, lost, dropped, refused by its connection or answered by a named error", async () => {
+  const crosses = await pool.query(`SELECT 1 FROM crosses WHERE not_sent_reason = 'NODE_REFUSED'`);
+  const events = await pool.query(`SELECT 1 FROM events WHERE reason = 'NODE_REFUSED' OR facts::text LIKE '%NODE_REFUSED%'`);
+  assert.deepEqual([crosses.rowCount, events.rowCount], [0, 0]);
+});

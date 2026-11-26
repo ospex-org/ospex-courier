@@ -10,6 +10,7 @@ import { get, startHookedCourier, type CourierProcess, type HookControl } from '
 import { testKeystoreFor } from './support/keystore';
 import { orderOn, postOrder as postOrderFrom, type Order } from './support/orders';
 import { closeEach } from './support/close';
+import { nodeText } from './support/named';
 import { startStack, type Stack } from './support/stack';
 import { postStop as postStopFrom, stopMessage } from './support/stops';
 import { startTcpRelay, type TcpRelay } from './support/tcp';
@@ -458,6 +459,52 @@ test("a copy taken at the bet's signed record: the take on the restored database
     assert.equal(await zeroReservations(copy.pool), '0', 'the hold stands');
   } finally {
     withheld.stop();
+    await stopAll();
+    await stack.restartCourier({ hooked: true });
+  }
+});
+
+test("a copy taken while the node's named error is the answer on record, the chain having taken the request: the take on the restored database leaves the Cross unknown with the error's fixed words; under the restore's hold its courier settles it confirmed from the chain by the hash the copy kept, with the hand-offs and the answer the copy kept, and signs and hands off nothing; the hold stands", async () => {
+  await backToTheOriginal();
+  await quote(await fresh(), url());
+  // The final block held and the receipt not given, so the original records the answer and cannot settle.
+  stack.proxy.finalFollows(null);
+  stack.proxy.setFinal(BigInt((await stack.rig.rpc('eth_blockNumber', [])) as string));
+  stack.proxy.rule('eth_getTransactionReceipt', { kind: 'answer', result: () => null });
+  const named = stack.proxy.passThenError('eth_sendRawTransaction', { code: -32000, message: nodeText('nonce too low') });
+  let b!: { status: number; hash: string; body: Record<string, unknown> };
+  try {
+    b = await bet(await fresh(), url());
+    assert.equal(b.status, 202, JSON.stringify(b.body));
+    await until(() => crossState(original, b.hash), (s) => s !== null && !['intent', 'signed', 'handing off'].includes(s), 30_000, 'the answer recorded');
+    assert.equal(named.forwarded.length, 1, 'the chain had the request');
+  } finally {
+    named.stop();
+  }
+  try {
+    const copy = await copyDatabase('restored_named');
+    const kept = (await copy.pool.query<{ state: string; tx_hash: string | null; hand_offs: number; node_answer: unknown }>('SELECT state, tx_hash, hand_offs, node_answer FROM crosses WHERE bet_hash = $1', [b.hash.toLowerCase()])).rows[0];
+    assert.deepEqual([kept?.state, kept?.hand_offs, kept?.node_answer], ['unknown', 1, { kind: 'unknown', words: 'nonce too low' }], JSON.stringify(kept));
+    await stopAll();
+    const shut = await operator(copy.url, ['shut', '--copy-time', new Date().toISOString()]);
+    assert.equal(shut.status, 0, shut.out);
+    const sends = stack.proxy.count('eth_sendRawTransaction');
+    const courier = await startHookedCourier({ ...stack.env, DATABASE_URL: copy.url });
+    extra.push(courier);
+    await new Promise((r) => setTimeout(r, 3_000));
+    assert.equal(await crossState(copy.pool, b.hash), 'unknown', 'the take leaves it unknown');
+    stack.proxy.rule('eth_getTransactionReceipt', null);
+    stack.proxy.setFinal(null);
+    stack.proxy.finalFollows(1n);
+    await until(() => crossState(copy.pool, b.hash), (s) => s === 'confirmed', 90_000, 'settled from the chain by its hash');
+    const row = (await copy.pool.query<{ tx_hash: string | null; hand_offs: number; node_answer: unknown }>('SELECT tx_hash, hand_offs, node_answer FROM crosses WHERE bet_hash = $1', [b.hash.toLowerCase()])).rows[0];
+    assert.deepEqual(row, { tx_hash: kept?.tx_hash, hand_offs: kept?.hand_offs, node_answer: kept?.node_answer }, 'the hash, the hand-offs and the answer the copy kept');
+    assert.deepEqual({ signed: courier.hooks.signed.length, sends: stack.proxy.count('eth_sendRawTransaction') - sends }, { signed: 0, sends: 0 }, 'nothing signed or handed off under the hold');
+    assert.equal(await zeroReservations(copy.pool), '0', 'the hold stands');
+  } finally {
+    stack.proxy.rule('eth_getTransactionReceipt', null);
+    stack.proxy.setFinal(null);
+    stack.proxy.finalFollows(1n);
     await stopAll();
     await stack.restartCourier({ hooked: true });
   }

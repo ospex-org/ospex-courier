@@ -6,6 +6,7 @@ import type { HoldPoint } from '../courier/check/hooks';
 import { get as getFrom, startHookedCourier, type CourierProcess, type HookControl } from './support/courier';
 import { orderOn, postOrder as postOrderFrom, type Order } from './support/orders';
 import { closeEach } from './support/close';
+import { nodeText } from './support/named';
 import { startStack, type Stack } from './support/stack';
 
 // Send once, across two processes on one database and one key: the first held at each point where it can stop while
@@ -116,7 +117,7 @@ async function nextFills(): Promise<void> {
  * start does with the bet (`take`), what the bet ends as, and whose hand-off may carry it: none; the first's, which had
  * passed the gate; or the second's, which sent the bet that its start put back to waiting.
  */
-const TWO: Array<{ point: HoldPoint; cut?: true; take: 'returned' | 'closed' | 'left'; ends: string[]; reason?: string; by: 'none' | 'first' | 'second' }> = [
+const TWO: Array<{ point: HoldPoint; cut?: true; named?: true; take: 'returned' | 'closed' | 'left'; ends: string[]; reason?: string; by: 'none' | 'first' | 'second' }> = [
   { point: 'after-reservation', take: 'returned', ends: ['confirmed'], by: 'second' },
   { point: 'after-intent', take: 'closed', ends: ['not sent'], reason: 'COURIER_RESTARTED', by: 'none' },
   { point: 'after-signature', take: 'closed', ends: ['not sent'], reason: 'COURIER_RESTARTED', by: 'none' },
@@ -124,14 +125,25 @@ const TWO: Array<{ point: HoldPoint; cut?: true; take: 'returned' | 'closed' | '
   { point: 'after-gate', take: 'left', ends: ['confirmed', 'expired unmined'], by: 'first' },
   { point: 'after-hand-off', take: 'left', ends: ['confirmed'], by: 'first' },
   { point: 'after-signed-record', cut: true, take: 'closed', ends: ['not sent'], reason: 'COURIER_RESTARTED', by: 'none' },
+  // The first holds the node's answer, a named error, when the second starts: its guarded record of it finds the lane
+  // no longer its own, and that gives it no right to send.
+  { point: 'after-hand-off', named: true, take: 'left', ends: ['confirmed'], by: 'first' },
 ];
 
 for (const two of TWO) {
-  test(`two processes on one database and one key, the first held ${two.point}${two.cut === true ? ' with its database session cut while it lives' : ''} while the second starts: at most one hand-off for the bet, none by a process that had not passed the gate, and the first sends nothing more`, async () => {
+  test(`two processes on one database and one key, the first held ${two.point}${two.cut === true ? ' with its database session cut while it lives' : ''}${two.named === true ? ' with the node\'s answer the named error "nonce too low", the chain having taken the request' : ''} while the second starts: at most one hand-off for the bet, none by a process that had not passed the gate, and the first sends nothing more`, async () => {
     const before = { s: signed(), h: handOffs(), requests: stack.proxy.counted.length };
     await hooks().arm(two.point, 1);
-    const c = await quoteAndBet();
-    const held = await hooks().reached(two.point);
+    const named = two.named === true ? stack.proxy.passThenError('eth_sendRawTransaction', { code: -32000, message: nodeText('nonce too low') }) : null;
+    let c!: Awaited<ReturnType<typeof quoteAndBet>>;
+    let held!: Awaited<ReturnType<HookControl['reached']>>;
+    try {
+      c = await quoteAndBet();
+      held = await hooks().reached(two.point);
+    } finally {
+      named?.stop();
+    }
+    if (named !== null) assert.equal(named.forwarded.length, 1, 'the chain had the request, and the first heard the named error');
     if (two.cut === true) {
       stack.dbRelay.cut();
       // The cut reached the first: its pool says an idle connection of its failed.
