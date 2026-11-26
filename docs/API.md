@@ -736,7 +736,6 @@ stops at: none is claimed.
 | `DATABASE_UNREADABLE` | 503 | every `/v1` route that reads the database | The database could not be read; with `retryAfterSeconds` where the courier waited ten seconds for a connection and none came free. On `POST /v1/orders`: "A database or connection failure means this order may or may not have been recorded. Next: read the order by its hash, or post the same signed order again. Do not sign a new bet because an answer failed." |
 | `NOT_READY` | 503 | `/readyz` | The database did not answer. |
 | `INTERNAL_ERROR` | 500 | any | The courier failed on this request, by a fault of its own. |
-
 | `STOPPED_AT_GATE`, `COURIER_RESTARTED` | — | a bet's record, `cross.reason` | Why its Cross was closed `not sent` before the hand-off gate: a stop found at the gate; or the courier restarted, or another of its processes took over, before the gate. |
 | `NODE_REFUSED` | — | reserved | Kept in the schema and API vocabulary; this build never issues it. A named error after the hand-off gate is unknown and is settled from the chain, not closed not sent. |
 | `ACCOUNT_PAUSED` | — | reserved | Kept for the build that issues it, at the door, for a bet; this build never issues it. |
