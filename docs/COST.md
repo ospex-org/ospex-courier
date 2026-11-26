@@ -251,7 +251,7 @@ Every statement the courier's own sessions run for one sent bet, from its post t
 each from its own `EXPLAIN (ANALYZE, BUFFERS)`, made by the database's `auto_explain` as the statement runs, on the
 book scan's three books, each in a market of its own: ten live quotes; 50,000 and 500,000 orders ended by the mark,
 ahead of ten live quotes; and 50,000 and 500,000 expired quotes not yet marked, behind the bet's live quote
-(`tests/cost-sent.test.ts`). Ahead of its live quote, as the book scan's figures lay it, the backlog leaves no bet to
+(`tests/cost-sent.test.ts`, `tests/cost-sent-ended.test.ts`). Ahead of its live quote, as the book scan's figures lay it, the backlog leaves no bet to
 send: the check meets the bound of 2,000 rows first, and refuses the bet there. Each book is measured before vacuum,
 with the dead versions its marking leaves, and after `VACUUM`; the backlog also with the final block held behind its
 expiry while the bet is checked. Buffers: all the statements' shared buffer accesses, a statement's largest call each,
