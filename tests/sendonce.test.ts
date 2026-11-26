@@ -4,7 +4,7 @@ import { keccak256, type Hex } from 'viem';
 import type { HDAccount } from 'viem/accounts';
 import pg from 'pg';
 import type { HoldPoint } from '../courier/check/hooks';
-import { startHookedCourier, type CourierProcess, type HookControl } from './support/courier';
+import { get as getFrom, startHookedCourier, type CourierProcess, type HookControl } from './support/courier';
 import { orderOn, postOrder as postOrderFrom, type Order } from './support/orders';
 import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
@@ -77,6 +77,21 @@ async function until<T>(read: () => Promise<T>, done: (v: T) => boolean, ms: num
 const FINAL = ['confirmed', 'reverted', 'not sent', 'expired unmined', 'replaced'];
 const final = (bet: string, ms = 90_000) => until(() => crossRow(bet), (r) => r !== null && FINAL.includes(r.state), ms, `the Cross of ${bet}`);
 
+/** Where the door refused a post: what the node check found, from the status address, and the courier's last lines. */
+async function whyRefused(): Promise<string> {
+  const status = await getFrom(url(), '/v1/status').catch(() => null);
+  const node = (status?.body as { node?: Record<string, unknown> } | undefined)?.node ?? null;
+  const notOk = (v: unknown) => typeof v === 'object' && v !== null && (v as { ok?: unknown }).ok === false;
+  const failing =
+    node === null
+      ? null
+      : {
+          ...Object.fromEntries(Object.entries(node).filter(([, v]) => notOk(v))),
+          verdicts: ((node.verdicts as Array<Record<string, unknown>> | undefined) ?? []).filter((v) => Object.values(v).some(notOk)),
+        };
+  return `the node check's failing parts: ${JSON.stringify(failing)}; the courier's last lines: ${stack.courier.lines.slice(-6).join(' | ')}`;
+}
+
 /** A quote of 9,600 that one bet fills whole, and a bet of 10,000 against it, to expire in `life` seconds. */
 async function quoteAndBet(life = 30n): Promise<{ M: HDAccount; B: HDAccount; quote: Order; betHash: string; quoteHash: string }> {
   const M = await fresh();
@@ -84,10 +99,10 @@ async function quoteAndBet(life = 30n): Promise<{ M: HDAccount; B: HDAccount; qu
   const T = await stack.rig.time();
   const quote: Order = { ...orderOn(stack.rig, M, { expiry: T + 600n, oddsTick: 204, riskAmount: 9_600n }), positionType: 0 };
   const posted = await postOrder(url(), stack.rig, M, 'rest', quote);
-  assert.equal(posted.status, 201, JSON.stringify(posted.body));
+  if (posted.status !== 201) assert.fail(`${JSON.stringify(posted.body)}; ${await whyRefused()}`);
   const bet: Order = { ...orderOn(stack.rig, B, { expiry: T + life, oddsTick: 196, riskAmount: 10_000n }), positionType: 1 };
   const taken = await postOrder(url(), stack.rig, B, 'take', bet);
-  assert.equal(taken.status, 202, JSON.stringify(taken.body));
+  if (taken.status !== 202) assert.fail(`${JSON.stringify(taken.body)}; ${await whyRefused()}`);
   return { M, B, quote, betHash: taken.body.orderHash as string, quoteHash: posted.body.orderHash as string };
 }
 
