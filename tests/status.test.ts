@@ -865,7 +865,7 @@ test('with the database stopped, the status answers 503 and claims nothing; /rea
     const posted = await postOrder(url, stack.rig, stack.rig.accounts.maker, 'rest', orderOn(stack.rig, stack.rig.accounts.maker, { expiry: T + 600n }));
     assert.equal(posted.status, 503, JSON.stringify(posted.body));
     assert.equal(posted.body.code, 'DATABASE_UNREADABLE');
-    assert.equal(posted.body.error, 'A database or connection failure can leave acceptance uncertain. Next: read the order by hash or repost the same signed order; do not sign a new bet merely because an answer failed.', "the door's sentence, whole");
+    assert.equal(posted.body.error, 'A database or connection failure means this order may or may not have been recorded. Next: read the order by its hash, or post the same signed order again. Do not sign a new bet because an answer failed.', "the door's sentence, whole");
   } finally {
     stack.dbRelay.restore();
   }

@@ -171,11 +171,11 @@ export async function getBook(deps: RouteDeps, query: URLSearchParams): Promise<
 }
 
 /**
- * A database or connection failure under the door can leave acceptance uncertain: the sentence the order route answers
- * it with, as docs/API.md states it, so the two agree.
+ * A database or connection failure under the door can leave the order recorded or not: the sentence the order route
+ * answers it with, as docs/API.md states it, so the two agree.
  */
 export const ORDER_ACCEPTANCE_UNCERTAIN =
-  'A database or connection failure can leave acceptance uncertain. Next: read the order by hash or repost the same signed order; do not sign a new bet merely because an answer failed.';
+  'A database or connection failure means this order may or may not have been recorded. Next: read the order by its hash, or post the same signed order again. Do not sign a new bet because an answer failed.';
 
 /**
  * POST /v1/orders: the door. A database or connection failure under it is 503 with that sentence: the order may have
