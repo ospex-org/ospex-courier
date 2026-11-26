@@ -739,14 +739,12 @@ export function createLane(deps: LaneDeps): Lane {
         if (cross === null || cross.state !== 'handing off') {
           recorded = 'lost';
         } else {
-          const kept = answer.kind === 'refused' ? { kind: 'refused' as const, words: answer.words } : answer.kind === 'taken' ? { kind: 'taken' as const } : { kind: 'unknown' as const };
+          // Taken, or not known: a named error keeps only its fixed words, and neither ends the Cross.
+          const kept: HandOff = answer.kind === 'taken' ? { kind: 'taken' } : answer.words === undefined ? { kind: 'unknown' } : { kind: 'unknown', words: answer.words };
           await writeAnswer(client, bet, kept);
           const facts = { txHash: signed.hash, nonce: signed.fields.nonce.toString(), handOffs: 1, answer: kept };
-          if (answer.kind === 'taken') await line(client, res.bet, 'cross sent', 'TAKEN', facts);
-          else if (answer.kind === 'refused') {
-            await line(client, res.bet, 'cross not sent', 'NODE_REFUSED', { ...facts, kind: answer.words });
-            await freeLaneOfCross(client, key);
-          } else await line(client, res.bet, 'cross unknown', 'NO_ANSWER', facts);
+          if (kept.kind === 'taken') await line(client, res.bet, 'cross sent', 'TAKEN', facts);
+          else await line(client, res.bet, 'cross unknown', 'ANSWER_UNKNOWN', facts);
           recorded = 'written';
         }
       } catch (err) {
@@ -758,7 +756,8 @@ export function createLane(deps: LaneDeps): Lane {
       await client.query('SELECT pg_advisory_unlock_all()');
       destroy = false;
       if (recorded === 'lost') return 'lost';
-      return answer.kind === 'refused' ? 'done' : 'settle';
+      // Whatever the node answered, the Cross is settled from the chain, the lane held until it is final.
+      return 'settle';
     } finally {
       release(destroy);
     }

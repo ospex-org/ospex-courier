@@ -331,9 +331,10 @@ CREATE TABLE IF NOT EXISTS crosses (
   -- For a Cross that was replaced, the transaction that took its nonce; for one that reverted, the reason.
   replaced_by          text CHECK (replaced_by ~ '^0x[0-9a-f]{64}$'),
   revert_reason        text,
-  -- Why a Cross was closed not sent; empty for every other state: a stop found at the gate (STOPPED_AT_GATE); the
-  -- courier restarted, or another of its processes took over, before the gate (COURIER_RESTARTED); the node refused
-  -- the one hand-off by name (NODE_REFUSED).
+  -- Why a Cross was closed not sent; empty for every other state. Two are written, both before the gate: a stop found
+  -- at the gate (STOPPED_AT_GATE); the courier restarted, or another of its processes took over, before the gate
+  -- (COURIER_RESTARTED). The third, NODE_REFUSED, is reserved: allowed here, and never written, since a node's named
+  -- error after the gate is not known.
   not_sent_reason      text,
   -- The check's figures: the final block and the time the candidate statement ran; the estimate, the limit and
   -- each step of the search for a shorter fill; the key's nonce, its POL and its coin, and the relay's coin, at the

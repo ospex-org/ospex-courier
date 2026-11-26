@@ -660,7 +660,7 @@ test("the sender's rules hold, each refusal beside a row that is taken: the tran
   await cross({ state: 'handing off', hand_offs: 1, tx_hash: tx('3') });
   await refused(cross({ state: 'sent', hand_offs: 0, tx_hash: tx('4') }), '23514', 'sent, never handed');
   await cross({ state: 'unknown', hand_offs: 1, tx_hash: tx('5') });
-  await refused(cross({ state: 'not sent', hand_offs: 0, not_sent_reason: 'NODE_REFUSED', tx_hash: tx('6') }), '23514', 'the node refused what was never handed to it');
+  await refused(cross({ state: 'not sent', hand_offs: 0, not_sent_reason: 'NODE_REFUSED', tx_hash: tx('6') }), '23514', 'the reserved NODE_REFUSED value requires one recorded hand-off');
   await cross({ state: 'not sent', hand_offs: 1, not_sent_reason: 'NODE_REFUSED', tx_hash: tx('7') });
   await refused(cross({ state: 'not sent', hand_offs: 1, not_sent_reason: 'STOPPED_AT_GATE', tx_hash: tx('8') }), '23514', 'the gate stopped what it handed on');
   await cross({ state: 'not sent', hand_offs: 0, not_sent_reason: 'STOPPED_AT_GATE', tx_hash: tx('9') });

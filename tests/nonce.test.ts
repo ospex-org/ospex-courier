@@ -36,6 +36,7 @@ function cross(nonce: bigint, state: CrossState, receipt: { number: bigint; hash
     revertReason: null,
     revertEvidence: null,
     revertData: null,
+    // The reserved reason, on a retained row the schema allows: this build never writes it.
     notSentReason: state === 'not sent' ? 'NODE_REFUSED' : null,
     gasUsed: null,
     effectiveGasPrice: null,
@@ -79,7 +80,7 @@ test('the count check: an unexplained nonce. Nonce 3 used at F and nothing the r
   assert.deepEqual([p.kind, p.kind === 'unexplained' ? p.nonce : null], ['unexplained', 3n]);
 });
 
-test('the count check: a not-sent and an expired-unmined row consume no nonce. Nonce 3 held by a Cross the node refused is unexplained; one closed expired unmined is read again by its hash first; with the nonce unused at F, neither stands in the way', () => {
+test('the count check: a not-sent and an expired-unmined row consume no nonce. Nonce 3 held by a retained, schema-valid reserved NODE_REFUSED row is unexplained; one closed expired unmined is read again by its hash first; with the nonce unused at F, neither stands in the way', () => {
   const F = header(110n);
   const refused = [cross(3n, 'not sent', null)];
   const p1 = proveNonce({ F, countAtFinal: 4n, countAtH: 4n, watermark: WM, crosses: refused, onF: shownAll(F, WM, refused) });

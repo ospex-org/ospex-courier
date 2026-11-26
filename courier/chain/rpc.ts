@@ -86,12 +86,14 @@ function withheld(text: string): string {
 }
 
 export interface JsonRpc {
+  /** One request. */
+  request<T = unknown>(method: string, params: unknown[]): Promise<T>;
   /**
-   * One request. `read`, where given, is handed the text of a JSON-RPC error the node answered with, inside the
-   * client, and its answer is the request's answer: so a caller that must tell the node's refusals apart reads them
-   * there, and nothing of the node's text leaves the client but what `read` makes of it.
+   * The one hand-off of a signed transaction (see `handOff`): one eth_sendRawTransaction, made once to this node, with
+   * no retry and no redirect followed, its time-out running through the answer's body. What the node answered is read
+   * inside the client, against this request's own id and the transaction's own hash, and nothing of its text leaves.
    */
-  request<T = unknown>(method: string, params: unknown[], read?: (text: string) => T): Promise<T>;
+  handOff(raw: Hex): Promise<HandOff>;
 }
 
 /**
@@ -102,7 +104,7 @@ export interface JsonRpc {
 export function createJsonRpc(url: string, timeoutMs = 10_000): JsonRpc {
   let id = 0;
   return {
-    async request<T>(method: string, params: unknown[], read?: (text: string) => T): Promise<T> {
+    async request<T>(method: string, params: unknown[]): Promise<T> {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       const aborted = (err: unknown) => controller.signal.aborted || (err as { name?: unknown })?.name === 'AbortError';
@@ -133,8 +135,6 @@ export function createJsonRpc(url: string, timeoutMs = 10_000): JsonRpc {
         if (typeof body !== 'object' || body === null) throw new NodeFailure('malformed', method, null, 'the answer was not an object');
         const { error, result } = body as { error?: { code?: unknown; message?: unknown; data?: unknown }; result?: unknown };
         if (error !== undefined && error !== null) {
-          // A caller that reads the node's refusals itself: the text goes to its reader here, and nowhere else.
-          if (read !== undefined) return read(typeof error.message === 'string' ? error.message : '');
           const code = typeof error.code === 'number' ? error.code : null;
           const message = typeof error.message === 'string' ? withheld(error.message) : '';
           // The EVM's refusal of the call: code 3, with its revert data as whole bytes of hex, kept apart from the text.
@@ -149,6 +149,41 @@ export function createJsonRpc(url: string, timeoutMs = 10_000): JsonRpc {
         }
         if (!('result' in (body as object))) throw new NodeFailure('malformed', method, null, 'the answer had no result');
         return result as T;
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    async handOff(raw) {
+      const expected = keccak256(raw).toLowerCase();
+      const requestId = ++id;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        let response: Response;
+        try {
+          response = await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: requestId, method: 'eth_sendRawTransaction', params: [raw] }),
+            signal: controller.signal,
+            // A redirect is not followed: the one request goes to this node and to no other.
+            redirect: 'manual',
+          });
+        } catch {
+          return { kind: 'unknown' };
+        }
+        if (response.status !== 200) {
+          // A redirect, or any other HTTP answer: the body is not read, and the request is done with.
+          controller.abort();
+          return { kind: 'unknown' };
+        }
+        let text: string;
+        try {
+          text = await response.text();
+        } catch {
+          return { kind: 'unknown' };
+        }
+        return readHandOff(text, requestId, expected);
       } finally {
         clearTimeout(timer);
       }
@@ -361,11 +396,12 @@ export async function maxPriorityFee(rpc: JsonRpc): Promise<bigint> {
 }
 
 /**
- * The refusals of a transaction the node will not take: the texts Bor's pool and RPC give (Bor v2.10.2), found in any
- * letter case anywhere in the node's text, tried in this order, and the words the courier keeps for each. A longer
- * text comes before one it contains.
+ * The node's named errors to a transaction it will not take: the texts Bor's pool and RPC give (Bor v2.10.2), found in
+ * any letter case anywhere in the node's text, tried in this order, and the fixed words the courier keeps for each. A
+ * longer text comes before one it contains. The words are kept for diagnosis only: a named error after the hand-off
+ * does not show that no node took the transaction, and it decides nothing.
  */
-const REFUSALS = [
+const NAMED = [
   ['replacement transaction underpriced', 'replacement transaction underpriced'],
   ['transaction underpriced', 'transaction underpriced'],
   ['transaction gas price below minimum', 'transaction gas price below minimum'],
@@ -387,42 +423,56 @@ const REFUSALS = [
   ['oversized data', 'oversized data'],
 ] as const;
 
-export type NodeRefusal = (typeof REFUSALS)[number][1];
+export type NamedError = (typeof NAMED)[number][1];
 
-/** Every refusal's words, in the order they are tried. */
-export const NODE_REFUSALS: readonly NodeRefusal[] = REFUSALS.map(([, words]) => words);
-
-/** The node's answer to the one hand-off: it took the transaction; it refused it by name; or what it did is not known. */
-export type HandOff = { kind: 'taken' } | { kind: 'refused'; words: NodeRefusal } | { kind: 'unknown' };
+/** Every named error's words, in the order they are tried. */
+export const NAMED_ERRORS: readonly NamedError[] = NAMED.map(([, words]) => words);
 
 /**
- * A JSON-RPC error's text, read inside the client: "already known" is the node holding this very transaction, so it
- * was taken; one of the refusals is that refusal's words; anything else is not known. Only the list's words come out.
+ * The node's answer to the one hand-off: taken, bound to this request; or not known, with the list's fixed words where
+ * the node's error named one. A named error is not known too: the words say which error the node gave, and nothing
+ * more.
  */
-function readHandOff(text: string): HandOff {
-  const t = text.toLowerCase();
-  if (t.includes('already known')) return { kind: 'taken' };
-  const found = REFUSALS.find(([match]) => t.includes(match));
-  return found === undefined ? { kind: 'unknown' } : { kind: 'refused', words: found[1] };
-}
+export type HandOff = { kind: 'taken' } | { kind: 'unknown'; words?: NamedError };
 
 /**
- * The hand-off: one eth_sendRawTransaction of the signed bytes, one request with no retry, its time-out running
- * through the answer's body. Taken when the node answers with this transaction's own hash, or says it already holds
- * it; refused only by one of the named refusals, read inside the client; anything else (a time-out, a failure of the
- * connection, an HTTP failure, a text not on the list, an answer that is not this hash) is not known. It never
- * throws for the node, and nothing of the node's text leaves it.
+ * The node's answer to this request, read inside the client: this request's own answer only, JSON-RPC 2.0 with its id,
+ * and a result or an error, never both. Taken where the result is this transaction's own hash, or where the error's
+ * whole message, in any letter case and with the space around it, is "already known". Every other answer is not known,
+ * with the list's fixed words where the error names one. Only those words come out.
  */
-export async function handOff(rpc: JsonRpc, raw: Hex): Promise<HandOff> {
-  const hash = keccak256(raw).toLowerCase();
-  let answer: unknown;
+function readHandOff(text: string, requestId: number, expected: string): HandOff {
+  let body: unknown;
   try {
-    answer = await rpc.request<unknown>('eth_sendRawTransaction', [raw], readHandOff);
+    body = JSON.parse(text);
   } catch {
     return { kind: 'unknown' };
   }
-  if (typeof answer === 'object' && answer !== null && 'kind' in answer) return answer as HandOff;
-  return typeof answer === 'string' && answer.toLowerCase() === hash ? { kind: 'taken' } : { kind: 'unknown' };
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return { kind: 'unknown' };
+  const envelope = body as Record<string, unknown>;
+  if (envelope.jsonrpc !== '2.0' || envelope.id !== requestId) return { kind: 'unknown' };
+  const hasResult = 'result' in envelope;
+  const hasError = envelope.error !== undefined && envelope.error !== null;
+  if (hasResult === hasError) return { kind: 'unknown' };
+  if (hasResult) return typeof envelope.result === 'string' && envelope.result.toLowerCase() === expected ? { kind: 'taken' } : { kind: 'unknown' };
+  const error = envelope.error;
+  const message = typeof error === 'object' && error !== null && typeof (error as { message?: unknown }).message === 'string' ? (error as { message: string }).message : '';
+  if (message.trim().toLowerCase() === 'already known') return { kind: 'taken' };
+  const lower = message.toLowerCase();
+  const found = NAMED.find(([match]) => lower.includes(match));
+  return found === undefined ? { kind: 'unknown' } : { kind: 'unknown', words: found[1] };
+}
+
+/**
+ * The hand-off: one eth_sendRawTransaction of the signed bytes, made once, with no retry and no redirect followed, its
+ * time-out running through the answer's body. Taken only where the node's answer to this request is this
+ * transaction's own hash, or an error whose whole message is "already known"; every other answer is not known: a
+ * time-out, a failure of the connection, an HTTP failure or a redirect, an answer that is not this request's, and a
+ * named error, which keeps only the list's words. It never throws for the node, and nothing of the node's text leaves
+ * it.
+ */
+export async function handOff(rpc: JsonRpc, raw: Hex): Promise<HandOff> {
+  return rpc.handOff(raw);
 }
 
 /** One log of a receipt, as the node gives it, every field checked. */

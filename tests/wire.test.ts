@@ -5,7 +5,7 @@ import pg from 'pg';
 import type { Hex } from 'viem';
 import { VERDICT } from '../courier/check/sentences';
 import { ORDER_ACCEPTANCE_UNCERTAIN } from '../courier/http/routes';
-import { crossMessage, NEXT, REASON, SENTENCE, wireState, type BetTerms, type LegForRecord } from '../courier/orders/wire';
+import { crossFields, crossMessage, NEXT, REASON, SENTENCE, wireState, type BetTerms, type LegForRecord } from '../courier/orders/wire';
 import type { CrossRow, CrossState } from '../courier/records/crosses';
 import { openPool } from '../courier/records/store';
 import { get } from './support/courier';
@@ -41,7 +41,6 @@ const TEMPLATES: Record<string, string> = {
   REPLACED: SENTENCE.REPLACED('{txHash}', '{replacedBy}', '{n}'),
   STOPPED_AT_GATE: SENTENCE.STOPPED_AT_GATE,
   COURIER_RESTARTED: SENTENCE.COURIER_RESTARTED,
-  NODE_REFUSED: SENTENCE.NODE_REFUSED('{kind}'),
   NOTHING_FILLED: SENTENCE.NOTHING_FILLED('{n}'),
   PART_FILLED: SENTENCE.PART_FILLED('{betFilled}', '{stake}', '{n}'),
   FULL_FILLED: SENTENCE.FULL_FILLED('{stake}', '{n}'),
@@ -208,7 +207,7 @@ test('the two pull branches: the bettor\'s own act shown by the coin\'s frame na
   assert.ok(unknown.includes(REASON.PULL_UNKNOWN('9.984')), unknown);
 });
 
-test('the other states: sending, unknown, sent and pending wait with N1; the three not-sent reasons with N2; a revert with no trace and one past the expiry; a restored attempt is uncertain, never one now being signed', () => {
+test('the other states: sending keeps its read-again step; unknown, sent and pending wait with N1; the two produced not-sent reasons use N2; a named hand-off error is unknown with N1; a revert with no trace and one past the expiry; a restored attempt is uncertain, never one now being signed', () => {
   assert.equal(messageOf(row('signed'), TERMS, LEGS, false), SENTENCE.SENDING('90'));
   assert.deepEqual(wireState(row('signed'), false), { state: 'queued', turn: 'sending' });
   assert.deepEqual(wireState(row('handing off'), false), { state: 'unknown' });
@@ -220,13 +219,17 @@ test('the other states: sending, unknown, sent and pending wait with N1; the thr
   assert.equal(messageOf(row('intent', { txHash: null }), TERMS, LEGS, true), SENTENCE.RESTORED('1000'));
   assert.equal(messageOf(row('not sent', { notSentReason: 'STOPPED_AT_GATE' }), TERMS, LEGS, false), SENTENCE.STOPPED_AT_GATE);
   assert.equal(messageOf(row('not sent', { notSentReason: 'COURIER_RESTARTED' }), TERMS, LEGS, false), SENTENCE.COURIER_RESTARTED);
-  assert.equal(messageOf(row('not sent', { notSentReason: 'NODE_REFUSED', nodeAnswer: { kind: 'refused', words: 'nonce too low' } }), TERMS, LEGS, false), SENTENCE.NODE_REFUSED('nonce too low'));
+  // A named error from the node: not known, its words kept on the answer, and no reason.
+  const named = row('unknown', { notSentReason: null, nodeAnswer: { kind: 'unknown', words: 'nonce too low' } });
+  assert.equal(messageOf(named, TERMS, LEGS, false), SENTENCE.UNKNOWN(h(2), '1000'));
+  assert.deepEqual(wireState(named, false), { state: 'unknown' });
+  assert.equal('reason' in crossFields(named, LEGS, false), false, 'no reason on a named error: the property is absent');
   const unavailable = messageOf(row('reverted', { revertReason: 'unavailable', revertEvidence: 'unavailable', recorded: at(EXPIRY - 1n, 0n, { reason: { reason: 'unavailable', evidence: 'unavailable' } }) }), TERMS, LEGS, false);
   assert.equal(unavailable, `${SENTENCE.REVERTED_UNAVAILABLE(h(2), '95')} ${expectedLine(0n, EXPIRY - 1n)}`);
   const late = messageOf(row('reverted', { revertReason: 'TakingOrderExpired', revertEvidence: 'trace', recorded: at(EXPIRY + 2n, 0n, { reason: { reason: 'TakingOrderExpired', expired: { expiry: '1000', blockTime: '1001' } } }) }), TERMS, LEGS, false);
   assert.equal(late, `${SENTENCE.REVERTED_EXPIRY(h(2), '95', '1001', '1000')} ${SENTENCE.CHAIN_REASON(REASON.EXPIRED)} ${expectedLine(0n, EXPIRY + 2n)}`);
   for (const t of [SENTENCE.UNKNOWN(h(2), '1000'), SENTENCE.SENT(h(2), 't', '1000'), SENTENCE.PENDING(h(2), '95', '1000')]) assert.ok(t.endsWith(NEXT.N1('1000')));
-  for (const t of [SENTENCE.STOPPED_AT_GATE, SENTENCE.COURIER_RESTARTED, SENTENCE.NODE_REFUSED('x')]) assert.ok(t.endsWith(NEXT.N2));
+  for (const t of [SENTENCE.STOPPED_AT_GATE, SENTENCE.COURIER_RESTARTED]) assert.ok(t.endsWith(NEXT.N2));
 });
 
 test("the wallet's form of COURIER_CANNOT_SEND takes N7, and it is told from the relay's sender form by its fields, not its sentence", () => {

@@ -46,7 +46,6 @@ export const SENTENCE = {
   REPLACED: (txHash: string, replacedBy: string, n: string) => `Transaction ${txHash} can never be mined: transaction ${replacedBy}, which took its place in the courier's line, is in final block ${n}.`,
   STOPPED_AT_GATE: `A stop for a quote listed for this bet was recorded before the courier handed the fill to the chain, so this courier sent nothing for it. ${NEXT.N2}`,
   COURIER_RESTARTED: `This attempt ended before the courier handed this bet's fill to the chain, so this courier sent nothing for it. ${NEXT.N2}`,
-  NODE_REFUSED: (kind: string) => `The courier handed this bet's fill to the chain once, and the node refused it: ${kind}. It was not handed again, and this courier filled nothing of it. ${NEXT.N2}`,
   // The bet's line.
   NOTHING_FILLED: (n: string) => `Nothing of this bet has filled on the chain as of final block ${n}.`,
   PART_FILLED: (betFilled: string, stake: string, n: string) => `The chain shows ${betFilled} USDC of this bet's ${stake} USDC filled in total as of final block ${n}.`,
@@ -235,8 +234,8 @@ export function crossMessage(c: CrossRow, terms: BetTerms, legs: readonly LegFor
     case 'not sent': {
       if (c.notSentReason === 'STOPPED_AT_GATE') return SENTENCE.STOPPED_AT_GATE;
       if (c.notSentReason === 'COURIER_RESTARTED') return SENTENCE.COURIER_RESTARTED;
-      const answer = (c.nodeAnswer ?? {}) as { words?: string };
-      return SENTENCE.NODE_REFUSED(answer.words ?? 'a refusal the courier names');
+      // The reserved reason, which this build never writes: a hand-off with no proven end, read as not known.
+      return SENTENCE.UNKNOWN(tx, expiry);
     }
   }
 }

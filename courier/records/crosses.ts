@@ -43,6 +43,12 @@ export interface CrossRow {
 }
 
 export type CrossState = 'intent' | 'signed' | 'handing off' | 'sent' | 'pending' | 'confirmed' | 'reverted' | 'unknown' | 'not sent' | 'expired unmined' | 'replaced';
+/**
+ * Why a Cross was closed not sent. This build writes two, both before the gate: a stop found at the gate
+ * (STOPPED_AT_GATE), and the courier restarted, or another of its processes took over, before the gate
+ * (COURIER_RESTARTED). NODE_REFUSED is reserved: the schema allows it, and this build never writes it, since a node's
+ * named error after the gate is not known.
+ */
 export type NotSentReason = 'STOPPED_AT_GATE' | 'COURIER_RESTARTED' | 'NODE_REFUSED';
 
 /** The states that are final: a Cross in one of them holds its lane no longer. */
@@ -152,13 +158,16 @@ export async function closeBeforeGate(on: Client, betHash: Hex, reason: 'STOPPED
   return (rowCount ?? 0) === 1;
 }
 
-/** The node's answer to the one hand-off, from handing off only: sent, not sent by the node's named refusal, or unknown. */
-export async function writeAnswer(on: Client, betHash: Hex, answer: { kind: 'taken' } | { kind: 'refused'; words: string } | { kind: 'unknown' }): Promise<boolean> {
-  const state = answer.kind === 'taken' ? 'sent' : answer.kind === 'refused' ? 'not sent' : 'unknown';
+/**
+ * The node's answer to the one hand-off, from handing off only: sent where it was taken, and unknown for every other
+ * answer, a named error with its fixed words among them. Neither ends the Cross: no not-sent reason and no outcome's
+ * time, and the lane, the reservation, the transaction and the hand-off stay as they are, for the settling.
+ */
+export async function writeAnswer(on: Client, betHash: Hex, answer: { kind: 'taken' } | { kind: 'unknown'; words?: string }): Promise<boolean> {
   const { rowCount } = await on.query(
-    `UPDATE crosses SET state = $2, not_sent_reason = $3, node_answer = $4, answered_at = now(), outcome_at = CASE WHEN $2 = 'not sent' THEN now() ELSE outcome_at END, updated_at = now()
+    `UPDATE crosses SET state = $2, node_answer = $3, answered_at = now(), updated_at = now()
      WHERE bet_hash = $1 AND state = 'handing off'`,
-    [betHash.toLowerCase(), state, answer.kind === 'refused' ? 'NODE_REFUSED' : null, JSON.stringify(answer)],
+    [betHash.toLowerCase(), answer.kind === 'taken' ? 'sent' : 'unknown', JSON.stringify(answer)],
   );
   return (rowCount ?? 0) === 1;
 }
