@@ -1,4 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { afterEach } from 'node:test';
+import pg from 'pg';
 import { isAddress, type Hex } from 'viem';
 import type { HoldPoint } from '../../courier/check/hooks';
 import { testKeystoreFor } from './keystore';
@@ -104,13 +106,18 @@ export async function startHookedCourier(env: CourierEnv, holds = ''): Promise<C
 }
 
 async function launch(entry: string, env: CourierEnv & { COURIER_TEST_HOLDS?: string }, ipc: boolean): Promise<CourierProcess> {
+  // The key's two settings are set here, for this child alone: never from this machine's environment.
+  const childEnv: Record<string, string | undefined> = { PATH: process.env.PATH, SYSTEMROOT: process.env.SYSTEMROOT, PORT: '0', ...keystoreSettings(env), ...env };
   const child = spawn(process.execPath, ['--import', 'tsx', entry], {
     cwd: ROOT,
-    // The key's two settings are set here, for this child alone: never from this machine's environment.
-    env: { PATH: process.env.PATH, SYSTEMROOT: process.env.SYSTEMROOT, PORT: '0', ...keystoreSettings(env), ...env },
+    env: childEnv,
     stdio: ipc ? ['ignore', 'pipe', 'pipe', 'ipc'] : ['ignore', 'pipe', 'pipe'],
   });
   const lines: string[] = [];
+  // When each line arrived, for the print of a failed case alone: the lines themselves are what the tests read.
+  const times: number[] = [];
+  const record: Started = { number: started.length + 1, entry, child, lines, times, url: null, databaseUrl: childEnv.DATABASE_URL, from: 0, withheld: withheldOf(childEnv) };
+  started.push(record);
   const hooks = ipc ? control(child, () => lines) : null;
   // The courier never outlives the test process; the listener leaves with the child, so a file that starts many
   // couriers does not pile listeners on the process.
@@ -124,7 +131,9 @@ async function launch(entry: string, env: CourierEnv & { COURIER_TEST_HOLDS?: st
     buffer += chunk.toString('utf8');
     const parts = buffer.split(/\r?\n/);
     buffer = parts.pop() ?? '';
-    lines.push(...parts.filter((l) => l !== ''));
+    const kept = parts.filter((l) => l !== '');
+    lines.push(...kept);
+    for (let i = 0; i < kept.length; i += 1) times.push(Date.now());
   };
   child.stdout?.on('data', onData);
   child.stderr?.on('data', onData);
@@ -142,6 +151,7 @@ async function launch(entry: string, env: CourierEnv & { COURIER_TEST_HOLDS?: st
     exited.then(() => reject(new CourierDidNotStart(lines.find((l) => l.startsWith('courier did not start:')) ?? `the process exited with ${child.exitCode}`, lines)));
     setTimeout(() => reject(new Error(`the courier did not listen within 60 seconds; its lines: ${lines.join(' | ')}`)), 60_000).unref();
   });
+  record.url = `http://127.0.0.1:${port}`;
 
   return {
     port,
@@ -160,6 +170,179 @@ async function launch(entry: string, env: CourierEnv & { COURIER_TEST_HOLDS?: st
     },
     ...(hooks === null ? {} : { hooks }),
   };
+}
+
+// A failed case prints its couriers. For each courier this test process started: the lines it wrote since the case
+// before this one ended (the first case gets its start's lines), each with the time it arrived; and, while it still
+// runs, what its status address says of its node check and its lane: the parts of the check that did not pass,
+// whether the lane takes bets, and the line that shut it, read whole from the courier's database. So a post answered
+// 503 NODE_UNUSABLE or NOT_TAKING_BETS where the case expected otherwise says why. All of it is read after the case
+// has failed, never during a case: no case's requests, waits or expected values change, and a case that passes prints
+// nothing. The print fails no case.
+
+interface Started {
+  number: number;
+  entry: string;
+  child: ChildProcess;
+  lines: string[];
+  times: number[];
+  /** Its address, once it listens. */
+  url: string | null;
+  /** The database it was given, where the line that shut its lane is read. */
+  databaseUrl: string | undefined;
+  /** How many of its lines there were when the last case ended. */
+  from: number;
+  /** The values it was handed that a print never carries, each with the name printed in its place. */
+  withheld: Array<[string, string]>;
+}
+
+const started: Started[] = [];
+
+/** Of one courier's lines in one case, at most the first so many and the last so many are printed. */
+const PRINT_FIRST = 40;
+const PRINT_LAST = 160;
+/** A longer line is cut, saying so. */
+const PRINT_WIDTH = 2_000;
+
+/** What the print reads of a case's context: whether the case passed (Node 22's TestContext.passed), and its diagnostic. */
+interface CaseContext {
+  passed?: unknown;
+  diagnostic?: (message: string) => void;
+}
+
+afterEach(async (context) => {
+  const t = context as unknown as CaseContext;
+  const ends = started.map((s) => s.lines.length);
+  try {
+    if (t.passed === false) {
+      for (const s of started) await printCourier((m) => t.diagnostic?.(m), s);
+    }
+  } catch (err) {
+    try {
+      t.diagnostic?.(`the couriers' print failed (${err instanceof Error ? err.name : typeof err}); the case's own failure stands`);
+    } catch {
+      // Nothing more is said.
+    }
+  } finally {
+    started.forEach((s, i) => {
+      s.from = ends[i] ?? s.lines.length;
+    });
+  }
+});
+
+/** One courier's print for a failed case: its lines since the case before ended, and its status while it runs. */
+async function printCourier(say: (message: string) => void, s: Started): Promise<void> {
+  const running = s.child.exitCode === null && s.child.signalCode === null;
+  const from = s.from <= s.lines.length ? s.from : 0;
+  const end = s.lines.length;
+  if (end === from && !running) return;
+  const state = running ? 'running' : `exited (${s.child.signalCode ?? s.child.exitCode})`;
+  say(`the courier ${s.number} (${s.entry}, process ${s.child.pid ?? 'without an id'}, ${state}): ${end - from} line${end - from === 1 ? '' : 's'} since the case before this one ended`);
+  const cut = end - from > PRINT_FIRST + PRINT_LAST;
+  const headEnd = cut ? from + PRINT_FIRST : end;
+  const tailStart = cut ? end - PRINT_LAST : end;
+  const show = (i: number) => say(`  ${clock(s.times[i])} ${printable(s.lines[i] ?? '', s.withheld)}`);
+  for (let i = from; i < headEnd; i += 1) show(i);
+  if (cut) say(`  … ${tailStart - headEnd} lines left out …`);
+  for (let i = tailStart; i < end; i += 1) show(i);
+  if (running && s.url !== null) {
+    const status = await statusOf(s.url);
+    say(`the courier ${s.number}'s status: ${printable(status.text, s.withheld)}`);
+    if (status.shutLines.length > 0) say(`the courier ${s.number}'s lane shut by: ${printable(await linesOf(s.databaseUrl, status.shutLines), s.withheld)}`);
+  }
+}
+
+/** The time a line arrived, UTC, to the millisecond. */
+function clock(ms: number | undefined): string {
+  return ms === undefined ? '--:--:--.---' : new Date(ms).toISOString().slice(11, 23);
+}
+
+/** A courier's key settings, as the print withholds them: only values long enough not to be found by chance. */
+function withheldOf(env: Record<string, string | undefined>): Array<[string, string]> {
+  const named: Array<[string, string | undefined]> = [
+    ['the keystore', env.COURIER_KEYSTORE_JSON],
+    ['the keystore password', env.COURIER_KEYSTORE_PASSWORD],
+  ];
+  return named.filter((n): n is [string, string] => typeof n[1] === 'string' && n[1].length >= 8);
+}
+
+/**
+ * A line as printed. CI's log is public: a value the courier was handed for its key never goes into it, nor a URL's
+ * user and password, though no line of the courier's is known to carry either.
+ */
+function printable(line: string, withheld: Array<[string, string]>): string {
+  let out = line;
+  for (const [name, value] of withheld) out = out.split(value).join(`<${name}>`);
+  out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, '$1<user and password>@');
+  return out.length > PRINT_WIDTH ? `${out.slice(0, PRINT_WIDTH)} … (${out.length - PRINT_WIDTH} characters cut)` : out;
+}
+
+/** What the print reads of the status: the node check, and the lane. */
+interface StatusRead {
+  node?: (Record<string, unknown> & { verdicts?: unknown }) | null;
+  sender?: { lane?: unknown; lanes?: unknown; restoreHold?: unknown };
+}
+
+/**
+ * The status address, read once with a wait of 5 seconds: the node check's parts that did not pass, and the lane; and
+ * the numbers of the lines that shut a lane, or the database, where any did.
+ */
+async function statusOf(url: string): Promise<{ text: string; shutLines: number[] }> {
+  let answered: number | null = null;
+  try {
+    const res = await fetch(`${url}/v1/status`, { signal: AbortSignal.timeout(5_000) });
+    answered = res.status;
+    const text = await res.text();
+    let body: StatusRead;
+    try {
+      body = JSON.parse(text) as StatusRead;
+    } catch {
+      return { text: `answered ${answered}, not as JSON: ${text.slice(0, 300)}`, shutLines: [] };
+    }
+    const lineOf = (v: unknown): number | null => {
+      const line = typeof v === 'object' && v !== null ? (v as { line?: unknown }).line : undefined;
+      return typeof line === 'number' && Number.isSafeInteger(line) ? line : null;
+    };
+    const lanesRead = body.sender?.lanes;
+    const lanes = Array.isArray(lanesRead) ? (lanesRead as unknown[]) : [];
+    const shutLines = [...new Set([...lanes.map((l) => lineOf(typeof l === 'object' && l !== null ? (l as { shut?: unknown }).shut : null)), lineOf(body.sender?.restoreHold)])].filter((n): n is number => n !== null);
+    const node = body.node ?? null;
+    const notOk = (v: unknown): boolean => typeof v === 'object' && v !== null && (v as { ok?: unknown }).ok === false;
+    const nodeCheck =
+      node === null
+        ? null
+        : {
+            usable: node.usable,
+            checkedAt: node.checkedAt,
+            latest: node.latest,
+            back: node.back,
+            failing: {
+              ...Object.fromEntries(Object.entries(node).filter(([, v]) => notOk(v))),
+              verdicts: (Array.isArray(node.verdicts) ? (node.verdicts as unknown[]) : []).filter((v) => typeof v === 'object' && v !== null && Object.values(v as Record<string, unknown>).some(notOk)),
+            },
+          };
+    return { text: JSON.stringify({ answered, nodeCheck, lane: body.sender?.lane ?? null, lanes: body.sender?.lanes ?? null, restoreHold: body.sender?.restoreHold ?? null }), shutLines };
+  } catch (err) {
+    return { text: `not read${answered === null ? '' : ` (answered ${answered})`}: ${err instanceof Error ? err.name : typeof err}`, shutLines: [] };
+  }
+}
+
+/** The lines of these numbers, read whole from the courier's database with a wait of 5 seconds: when, what, why, and their facts. */
+async function linesOf(databaseUrl: string | undefined, numbers: number[]): Promise<string> {
+  if (databaseUrl === undefined) return 'not read: the courier was given no database';
+  const client = new pg.Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000, query_timeout: 5_000 });
+  try {
+    await client.connect();
+    const { rows } = await client.query<{ number: string; at: Date; kind: string; reason: string | null; facts: unknown }>(
+      'SELECT number::text AS number, at, kind, reason, facts FROM events WHERE number = ANY($1::bigint[]) ORDER BY number',
+      [numbers],
+    );
+    return JSON.stringify(rows.map((r) => ({ line: Number(r.number), at: r.at.toISOString(), kind: r.kind, reason: r.reason, facts: r.facts })));
+  } catch (err) {
+    return `not read: ${err instanceof Error ? err.name : typeof err}`;
+  } finally {
+    await client.end().catch(() => undefined);
+  }
 }
 
 /** The test's end of the hooks' channel. */
