@@ -6,7 +6,7 @@ import { encodeFunctionData, keccak256, type Abi, type Hex } from 'viem';
 import type { HDAccount } from 'viem/accounts';
 import pg from 'pg';
 import { get as getFrom, type HookControl } from './support/courier';
-import { orderOn, postOrder as postOrderFrom, type Order } from './support/orders';
+import { crossFromTheTest, orderOn, postOrder as postOrderFrom, sign, type Order } from './support/orders';
 import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
 import { outcomes, postStop as postStopFrom, resultsOf, stopMessage } from './support/stops';
@@ -272,6 +272,43 @@ test("the pause's carries: the reserved code is on the page and issued by no pat
     await hooks().go(held);
   }
   await final(first.hash);
+});
+
+test("the full total, filled by another courier: the bet filled in full on the chain, through the rig's other relay, while ours is kept from the chain; then ours let through: it reverts TakingOrderFilled, and the record says the chain shows the bet filled in full, with no next step", async () => {
+  // A game of its own, so the bet lists this quote and no other case's.
+  const gameId = await stack.rig.createGame({ startWritten: true });
+  await postQuote(await fresh(), { gameId });
+  const B = await fresh();
+  const M2 = await fresh();
+  const T = await stack.rig.time();
+  const bet: Order = { ...orderOn(stack.rig, B, { expiry: T + 30n, oddsTick: 196, riskAmount: 10_000n, gameId }), positionType: 1 };
+  const kept = stack.proxy.withhold();
+  let hash = '';
+  try {
+    const taken = await postOrder(url(), stack.rig, B, 'take', bet);
+    assert.equal(taken.status, 202, JSON.stringify(taken.body));
+    hash = taken.body.orderHash as string;
+    await until(() => crossOf(hash), (c) => c?.state === 'sent', 30_000, 'our Cross sent, and kept from the chain');
+    // Another courier fills the bet in full, with a quote of its own the courier never saw: 10,000 at tick 200 covers
+    // the bet's 10,000 exactly.
+    const other: Order = { ...orderOn(stack.rig, M2, { expiry: T + 600n, oddsTick: 200, riskAmount: 10_000n, minFill: 0n, gameId }), positionType: 0 };
+    const filled = await crossFromTheTest(stack.rig, { order: bet, signature: await sign(B, bet, 31337, stack.rig.addresses.matching) }, [{ order: other, signature: await sign(M2, other, 31337, stack.rig.addresses.matching) }]);
+    assert.equal(filled.filled, true, JSON.stringify(filled));
+    assert.equal(await stack.rig.read<bigint>(stack.rig.addresses.matching, stack.rig.abis.OspexMatching as Abi, 's_filledRisk', [hash]), 10_000n, 'the bet filled in full by the other courier');
+    // Ours let through, alone, before the bet's expiry.
+    await stack.rig.rpc('eth_sendRawTransaction', [kept.kept[0]]);
+  } finally {
+    kept.stop();
+  }
+  const row = await final(hash);
+  assert.equal(row?.state, 'reverted', JSON.stringify(row));
+  const record = await get(`/v1/orders/${hash}`);
+  assert.equal(record.status, 200);
+  const cross = record.body.cross as { state: string; reason: string | null; message: string };
+  assert.deepEqual([cross.state, cross.reason], ['reverted', 'TakingOrderFilled'], JSON.stringify(record.body));
+  assert.match(cross.message, /this bet had already filled on the chain/, cross.message);
+  assert.match(cross.message, /The chain shows this bet's 0\.01 USDC filled in full as of final block \d+\.$/, cross.message);
+  assert.doesNotMatch(cross.message, /Next:/, 'a bet filled in full has no next step');
 });
 
 test("the bettor's record of not sent's third reason: the node refuses the one hand-off by name, and the record reads not sent NODE_REFUSED with the refusal's words, handed once and never again, and nothing of the bet filled; the next bet is sent and fills the same quote", async () => {
