@@ -277,3 +277,44 @@ test("no form of the key, the password or the keystore is in anything the signer
     assert.ok(!all.includes(needle), 'a form of the key, the password or the keystore came out');
   }
 });
+
+test("signing does not reach the settings the signer was opened with: opened from settings behind a revocable proxy, revoked as soon as the signer is returned, it signs a sealed Cross, and refuses the sends it refuses, each for its own reason", async () => {
+  const held = { epoch: 3n, reservation: 41n };
+  const marks = new WeakSet<object>();
+  const signed: Hex[] = [];
+  const { proxy, revoke } = Proxy.revocable(base({ isSealed: (x: unknown): x is SealedSend => typeof x === 'object' && x !== null && marks.has(x), laneNow: () => held, seams: { signed: (raw) => signed.push(raw) } }), {});
+  const signer = openSigner(proxy);
+  // From here any read of the settings throws: a signer that still reaches them fails at that read.
+  revoke();
+  const out = await signer.signCross(sendOf(marks, held));
+  assert.equal(signed.length, 1);
+  assert.equal(await recoverTransactionAddress({ serializedTransaction: out.raw as never }), ADDRESS);
+  assert.equal(out.fields.chainId, CHAIN);
+  await refusedBy(signer.signCross(structuredClone(sendOf(marks, held))), /not a send the pre-check sealed/);
+  await refusedBy(signer.signCross(sendOf(marks, { epoch: 2n, reservation: 41n })), /epoch and reservation/);
+  await refusedBy(signer.signCross(sendOf(marks, held, { takingHash: `0x${'ee'.repeat(32)}` })), /no longer hashes/);
+  await refusedBy(signer.signCross(sendOf(marks, held, { calldata: '0x84075346' })), /calldata/);
+  assert.equal(signed.length, 1, 'nothing more was signed');
+});
+
+test('a forced collection, once the signer is returned: a weak reference to the settings it was opened with is cleared while the signer is held, and the signer still signs', async () => {
+  const v8 = await import('node:v8');
+  const vm = await import('node:vm');
+  v8.setFlagsFromString('--expose_gc');
+  const gc = vm.runInNewContext('gc') as () => void;
+  const held = { epoch: 1n, reservation: 2n };
+  const marks = new WeakSet<object>();
+  // The settings made and dropped inside this function: the test keeps only the signer and a weak reference.
+  const { signer, settings } = (() => {
+    const deps = base({ isSealed: (x: unknown): x is SealedSend => typeof x === 'object' && x !== null && marks.has(x), laneNow: () => held });
+    return { signer: openSigner(deps), settings: new WeakRef(deps) };
+  })();
+  // A turn apart before each collection, so that nothing this turn made keeps the settings alive.
+  await new Promise((r) => setImmediate(r));
+  gc();
+  await new Promise((r) => setImmediate(r));
+  gc();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(settings.deref(), undefined, 'the settings were collected');
+  await signer.signCross(sendOf(marks, held));
+});

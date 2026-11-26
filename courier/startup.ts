@@ -31,28 +31,30 @@ export class StartupRefused extends Error {
 
 /**
  * The key's two settings and the keystore opened: the signer, or a refusal that names the settings and no value. The
- * two settings are removed from `env` once the keystore is open, so nothing later in the process can read them.
+ * two settings are removed from `env` whatever the opening comes to, a refusal of either setting included, so nothing
+ * later in the process can read them.
  */
 function openKey(
   env: Record<string, string | undefined>,
   at: { address: Address; relay: Address; matching: Address; chainId: bigint; laneNow: () => { epoch: bigint; reservation: bigint } | null; hooks: LaneHooks | undefined },
 ): Signer {
-  const json = (env.COURIER_KEYSTORE_JSON ?? '').trim();
-  const password = env.COURIER_KEYSTORE_PASSWORD ?? '';
-  const missing = [...(json === '' ? ['COURIER_KEYSTORE_JSON is not set'] : []), ...(password === '' ? ['COURIER_KEYSTORE_PASSWORD is not set'] : [])];
-  if (missing.length > 0) throw new StartupRefused(`settings: ${missing.join('; ')}`);
-  let signer: Signer;
   try {
-    signer = openSigner({ keystoreJson: json, keystorePassword: password, address: at.address, relay: at.relay, matching: at.matching, chainId: at.chainId, isSealed: isSealedSend, laneNow: at.laneNow, ...(at.hooks?.signer === undefined ? {} : { seams: at.hooks.signer }) });
-  } catch (err) {
-    if (!(err instanceof KeystoreRefused)) throw new StartupRefused('the key: COURIER_KEYSTORE_JSON could not be opened');
-    if (err.problem === 'wrong-password') throw new StartupRefused("the key: COURIER_KEYSTORE_PASSWORD does not open COURIER_KEYSTORE_JSON (the keystore's MAC does not match)");
-    if (err.problem === 'not-the-address') throw new StartupRefused('the key: COURIER_KEYSTORE_JSON holds a key whose address is not COURIER_ADDRESS');
-    throw new StartupRefused(`the key: COURIER_KEYSTORE_JSON could not be read as a keystore (${err.message.replace(/^keystore: /, '')})`);
+    const json = (env.COURIER_KEYSTORE_JSON ?? '').trim();
+    const password = env.COURIER_KEYSTORE_PASSWORD ?? '';
+    const missing = [...(json === '' ? ['COURIER_KEYSTORE_JSON is not set'] : []), ...(password === '' ? ['COURIER_KEYSTORE_PASSWORD is not set'] : [])];
+    if (missing.length > 0) throw new StartupRefused(`settings: ${missing.join('; ')}`);
+    try {
+      return openSigner({ keystoreJson: json, keystorePassword: password, address: at.address, relay: at.relay, matching: at.matching, chainId: at.chainId, isSealed: isSealedSend, laneNow: at.laneNow, ...(at.hooks?.signer === undefined ? {} : { seams: at.hooks.signer }) });
+    } catch (err) {
+      if (!(err instanceof KeystoreRefused)) throw new StartupRefused('the key: COURIER_KEYSTORE_JSON could not be opened');
+      if (err.problem === 'wrong-password') throw new StartupRefused("the key: COURIER_KEYSTORE_PASSWORD does not open COURIER_KEYSTORE_JSON (the keystore's MAC does not match)");
+      if (err.problem === 'not-the-address') throw new StartupRefused('the key: COURIER_KEYSTORE_JSON holds a key whose address is not COURIER_ADDRESS');
+      throw new StartupRefused(`the key: COURIER_KEYSTORE_JSON could not be read as a keystore (${err.message.replace(/^keystore: /, '')})`);
+    }
+  } finally {
+    delete env.COURIER_KEYSTORE_JSON;
+    delete env.COURIER_KEYSTORE_PASSWORD;
   }
-  delete env.COURIER_KEYSTORE_JSON;
-  delete env.COURIER_KEYSTORE_PASSWORD;
-  return signer;
 }
 
 /** What this build does not yet do, published on the status address. */

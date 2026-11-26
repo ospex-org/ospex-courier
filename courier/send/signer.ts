@@ -172,21 +172,29 @@ export interface Signer {
 /** Opens the keystore and returns the signer, whose one signing entry is signCross. Throws KeystoreRefused. */
 export function openSigner(deps: SignerDeps): Signer {
   const account = openAccount(deps.keystoreJson, deps.keystorePassword, deps.address);
+  // What signing needs, taken now, and nothing else: the settings themselves, the keystore and its password among
+  // them, are not kept, so that only the account outlives the opening.
   const seams = deps.seams ?? {};
   const relay = getAddress(deps.relay);
-  const chainId = Number(deps.chainId);
+  const matching = deps.matching;
+  /** The set's chain, as the orders' domain and the signed fields name it. */
+  const setChain = deps.chainId;
+  /** The same chain as the envelope numbers it. */
+  const chainId = Number(setChain);
+  const isSealed = deps.isSealed;
+  const laneNow = deps.laneNow;
   return {
     address: account.address,
     async signCross(given) {
       const checked = seams.handed === undefined ? given : (seams.handed(given) as SealedSend);
       // 1. The mark: an object the pre-check sealed, in this process, and nothing shaped like one.
-      if (!deps.isSealed(checked)) throw new SignatureRefused('the object is not a send the pre-check sealed');
+      if (!isSealed(checked)) throw new SignatureRefused('the object is not a send the pre-check sealed');
       // 2. The lane now: the epoch and the reservation the snapshot was made under.
-      const now = deps.laneNow();
+      const now = laneNow();
       if (now === null || now.epoch !== checked.epoch || now.reservation !== checked.reservation) throw new SignatureRefused('the sealed send is not of the lane\'s current epoch and reservation');
       // 3. Every order hashes to the hash it carries.
       for (const o of [checked.taking, ...checked.resting]) {
-        if (orderHash(o.order, deps.chainId, deps.matching).toLowerCase() !== o.hash.toLowerCase()) throw new SignatureRefused('an order no longer hashes to the hash it carries');
+        if (orderHash(o.order, setChain, matching).toLowerCase() !== o.hash.toLowerCase()) throw new SignatureRefused('an order no longer hashes to the hash it carries');
       }
       // 4. The calldata, built here from those orders with the pinned ABI's cross, is the calldata the pre-check proved.
       const data = encodeFunctionData({ abi: RELAY_ABI, functionName: 'cross', args: [{ order: checked.taking.order, signature: checked.taking.signature }, checked.resting.map((o) => ({ order: o.order, signature: o.signature }))] } as never);
@@ -217,7 +225,7 @@ export function openSigner(deps: SignerDeps): Signer {
       return {
         raw,
         hash: keccak256(raw),
-        fields: { from: account.address, to: relay, nonce: checked.nonce, gas: checked.gas.limit, maxFeePerGas: checked.maxFeePerGas, maxPriorityFeePerGas: checked.maxPriorityFeePerGas, chainId: deps.chainId },
+        fields: { from: account.address, to: relay, nonce: checked.nonce, gas: checked.gas.limit, maxFeePerGas: checked.maxFeePerGas, maxPriorityFeePerGas: checked.maxPriorityFeePerGas, chainId: setChain },
       };
     },
   };
