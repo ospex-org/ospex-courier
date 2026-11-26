@@ -100,6 +100,9 @@ function operator(args: string[], env: Record<string, string> = {}): Promise<{ o
   });
 }
 
+/** The final block's height as the proxy serves it in this file: one block under the head. */
+const finalHeight = async (): Promise<bigint> => BigInt((await stack.rig.rpc('eth_blockNumber', [])) as string) - 1n;
+
 /** The relay's sender set to the key, as the timelock's call leaves it, and the key funded with POL. */
 async function rotateTo(next: HDAccount): Promise<void> {
   await stack.rig.rpc('anvil_setBalance', [next.address, '0x56bc75e2d63100000']);
@@ -207,7 +210,9 @@ test("the key's hold, a second time, closed by a rotation: the lane shut by a tr
   await stopAll();
   const K3 = stack.rig.account(32);
   await rotateTo(K3);
-  await new Promise((r) => setTimeout(r, 5_000));
+  // The final block past the rotation, read as the proxy serves it here: one block under the head.
+  const rotatedAt = BigInt((await stack.rig.rpc('eth_blockNumber', [])) as string) + 1n;
+  await until(finalHeight, (f) => f >= rotatedAt, 30_000, 'the final block past the rotation');
   const k3 = await startHookedCourier(envFor(K3));
   extra.push(k3);
   current = () => k3.url;

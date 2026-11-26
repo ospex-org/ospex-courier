@@ -90,6 +90,9 @@ async function quoteAndBet(life = 30n): Promise<{ M: HDAccount; B: HDAccount; qu
 /** The counts every witness names: signatures at the signer, hand-offs at the proxy, across the courier's lives. */
 const counts = () => ({ signed: stack.courier.hooks?.signed.length ?? 0, handOffs: stack.proxy.count('eth_sendRawTransaction') });
 
+/** The final block's height as the proxy serves it in this file: one block under the head. */
+const finalHeight = async (): Promise<bigint> => BigInt((await stack.rig.rpc('eth_blockNumber', [])) as string) - 1n;
+
 /** The key's count on the chain at the latest block, and its pending one. */
 async function keyNonce(): Promise<{ latest: bigint; pending: bigint }> {
   const at = async (tag: string) => BigInt((await stack.rig.rpc('eth_getTransactionCount', [stack.rig.accounts.sender.address, tag])) as string);
@@ -319,10 +322,11 @@ test('on the stack: a nonce of the key used at a final block by a transaction th
   const key = stack.rig.accounts.sender.address;
   const wm = await pool.query<{ to: string; at: string | null }>('SELECT verified_nonce_to::text AS to, verified_block_number::text AS at FROM lanes');
   const used = await keyNonce();
-  await stack.rig.rpc('eth_sendTransaction', [{ from: key, to: key, value: '0x0' }]);
+  const own = (await stack.rig.rpc('eth_sendTransaction', [{ from: key, to: key, value: '0x0' }])) as string;
   await until(keyNonce, (n) => n.latest === used.latest + 1n, 20_000, "the key's own transaction mined");
-  // The final block past it: a block or two more.
-  await new Promise((r) => setTimeout(r, 6_000));
+  // The final block past it, read as the proxy serves it here: one block under the head.
+  const minedAt = BigInt(((await stack.rig.rpc('eth_getTransactionReceipt', [own])) as { blockNumber: string }).blockNumber);
+  await until(finalHeight, (f) => f >= minedAt, 30_000, "the final block past the key's own transaction");
   const c = await quoteAndBet();
   const shut = await until(async () => (await pool.query<{ shut_line: string | null }>('SELECT shut_line::text AS shut_line FROM lanes')).rows[0]?.shut_line ?? null, (v) => v !== null, 30_000, 'the lane shut');
   const opened = await pool.query<{ reason: string; facts: Record<string, unknown> }>('SELECT reason, facts FROM events WHERE number = $1', [shut]);
