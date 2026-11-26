@@ -98,8 +98,9 @@ test("the hand-off: one request and no retry; taken only with the expected hash 
 });
 
 /**
- * A node of the test's own, for the answers the chain's proxy cannot give: each request is answered as `answer` says,
- * and counted as it arrives.
+ * A node of the test's own, for the answers the chain's proxy cannot give: each request is counted as it arrives,
+ * whatever its method or body, and answered as `answer` says. A request that is not a JSON-RPC object, an empty GET
+ * among them, is counted and answered 400, and never throws here.
  */
 async function stubNode(answer: (req: { id: unknown; params: unknown[] }, res: ServerResponse) => void): Promise<{ url: string; arrived: () => number; close(): Promise<void> }> {
   let arrived = 0;
@@ -109,7 +110,18 @@ async function stubNode(answer: (req: { id: unknown; params: unknown[] }, res: S
     incoming.on('data', (c: Buffer) => chunks.push(c));
     incoming.on('end', () => {
       arrived += 1;
-      const req = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { id: unknown; params?: unknown[] };
+      let req: { id: unknown; params?: unknown[] } | null = null;
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+        if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) req = parsed as { id: unknown; params?: unknown[] };
+      } catch {
+        req = null;
+      }
+      if (req === null) {
+        res.writeHead(400);
+        res.end();
+        return;
+      }
       answer({ id: req.id, params: req.params ?? [] }, res);
     });
   });
@@ -138,23 +150,40 @@ test("the hand-off's transport and the binding of its answer: a refused connecti
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(typeof body === 'string' ? body : JSON.stringify(body));
   };
-  /** One hand-off to a node answering as `answer` says: what the client made of it, and how many requests reached the node. */
-  async function handedTo(answer: (req: { id: unknown; params: unknown[] }, res: ServerResponse) => void, timeoutMs = 1_000): Promise<{ answer: unknown; arrived: number }> {
+  /**
+   * The client's own calls out, counted where it makes them: every fetch while `work` runs. Beside the arrivals at a
+   * node, they show a second attempt that reaches nothing, as at a refused connection.
+   */
+  async function callsOut<T>(work: () => Promise<T>): Promise<{ value: T; attempts: number }> {
+    const real = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = ((...args: Parameters<typeof fetch>) => {
+      attempts += 1;
+      return real(...args);
+    }) as typeof fetch;
+    try {
+      return { value: await work(), attempts };
+    } finally {
+      globalThis.fetch = real;
+    }
+  }
+  /** One hand-off to a node answering as `answer` says: what the client made of it, its attempts, and how many requests reached the node. */
+  async function handedTo(answer: (req: { id: unknown; params: unknown[] }, res: ServerResponse) => void, timeoutMs = 1_000): Promise<{ answer: unknown; arrived: number; attempts: number }> {
     const node = await stubNode(answer);
     try {
-      const got = await handOff(createJsonRpc(node.url, timeoutMs), raw);
-      return { answer: got, arrived: node.arrived() };
+      const { value, attempts } = await callsOut(() => handOff(createJsonRpc(node.url, timeoutMs), raw));
+      return { answer: value, arrived: node.arrived(), attempts };
     } finally {
       await node.close();
     }
   }
 
   // Taken: this request's id, and this transaction's own hash as the result.
-  assert.deepEqual(await handedTo((r, res) => json(res, { jsonrpc: '2.0', id: r.id, result: own })), { answer: { kind: 'taken' }, arrived: 1 });
-  assert.deepEqual(await handedTo((r, res) => json(res, { jsonrpc: '2.0', id: r.id, result: own.toUpperCase().replace('0X', '0x') })), { answer: { kind: 'taken' }, arrived: 1 });
+  assert.deepEqual(await handedTo((r, res) => json(res, { jsonrpc: '2.0', id: r.id, result: own })), { answer: { kind: 'taken' }, arrived: 1, attempts: 1 });
+  assert.deepEqual(await handedTo((r, res) => json(res, { jsonrpc: '2.0', id: r.id, result: own.toUpperCase().replace('0X', '0x') })), { answer: { kind: 'taken' }, arrived: 1, attempts: 1 });
   // Taken: an error to this request whose whole message is already known, in any letter case and with space around it.
   for (const message of ['already known', '  Already Known \n', 'ALREADY KNOWN']) {
-    assert.deepEqual(await handedTo((r, res) => json(res, { jsonrpc: '2.0', id: r.id, error: { code: -32000, message } })), { answer: { kind: 'taken' }, arrived: 1 }, JSON.stringify(message));
+    assert.deepEqual(await handedTo((r, res) => json(res, { jsonrpc: '2.0', id: r.id, error: { code: -32000, message } })), { answer: { kind: 'taken' }, arrived: 1, attempts: 1 }, JSON.stringify(message));
   }
   // Not known: every other answer, each made once, and nothing of it comes out.
   const others: Array<[string, (r: { id: unknown; params: unknown[] }, res: ServerResponse) => void, unknown]> = [
@@ -189,39 +218,44 @@ test("the hand-off's transport and the binding of its answer: a refused connecti
   ];
   for (const [what, answer, expected] of others) {
     const got = await handedTo(answer);
-    assert.deepEqual(got, { answer: expected, arrived: 1 }, what);
+    assert.deepEqual(got, { answer: expected, arrived: 1, attempts: 1 }, what);
     const out = JSON.stringify(got.answer).toLowerCase();
     for (const needle of ['planted', 'marker', 'peer', 'not json']) assert.ok(!out.includes(needle), `${what}: ${needle} does not come out`);
   }
-  // A time-out before the answer's headers, and one in its body: not known, one request each, and no other.
-  assert.deepEqual(await handedTo(() => undefined, 300), { answer: { kind: 'unknown' }, arrived: 1 }, 'no headers in time');
+  // A time-out before the answer's headers, and one in its body: not known, one attempt and one request each, and no other.
+  assert.deepEqual(await handedTo(() => undefined, 300), { answer: { kind: 'unknown' }, arrived: 1, attempts: 1 }, 'no headers in time');
   assert.deepEqual(
     await handedTo((r, res) => {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.write(`{"jsonrpc":"2.0","id":${JSON.stringify(r.id)},"result":"${own.slice(0, 20)}`);
     }, 300),
-    { answer: { kind: 'unknown' }, arrived: 1 },
+    { answer: { kind: 'unknown' }, arrived: 1, attempts: 1 },
     'the body not whole in time',
   );
-  // A redirect: not followed. Not known, and no request reaches the redirect's place.
+  // A redirect: not followed. Not known, one attempt, and for each status on its own, no request at the redirect's
+  // place, whatever its method or body: the place counts every request and answers it.
   const elsewhere = await stubNode((r, res) => json(res, { jsonrpc: '2.0', id: r.id, result: own }));
   try {
     for (const status of [301, 302, 307, 308]) {
+      const before = elsewhere.arrived();
       const got = await handedTo((_r, res) => {
         res.writeHead(status, { location: elsewhere.url });
         res.end();
       });
-      assert.deepEqual(got, { answer: { kind: 'unknown' }, arrived: 1 }, `a ${status}`);
+      assert.deepEqual(got, { answer: { kind: 'unknown' }, arrived: 1, attempts: 1 }, `a ${status}`);
+      assert.equal(elsewhere.arrived() - before, 0, `a ${status}: no request at the redirect's place`);
     }
     assert.equal(elsewhere.arrived(), 0, "no request at the redirect's place");
   } finally {
     await elsewhere.close();
   }
-  // A refused connection: not known, and no node saw the request.
+  // A refused connection: not known, one attempt by the client, and no node saw the request.
   const gone = await stubNode(() => undefined);
   const url = gone.url;
   await gone.close();
-  assert.deepEqual(await handOff(createJsonRpc(url, 1_000), raw), { kind: 'unknown' });
+  const refused = await callsOut(() => handOff(createJsonRpc(url, 1_000), raw));
+  assert.deepEqual(refused.value, { kind: 'unknown' });
+  assert.equal(refused.attempts, 1, 'one attempt at a refused connection');
   assert.equal(gone.arrived(), 0, 'nothing arrived');
 });
 
