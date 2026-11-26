@@ -53,7 +53,12 @@ const signed = () => {
 const handOffs = () => stack.proxy.count('eth_sendRawTransaction');
 
 before(async () => {
-  stack = await startStack('restore', { hooked: true, blockTime: 2, sending: true });
+  stack = await startStack('restore', {
+    hooked: true,
+    blockTime: 2,
+    sending: true,
+    sendsApart: { copies: "this file's couriers on copies of the database send through the stack's proxy and keep their records in the copies" },
+  });
   stack.proxy.finalFollows(1n);
   original = new pg.Pool({ connectionString: stack.databaseUrl, max: 2 });
 });

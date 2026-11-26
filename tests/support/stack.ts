@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
+import { keccak256, type Hex } from 'viem';
 import { closeEach } from './close';
 import { testServer } from './database';
 import { startCourier, startHookedCourier, type CourierProcess, type HookControl } from './courier';
@@ -16,8 +17,10 @@ import { startTcpRelay, type TcpRelay } from './tcp';
 // database with the schema applied, a relay in front of the database, and the
 // courier as its own process against the two. At its close every stack prints
 // what the courier sent through the proxy, counted as the requests arrived,
-// and asserts it sent no transaction but the Crosses its records hold as handed
-// to the node, each once, and never asked the node to sign anything.
+// and asserts that it never asked the node to sign anything, and that it sent no
+// transaction but the Crosses its records hold as handed to the node, each
+// once by its own bytes, unless the file names why its records cannot be held
+// to its sends (`sendsApart`).
 
 export interface Stack {
   rig: Rig;
@@ -59,8 +62,8 @@ function launchCourier(env: Stack['env'], options: { hooked?: boolean; holds?: s
 
 /**
  * The stack's options. `blockTime` mines a block every so many seconds with the pool open, as the sender's tests need;
- * `sending` is a stack whose courier sends, where each test counts its signatures and hand-offs itself and the close
- * asserts nothing of them.
+ * `sending` is a stack whose courier sends, where each test counts its own signatures and hand-offs, and whose close
+ * holds the sends to the records as any stack's does.
  */
 export interface StackOptions {
   hooked?: boolean;
@@ -69,6 +72,14 @@ export interface StackOptions {
   coin?: 'TestCoin' | 'RefusingCoin' | 'FalseCoin';
   blockTime?: number;
   sending?: true;
+  /**
+   * Why this file's records cannot be held to its sends at the close, in the file's own words. `copies`: its couriers
+   * on copies of the stack's database send through the same proxy and keep their records in the copies, so the close
+   * asserts only that nothing asked the node to sign. `unsent`: its records hold hand-offs that never reached the
+   * node, laid by the test or cut off by a kill between the gate and the request, so the close still holds every send
+   * to a hand-off its records hold, by the transaction's own bytes, once, and does not hold every hand-off to a send.
+   */
+  sendsApart?: { copies: string } | { unsent: string };
 }
 
 export async function startStack(prefix: string, options: StackOptions = {}): Promise<Stack> {
@@ -130,20 +141,23 @@ export async function startStack(prefix: string, options: StackOptions = {}): Pr
     },
     async close() {
       let sends: Sends = { eth_sendRawTransaction: 0, eth_sendTransaction: 0 };
-      let handed = 0;
+      let sent: string[] = [];
+      let handed: string[] = [];
+      const apart = options.sendsApart;
       // Each step in its own try: the database is dropped whatever failed before it.
       await closeEach(
         () => stack.courier.stop(),
         async () => {
           // Counted once the courier has stopped, so a send in flight at the close is in the count too.
           sends = proxy.sends();
+          sent = proxy.counted.filter((c) => c.method === 'eth_sendRawTransaction').map((c) => (c.sent === undefined ? 'a send with no bytes' : keccak256(c.sent as Hex).toLowerCase()));
           console.log(`# the courier's sends through the proxy (${prefix}): eth_sendRawTransaction ${sends.eth_sendRawTransaction}, eth_sendTransaction ${sends.eth_sendTransaction}`);
-          // The Crosses the records hold as handed to the node: what the sends must be, one each.
-          if (options.sending === true) return;
+          if (apart !== undefined && 'copies' in apart) return;
+          // The Crosses the records hold as handed to the node: what the sends must be, one each, by their own bytes.
           const records = new pg.Pool({ connectionString: url, max: 1 });
           try {
-            const { rows } = await records.query<{ n: string }>('SELECT count(*)::text AS n FROM crosses WHERE hand_offs = 1');
-            handed = Number((rows[0] as { n: string }).n);
+            const { rows } = await records.query<{ tx_hash: string | null }>('SELECT tx_hash FROM crosses WHERE hand_offs = 1');
+            handed = rows.map((r) => String(r.tx_hash).toLowerCase());
           } finally {
             await records.end();
           }
@@ -153,8 +167,22 @@ export async function startStack(prefix: string, options: StackOptions = {}): Pr
         () => rig.close(),
         () => db.end(),
       );
-      if (options.sending === true) return;
-      assert.deepEqual(sends, { eth_sendRawTransaction: handed, eth_sendTransaction: 0 }, 'the courier sent a transaction its records do not hold as handed off once, or asked the node to sign one');
+      assert.equal(sends.eth_sendTransaction, 0, 'the courier asked the node to sign a transaction');
+      if (apart !== undefined && 'copies' in apart) {
+        console.log(`# the sends held to no records at the close (${prefix}): ${apart.copies}`);
+        return;
+      }
+      if (apart !== undefined && 'unsent' in apart) {
+        console.log(`# the hand-offs not held to sends at the close (${prefix}): ${apart.unsent}`);
+        const left = [...handed];
+        for (const s of sent) {
+          const i = left.indexOf(s);
+          assert.ok(i >= 0, `the courier sent a transaction its records do not hold as handed off, or sent one twice: ${s}`);
+          left.splice(i, 1);
+        }
+        return;
+      }
+      assert.deepEqual([...sent].sort(), [...handed].sort(), 'the courier sent a transaction its records do not hold as handed off once, or its records hold a hand-off that never reached the node');
     },
   };
   return stack;

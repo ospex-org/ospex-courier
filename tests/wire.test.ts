@@ -236,7 +236,7 @@ test("the wallet's form of COURIER_CANNOT_SEND takes N7, and it is told from the
 
 test("every row above, served: written as the sender writes a Cross's row, beside its bet and its quote, and read back through GET /v1/orders/{hash}; the record's message is the same text, word for word, the database's restore hold read for the restored ones", async () => {
   // A sending stack: its close counts no sends against these rows, which no courier handed off.
-  const stack = await startStack('wire_served', { sending: true });
+  const stack = await startStack('wire_served', { sending: true, sendsApart: { unsent: 'the served records are laid by the test, hand-offs included, and none of them reached the node' } });
   const pool = openPool(stack.databaseUrl, null) as pg.Pool;
   const headers = { 'x-forwarded-for': '198.18.250.1' };
   const hex = (n: number) => `0x${n.toString(16).padStart(64, '0')}`;

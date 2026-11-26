@@ -40,7 +40,12 @@ const requestsOf = (txHash: string | null | undefined): number =>
   txHash === null || txHash === undefined ? 0 : stack.proxy.counted.filter((r) => r.sent !== undefined && keccak256(r.sent as Hex).toLowerCase() === txHash.toLowerCase()).length;
 
 before(async () => {
-  stack = await startStack('sendonce', { hooked: true, blockTime: 2, sending: true });
+  stack = await startStack('sendonce', {
+    hooked: true,
+    blockTime: 2,
+    sending: true,
+    sendsApart: { unsent: 'a process killed between the gate and the request leaves a hand-off in the records that never reached the node' },
+  });
   stack.proxy.finalFollows(1n);
   pool = new pg.Pool({ connectionString: stack.databaseUrl, max: 2 });
 });
