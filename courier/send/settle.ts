@@ -8,8 +8,8 @@ import { crossesAtNonce, crossesOfKey, crossRow, freeLaneOf, FINAL_STATES, legsO
 import { lockLane, readLane, shutLane } from '../records/lanes';
 import type { OrderRow } from '../records/orders';
 import type { Store } from '../records/store';
-import { filledAtF, onFinalChain } from './chain';
-import { look, lookFacts, type Expected, type Look, type Ran } from './outcome';
+import { decisionAt, filledAtF, onFinalChain, stillFinal, type Decision } from './chain';
+import { look, lookFacts, type Expected, type Look, type Looked, type Ran } from './outcome';
 import { reasonFacts, reasonOf, type Reason } from './reason';
 
 // The owner's settling of a Cross at or past the gate: a look at the chain at
@@ -18,7 +18,11 @@ import { reasonFacts, reasonOf, type Reason } from './reason';
 // Cross final. No timer ends it, no repeated read does, and no wait running out
 // does. Each write is one transaction under the lane's guards: the lane's row,
 // this process's epoch, the reservation the Cross records, its open Cross this
-// one. A final write frees the lane.
+// one. A final write frees the lane. Where a look, or a read again of an
+// expired unmined Cross, read a block's header by number, F's own height is
+// read again after all its reads and before anything it decided is written or
+// stops the process: another block there, or that read unavailable, writes
+// nothing of it, and the Cross is looked at again.
 
 export interface SettleDeps {
   store: Store;
@@ -213,9 +217,39 @@ export function createSettler(deps: SettleDeps): Settler {
     return { expected: { betHash: bet.hash, account: bet.order.account, expiry: bet.order.expiry, legs: legs.map((l) => ({ orderHash: l.orderHash })), atH }, legs };
   }
 
-  /** The final write of a ran Cross: the receipt's figures, the legs as the chain recorded them, the marks at F, the line, the lane freed. */
-  async function writeRan(bet: OrderRow, cross: CrossRow, legs: Legs, l: Ran & { F: Header }): Promise<'written' | 'unchanged' | 'lost'> {
+  /**
+   * A decision's last check of F (./chain.ts): 'held' where F's own height still holds F, or where the decision read no
+   * header by number; 'changed' where another block stands there; 'unread' where that read failed twice. Only 'held'
+   * lets the decision be written.
+   */
+  async function lastCheck(decision: Decision): Promise<'held' | 'changed' | 'unread'> {
+    try {
+      return (await stillFinal(deps.chain, deps.rpc, decision)) ? 'held' : 'changed';
+    } catch (err) {
+      if (err instanceof ChainUnreachable) return 'unread';
+      throw err;
+    }
+  }
+
+  /** What a look that failed its last check of F is taken as: not comparable, with nothing it decided written. */
+  function discarded(l: Looked, checked: 'changed' | 'unread'): Looked {
+    const why = checked === 'changed' ? "the final block's own height, read again, holds another block" : "the final block's own height could not be read again";
+    deps.log(`lane: the look at final block ${s(l.F.number)} is set aside before anything it found is written (${why}); the Cross is looked at again`);
+    return { kind: 'not comparable', F: l.F, facts: { why, final: finalNamed(l.F), found: l.kind }, decision: l.decision };
+  }
+
+  /**
+   * The final write of a ran Cross: the receipt's figures, the legs as the chain recorded them, the marks at F, the line,
+   * the lane freed. Its last check of F comes after the trace and the receipt's block time are read, the decision's last
+   * reads of the chain; 'discarded' where it fails, and nothing is written.
+   */
+  async function writeRan(bet: OrderRow, cross: CrossRow, legs: Legs, l: Ran & { F: Header; decision: Decision }): Promise<'written' | 'unchanged' | 'lost' | 'discarded'> {
     const w = await ranWrite(outcomeDeps, bet, cross, legs, l);
+    const checked = await lastCheck(l.decision);
+    if (checked !== 'held') {
+      discarded({ ...l, kind: 'ran' }, checked);
+      return 'discarded';
+    }
     return guarded(cross, async (client) => {
       if (!(await writeFinal(client, bet.hash, w.outcome))) return false;
       if (w.marks.length > 0) await store.orders.markEndedAtFinal(client, w.marks, { number: l.F.number, hash: l.F.hash });
@@ -298,11 +332,13 @@ export function createSettler(deps: SettleDeps): Settler {
     let wrote: 'none' | 'written' = 'none';
     for (const c of expired) {
       if ((c.nonce as bigint) >= count) continue;
+      // Each expired unmined Cross read again is a decision of its own at F, checked at its end before it is written.
+      const decision = decisionAt(F);
       let receipt: Receipt | null;
       try {
         receipt = await deps.chain.ask(F, () => receiptOf(deps.rpc, c.txHash as Hex));
         if (receipt === null || receipt.blockNumber > F.number) continue;
-        const [shown] = await onFinalChain(deps.chain, deps.rpc, F, [{ number: receipt.blockNumber, hash: receipt.blockHash }]);
+        const [shown] = await onFinalChain(deps.chain, deps.rpc, decision, [{ number: receipt.blockNumber, hash: receipt.blockHash }]);
         if (shown !== true) continue;
       } catch (err) {
         if (err instanceof ChainUnreachable) continue;
@@ -311,6 +347,7 @@ export function createSettler(deps: SettleDeps): Settler {
       const bet = await store.orders.get(c.betHash, store.lane);
       if (bet === null) throw new Error('an expired unmined Cross has no bet');
       if (receipt.status !== 'reverted') {
+        if ((await lastCheck(decision)) !== 'held') continue;
         // Expired unmined says it can no longer fill; a successful receipt says it did: a contradiction.
         await store.events.write({ run: deps.run.id, kind: 'incident', orderHash: bet.hash, betHash: bet.hash, account: bet.order.account.toLowerCase(), gameId: bet.order.gameId, reason: 'CHAIN_CONTRADICTS_RECORDS', facts: { lane: key, betHash: c.betHash, why: 'a Cross closed expired unmined has a successful receipt on the final chain', txHash: c.txHash, final: finalNamed(F) } });
         deps.stopSending('a Cross closed expired unmined has a successful receipt on the final chain');
@@ -325,6 +362,7 @@ export function createSettler(deps: SettleDeps): Settler {
         if (!(err instanceof ChainUnreachable)) throw err;
       }
       if (betFilled === null) continue;
+      if ((await lastCheck(decision)) !== 'held') continue;
       const outcome: FinalOutcome = {
         state: 'reverted',
         final: { number: F.number, hash: F.hash },
@@ -358,7 +396,7 @@ export function createSettler(deps: SettleDeps): Settler {
       if (FINAL_STATES.includes(cross.state)) return 'done';
       const { expected, legs } = await expectedOf(bet, cross);
       const ours = new Map((cross.nonce === null ? [] : await crossesAtNonce(store.lane, key, cross.nonce)).filter((c) => c.txHash !== null && c.betHash.toLowerCase() !== cross.betHash.toLowerCase()).map((c) => [(c.txHash as Hex).toLowerCase(), c.betHash]));
-      let l: Look;
+      let l: Looked;
       try {
         l = await look(outcomeDeps, cross, expected, lastF, ours);
       } catch (err) {
@@ -370,6 +408,13 @@ export function createSettler(deps: SettleDeps): Settler {
         gap = Math.min(gap * 2, deps.gap.lastMs);
         continue;
       }
+      // The look's last check of F, after all its reads and before anything it found is written or stops the process.
+      // A ran Cross's comes later, in its write, after its trace and its block's time are read.
+      if (l.kind !== 'not comparable' && l.kind !== 'ran') {
+        const checked = await lastCheck(l.decision);
+        if (checked !== 'held') l = discarded(l, checked);
+      }
+      let ranDiscarded = false;
       if (l.kind !== 'not comparable' && (lastF === null || l.F.number > lastF.number)) lastF = l.F;
       if (l.kind !== 'not comparable' && l.kind !== 'contradiction' && deps.repairMarks !== undefined) {
         try {
@@ -400,13 +445,16 @@ export function createSettler(deps: SettleDeps): Settler {
             return true;
           });
           break;
-        case 'ran':
-          result = await writeRan(bet, cross, legs, l);
-          if (result === 'written') {
+        case 'ran': {
+          const r = await writeRan(bet, cross, legs, l);
+          if (r === 'written') {
             await openOnRead(bet);
             return 'done';
           }
+          if (r === 'discarded') ranDiscarded = true;
+          else result = r;
           break;
+        }
         case 'expired unmined':
           result = await guarded(cross, async (client) => {
             if (!(await writeFinal(client, bet.hash, { state: 'expired unmined', final: { number: l.F.number, hash: l.F.hash }, recorded: { betFilled: s(l.betFilled), final: finalNamed(l.F), expiry: s(bet.order.expiry) } }))) return false;
@@ -448,7 +496,7 @@ export function createSettler(deps: SettleDeps): Settler {
           break;
       }
       if (result === 'lost') return 'lost';
-      await unresolvedAfterExpiry(bet, cross, l);
+      if (!ranDiscarded) await unresolvedAfterExpiry(bet, cross, l);
       await sleep(gap);
       gap = Math.min(gap * 2, deps.gap.lastMs);
     }

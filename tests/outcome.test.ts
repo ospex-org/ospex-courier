@@ -320,19 +320,22 @@ test("the bet's filled amount at the final block, a ran Cross's second read, fai
   assert.equal((await final(next.bet))?.state, 'confirmed');
 });
 
-test("the walk of the final block's parents after a quiet spell of 300 blocks: one parent the node does not return by its hash is read again, the bet is sent, and the process goes on taking bets", async () => {
+/** A height a request names by number, as a hex quantity; null for a tag or anything else. */
+const numberedAt = (p: unknown[]): bigint | null => (typeof p[0] === 'string' && /^0x[0-9a-fA-F]+$/.test(p[0]) ? BigInt(p[0]) : null);
+
+test("the headers read by number after a quiet spell of 300 blocks: one deep header the node does not return by its number is read again, the bet is sent, and the process goes on taking bets", async () => {
   const first = await quoteAndBet();
   assert.equal((await final(first.bet))?.state, 'confirmed');
-  // A quiet spell longer than the chain's own hash of a height reaches back: the next bet's send checks walk to the watermark's anchor.
+  // A quiet spell longer than the chain's own hash of a height reaches back: the next bet's send checks read the watermark's anchor by its number.
   await stack.rig.rpc('anvil_mine', ['0x12c']);
   const head = BigInt((await stack.rig.rpc('eth_blockNumber', [])) as string);
   const before = stops();
   let nulled = 0;
-  stack.proxy.rule('eth_getBlockByHash', {
+  stack.proxy.rule('eth_getBlockByNumber', {
     kind: 'rewriteResult',
-    result: (_p, result) => {
-      const at = result === null ? null : BigInt((result as { number: Hex }).number);
-      if (nulled === 0 && at !== null && at + 260n < head) {
+    result: (p, result) => {
+      const at = numberedAt(p);
+      if (nulled === 0 && result !== null && at !== null && at + 260n < head) {
         nulled++;
         return null;
       }
@@ -342,10 +345,10 @@ test("the walk of the final block's parents after a quiet spell of 300 blocks: o
   let bet = '';
   try {
     bet = (await quoteAndBet()).bet;
-    await until(async () => nulled, (n) => n === 1, 60_000, 'one parent not returned');
-    await until(async () => stops() > before || (await row(bet)) !== null, (v) => v, 60_000, "the lane's answer to the parent not returned");
+    await until(async () => nulled, (n) => n === 1, 60_000, 'one deep header not returned');
+    await until(async () => stops() > before || (await row(bet)) !== null, (v) => v, 60_000, "the lane's answer to the header not returned");
   } finally {
-    stack.proxy.rule('eth_getBlockByHash', null);
+    stack.proxy.rule('eth_getBlockByNumber', null);
   }
   const next = await quoteAndBet();
   assert.equal(stops(), before, 'the process did not stop');
@@ -356,7 +359,7 @@ test("the walk of the final block's parents after a quiet spell of 300 blocks: o
 /**
  * A Cross whose receipt lies further below F than the chain's own hash of a height reaches, when it is first looked
  * at as final: F held at the head while the Cross is sent and mined, then 300 blocks, then F one behind the head again.
- * That look shows the receipt's block on F's chain by walking F's parents by hash.
+ * That look holds the receipt's block to the header at its height, read by number, and reads F's own height again.
  */
 async function deepReceipt(): Promise<{ bet: string; head: bigint; receiptBlock: bigint }> {
   stack.proxy.finalFollows(null);
@@ -377,24 +380,18 @@ async function deepReceipt(): Promise<{ bet: string; head: bigint; receiptBlock:
   return { bet: c.bet, head, receiptBlock: BigInt((mined as { blockNumber: Hex }).blockNumber) };
 }
 
-/** A parent the walk asks for: well past the window below the head, and above the receipt's own block. */
-const deepParent = (d: { head: bigint; receiptBlock: bigint }, result: unknown): bigint | null => {
-  const at = result === null ? null : BigInt((result as { number: Hex }).number);
-  return at !== null && at + 260n < d.head && at > d.receiptBlock + 5n ? at : null;
-};
+/** The receipt's own height, where a request names it by number: the deep read the look makes for it. */
+const atReceipt = (d: { receiptBlock: bigint }, p: unknown[]): boolean => numberedAt(p) === d.receiptBlock;
 const unavailableLooks = () => stack.courier.lines.filter((l) => /could not be read whole/.test(l)).length;
 
-test("a parent of the final block missing on both of the reader's attempts, in a look's walk past the window: the look is unavailable and writes nothing final; at a later look the node returns it, and the Cross is confirmed; the process goes on, with one hand-off", async () => {
+test("the receipt's header, more than 256 blocks below the final block, missing on both of the reader's attempts at its number: the look is unavailable and writes nothing final; at a later look the node returns it, and the Cross is confirmed; the process goes on, with one hand-off", async () => {
   const before = { stops: stops(), handOffs: handOffs(), unavailable: unavailableLooks() };
   const d = await deepReceipt();
   let missing = 0;
-  let asked: string | null = null;
-  stack.proxy.rule('eth_getBlockByHash', {
+  stack.proxy.rule('eth_getBlockByNumber', {
     kind: 'rewriteResult',
     result: (p, result) => {
-      const hash = String(p[0]).toLowerCase();
-      if (missing < 2 && deepParent(d, result) !== null && (asked === null || asked === hash)) {
-        asked = hash;
+      if (missing < 2 && result !== null && atReceipt(d, p)) {
         missing++;
         return null;
       }
@@ -404,12 +401,12 @@ test("a parent of the final block missing on both of the reader's attempts, in a
   try {
     stack.proxy.setFinal(null);
     stack.proxy.finalFollows(1n);
-    await until(async () => missing, (n) => n >= 2, 60_000, 'a parent missing on both attempts');
-    await until(async () => stops() > before.stops || unavailableLooks() > before.unavailable, (v) => v, 30_000, "the look's answer to the missing parent");
+    await until(async () => missing, (n) => n >= 2, 60_000, "the receipt's header missing on both attempts");
+    await until(async () => stops() > before.stops || unavailableLooks() > before.unavailable, (v) => v, 30_000, "the look's answer to the missing header");
     assert.equal(stops(), before.stops, 'the process did not stop');
-    assert.ok(!FINAL.includes(String((await row(d.bet))?.state)), 'nothing final is written while the walk is incomplete');
+    assert.ok(!FINAL.includes(String((await row(d.bet))?.state)), "nothing final is written while the receipt's header is missing");
   } finally {
-    stack.proxy.rule('eth_getBlockByHash', null);
+    stack.proxy.rule('eth_getBlockByNumber', null);
     stack.proxy.setFinal(null);
     stack.proxy.finalFollows(1n);
   }
@@ -419,33 +416,70 @@ test("a parent of the final block missing on both of the reader's attempts, in a
   assert.equal(handOffs() - before.handOffs, 1, 'one hand-off');
 });
 
-for (const wrong of ['height', 'hash'] as const) {
-  test(`a parent of the final block returned with the wrong ${wrong} in a look's walk past the window: a contradiction, never read again as if it were missing and never followed; no ancestry is shown from it, nothing final is written, and the process stops sending; started again with the node answering as asked, the Cross is confirmed`, async () => {
-    const before = stops();
-    const d = await deepReceipt();
-    let served = 0;
-    stack.proxy.rule('eth_getBlockByHash', {
-      kind: 'rewriteResult',
-      result: (_p, result) => {
-        const at = deepParent(d, result);
-        if (served > 0 || at === null) return result;
-        served++;
-        return wrong === 'height' ? { ...(result as Record<string, unknown>), number: `0x${(at - 1n).toString(16)}` } : { ...(result as Record<string, unknown>), hash: `0x${'ab'.repeat(32)}` };
-      },
-    });
-    try {
-      stack.proxy.setFinal(null);
-      stack.proxy.finalFollows(1n);
-      await until(async () => served, (n) => n === 1, 60_000, `the parent with the wrong ${wrong} served`);
-      await until(async () => stops() > before || FINAL.includes(String((await row(d.bet))?.state)), (v) => v, 60_000, `the lane's answer to the wrong ${wrong}`);
-      assert.ok(!FINAL.includes(String((await row(d.bet))?.state)), `no outcome from a walk that met a parent with the wrong ${wrong}`);
-      assert.equal(stops(), before + 1, 'the process stops sending');
-    } finally {
-      stack.proxy.rule('eth_getBlockByHash', null);
-      stack.proxy.setFinal(null);
-      stack.proxy.finalFollows(1n);
-      await stack.restartCourier({ hooked: true });
-    }
-    assert.equal((await final(d.bet))?.state, 'confirmed');
+test("the receipt's header read by its number returned at the wrong height: a contradiction, never read again as if it were missing; nothing final is written, and the process stops sending; started again with the node answering as asked, the Cross is confirmed", async () => {
+  const before = stops();
+  const d = await deepReceipt();
+  let served = 0;
+  stack.proxy.rule('eth_getBlockByNumber', {
+    kind: 'rewriteResult',
+    result: (p, result) => {
+      if (served > 0 || result === null || !atReceipt(d, p)) return result;
+      served++;
+      return { ...(result as Record<string, unknown>), number: `0x${(d.receiptBlock - 1n).toString(16)}` };
+    },
   });
-}
+  try {
+    stack.proxy.setFinal(null);
+    stack.proxy.finalFollows(1n);
+    await until(async () => served, (n) => n === 1, 60_000, 'the header at the wrong height served');
+    await until(async () => stops() > before || FINAL.includes(String((await row(d.bet))?.state)), (v) => v, 60_000, "the lane's answer to the wrong height");
+    assert.ok(!FINAL.includes(String((await row(d.bet))?.state)), 'no outcome from a look that met a header at the wrong height');
+    assert.equal(stops(), before + 1, 'the process stops sending');
+  } finally {
+    stack.proxy.rule('eth_getBlockByNumber', null);
+    stack.proxy.setFinal(null);
+    stack.proxy.finalFollows(1n);
+    await stack.restartCourier({ hooked: true });
+  }
+  assert.equal((await final(d.bet))?.state, 'confirmed');
+});
+
+// The earlier build walked F's parents, and a parent answered under another hash than the one asked for stopped the
+// process. Read by number, a header at the requested height under another hash says only that the receipt's block is
+// not the block at that height on F's chain: an orphan's, set aside and read again, and the process does not stop.
+test("the receipt's header read by its number returned under another hash: the receipt is an orphan's, set aside, not a contradiction, and the process does not stop; nothing final is written from that look; at a later look, the node answering as asked, the Cross is confirmed, with one hand-off", async () => {
+  const before = { stops: stops(), handOffs: handOffs() };
+  const d = await deepReceipt();
+  let served = 0;
+  stack.proxy.rule('eth_getBlockByNumber', {
+    kind: 'rewriteResult',
+    result: (p, result) => {
+      if (served > 0 || result === null || !atReceipt(d, p)) return result;
+      served++;
+      return { ...(result as Record<string, unknown>), hash: `0x${'ab'.repeat(32)}` };
+    },
+  });
+  let next: { arrived: Promise<void>; release(): void } | null = null;
+  try {
+    stack.proxy.setFinal(null);
+    stack.proxy.finalFollows(1n);
+    await until(async () => served, (n) => n === 1, 60_000, 'the header under another hash served');
+    // The next look's final block held as it arrives: the look that met the other hash has ended by then.
+    next = stack.proxy.hold('eth_getBlockByNumber', (p) => p[0] === 'finalized');
+    await next.arrived;
+    const r = await row(d.bet);
+    assert.ok(!FINAL.includes(String(r?.state)), `nothing final from the look that met the other hash: ${JSON.stringify(r)}`);
+    assert.equal(stops(), before.stops, 'the process does not stop');
+    const orphaned = await pool.query<{ facts: Record<string, unknown> }>(`SELECT facts FROM events WHERE bet_hash = $1 AND reason = 'RECEIPT_ORPHANED' ORDER BY number`, [d.bet.toLowerCase()]);
+    assert.equal(orphaned.rows.length, 1, "the receipt set aside as an orphan's, once");
+    assert.equal(String((orphaned.rows[0]?.facts.orphan as { number?: string } | undefined)?.number), d.receiptBlock.toString(), "the orphan's line names the receipt's block");
+  } finally {
+    next?.release();
+    stack.proxy.rule('eth_getBlockByNumber', null);
+    stack.proxy.setFinal(null);
+    stack.proxy.finalFollows(1n);
+  }
+  assert.equal((await final(d.bet))?.state, 'confirmed');
+  assert.equal(stops(), before.stops, 'the process did not stop');
+  assert.equal(handOffs() - before.handOffs, 1, 'one hand-off');
+});

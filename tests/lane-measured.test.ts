@@ -112,7 +112,7 @@ test("twenty bets posted at once, each against its own quote on a market of its 
   console.log(`# the lane, measured: ${n} bets posted at once; ${sent.length} sent (${sent.filter((r) => r.state === 'confirmed').length} confirmed), ${lapsed.length} lapsed (by post order: ${lapsed.join(', ') || 'none'}); ${perMinute} Crosses a minute; hops in ms (median, max): ${JSON.stringify(Object.fromEntries(Object.entries(hops).map(([k, v]) => [k, stat(v)])))}`);
 });
 
-test("the catch-up after a quiet spell: the lane's watermark anchored more than 256 blocks below the final block, the next bet's send checks show it on F's chain by a walk of parent hashes down to it, one request a block, counted at the proxy; then the anchor is raised and the bet after walks nothing", async () => {
+test("the catch-up after a quiet spell: the lane's watermark and the last bet's receipt more than 256 blocks below the final block; the next bet's send checks read each one's header by its number and then the final block's own height once more, three headers by number and none by hash, counted at the proxy; then the anchor is raised and the bet after reads none", async () => {
   const rig = stack.rig;
   const hooks = stack.courier.hooks as HookControl;
   const market = { scorer: rig.addresses.spread, lineTicks: -6_005 };
@@ -139,29 +139,44 @@ test("the catch-up after a quiet spell: the lane's watermark anchored more than 
   };
   const final = (h: string) => until(async () => (await pool.query<{ state: string }>('SELECT state FROM crosses WHERE bet_hash = $1', [h])).rows[0]?.state, (s) => s !== undefined && FINAL.includes(s), 90_000, `the Cross of ${h}`);
   await quote();
-  assert.equal(await final(await betOf(B1)), 'confirmed');
+  const first = await betOf(B1);
+  assert.equal(await final(first), 'confirmed');
   const anchorOf = async () => (await pool.query<{ n: string | null }>('SELECT verified_block_number::text AS n FROM lanes WHERE sender = $1', [rig.accounts.sender.address.toLowerCase()])).rows[0]?.n ?? null;
+  const receiptOf = async (h: string) => (await pool.query<{ n: string | null }>('SELECT receipt_block_number::text AS n FROM crosses WHERE bet_hash = $1', [h])).rows[0]?.n ?? null;
   // The quiet spell: 300 blocks with no bet.
   await rig.mine(300);
+  /** The headers the bet's send checks read, from its check's result to its intent: by number (each height named) and by hash. */
   const counted = async (B: HDAccount) => {
     await hooks.arm('before-result', 1);
     await hooks.arm('after-intent', 1);
     await quote();
     const h = await betOf(B);
     const atResult = await hooks.reached('before-result');
-    const before = stack.proxy.count('eth_getBlockByHash');
+    const from = stack.proxy.counted.length;
     await hooks.go(atResult);
     const atIntent = await hooks.reached('after-intent');
-    const walked = stack.proxy.count('eth_getBlockByHash') - before;
+    const seen = stack.proxy.counted.slice(from);
     await hooks.go(atIntent);
     assert.equal(await final(h), 'confirmed');
-    return walked;
+    const numbered = seen.filter((c) => c.method === 'eth_getBlockByNumber' && typeof c.params?.[0] === 'string' && /^0x[0-9a-f]+$/i.test(c.params[0] as string)).map((c) => BigInt(c.params?.[0] as string));
+    return { hash: h, numbered, byHash: seen.filter((c) => c.method === 'eth_getBlockByHash').length };
   };
   const anchorBefore = await anchorOf();
   const head = BigInt((await rig.rpc('eth_blockNumber', [])) as string);
-  const walked = await counted(B2);
-  assert.ok(walked >= 256, `the walk down to the anchor at ${anchorBefore}, from about ${head}: ${walked} headers`);
+  const next = await counted(B2);
+  const intentF = (await pool.query<{ f: string }>(`SELECT checked->'send'->'nonce'->'final'->>'number' AS f FROM crosses WHERE bet_hash = $1`, [next.hash])).rows[0]?.f;
+  // q = 2 distinct deep heights, the watermark's anchor and the last bet's receipt, then one read of F's own height.
+  const heights = [...new Set(next.numbered)];
+  const retries = next.numbered.length - heights.length;
+  assert.deepEqual(
+    { numbered: next.numbered.length - retries, retries, byHash: next.byHash, distinctHeights: heights.length },
+    { numbered: 3, retries: 0, byHash: 0, distinctHeights: 3 },
+    `the next bet's send checks: ${JSON.stringify({ numbered: next.numbered.map(String), anchorBefore, head: String(head) })}`,
+  );
+  assert.ok(heights.includes(BigInt(anchorBefore as string)), "the watermark's anchor read by its number");
+  assert.ok(heights.includes(BigInt((await receiptOf(first)) as string)), "the last bet's receipt read by its number");
+  assert.ok(heights.includes(BigInt(intentF as string)), "the final block's own height read again");
   const after = await counted(B3);
-  console.log(`# the catch-up after a quiet spell of 300 blocks: the anchor at block ${anchorBefore}, the head at ${head}; the next bet's send checks read ${walked} headers by hash; the bet after it read ${after}`);
-  assert.ok(after < 256, `the anchor raised by the bet before: ${after} headers`);
+  console.log(`# the catch-up after a quiet spell of 300 blocks: the anchor at block ${anchorBefore}, the head at ${head}; the next bet's send checks read ${next.numbered.length} headers by number (${next.numbered.map(String).join(', ')}; F at ${intentF}), ${retries} of them again, and ${next.byHash} by hash; the bet after it read ${after.numbered.length} by number and ${after.byHash} by hash`);
+  assert.deepEqual({ numbered: after.numbered.length, byHash: after.byHash }, { numbered: 0, byHash: 0 }, 'the anchor raised by the bet before: nothing read by number or by hash');
 });

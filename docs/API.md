@@ -181,9 +181,13 @@ an attempt already begun: one that had not reached the gate is closed `not sent`
 from the chain before the lane takes anything else.
 
 **The outcome, from the chain alone.** The courier reads the final block, F, and from then on names it by its hash.
-A receipt counts only in a block shown to be on F's chain; a height alone shows nothing. A receipt above F is
-`pending`; one at or under F on F's chain is `confirmed` or `reverted`; a transaction in no block, at a final block
-whose time is at or past the bet's expiry, is `expired unmined`; one whose place in the key's line another
+A receipt counts only when its block hash, not just its height, passes the final-chain compatibility check. At F
+compare hashes directly; up to 256 blocks below F use blockhash at F's hash; deeper blocks use the canonical header at
+that height followed by a check of F's original height and hash. The deep case trusts the provider, including its
+separate backends, to report one coherent finalized history. It does not independently verify consensus or establish
+the explicit parent connection. An unavailable or inconsistent comparison produces no final outcome. A receipt above
+F is `pending`; one at or under F on F's chain is `confirmed` or `reverted`; a transaction in no block, at a final
+block whose time is at or past the bet's expiry, is `expired unmined`; one whose place in the key's line another
 transaction took, in a final block, is `replaced`. No timer closes a Cross, and no wait running out does. For every
 outcome the bet's total filled at that final block is read and recorded with it. A reverted Cross's reason comes from
 one trace of the transaction, and an account is named only where that trace shows its own act; the courier never
@@ -322,6 +326,10 @@ A known reason the table does not list keeps its name and values whole in `cross
 
 - **“A compatible final block”:** A compatible final block F is a block from the node's finalized chain on the signed order's chainId, named by number, hash and chain timestamp, whose hash agrees with every same-height final anchor and whose ancestry contains every earlier final anchor or finalized receipt used for this decision; it must not regress behind them. Bind all proof and total reads to F's hash with requireCanonical: true, not merely its height, and use no proof if finality, ancestry or a required read is unavailable or contradictory.
 - **“Read this bet's filled amount on the chain”:** On the signed order's chainId, call s_filledRisk(bytes32) on the OspexMatching contract named by that order's EIP-712 verifyingContract, passing the record's orderHash, at that same compatible F by block hash; the returned uint256 is the order's total filled risk across all Crosses, in the same raw units as order.riskAmount—not this Cross's contribution and not an amount read from the relay.
+
+“Compatible final block” here carries that same provider and finality assumption. Expiry or cancellation and total
+filled must still be established at the same compatible final block before another signed bet is advised; the wall
+clock, a node error, or a missing receipt is not that proof.
 
 The order record already names the fields a next step is chosen by:
 

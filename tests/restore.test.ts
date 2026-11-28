@@ -882,3 +882,39 @@ test("a found intent recovered by two processes on the copy, the first of them o
     await stack.restartCourier({ hooked: true });
   }
 });
+
+test("a copy taken at the bet's intent, its transaction then sent and filled by the courier that went on, and 300 blocks mined before the restored courier starts: the watermark's anchor, the search's lower anchor and the block it finds lie more than 256 blocks below F, each read by number, with F's own height read again before recovery writes; the restored Cross is settled confirmed as any Cross is, nothing signed or handed off, and the hold stands", async () => {
+  const f = await foundIntent('restored_found_deep');
+  try {
+    const anchor = BigInt(String((await f.copy.pool.query<{ n: string }>('SELECT verified_block_number::text AS n FROM lanes WHERE sender = $1', [stack.rig.accounts.sender.address.toLowerCase()])).rows[0]?.n));
+    const found = BigInt(((await stack.rig.rpc('eth_getTransactionReceipt', [f.settled.txHash])) as { blockNumber: Hex }).blockNumber);
+    await stack.rig.rpc('evm_setIntervalMining', [0]);
+    await stack.rig.rpc('anvil_mine', ['0x12c', '0x2']);
+    await stack.rig.rpc('evm_setIntervalMining', [2]);
+    const from = stack.proxy.counted.length;
+    const { before } = await startOnCopy(f);
+    await until(() => crossState(f.copy.pool, f.bet), (s) => s === 'confirmed', 120_000, 'the found intent settled');
+    assert.deepEqual({ s: signed() - before.s, h: handOffs() - before.h }, { s: 0, h: 0 }, 'nothing signed or handed off');
+    const F = BigInt(String((await f.copy.pool.query<{ n: string }>('SELECT final_block_number::text AS n FROM crosses WHERE bet_hash = $1', [f.bet.toLowerCase()])).rows[0]?.n));
+    assert.ok(F - anchor > 256n && F - found > 256n, `the anchor and the found block more than 256 below F: ${JSON.stringify({ anchor: String(anchor), found: String(found), F: String(F) })}`);
+    const read = stack.proxy.counted
+      .slice(from)
+      .filter((r) => r.method === 'eth_getBlockByNumber' && typeof r.params?.[0] === 'string' && /^0x[0-9a-fA-F]+$/.test(r.params[0] as string) && r.params?.[1] !== true)
+      .map((r) => BigInt(r.params?.[0] as string));
+    assert.ok(read.includes(anchor), "the watermark's anchor, the search's lower anchor, read by number");
+    assert.ok(read.includes(found), 'the block the search found read by number');
+    assert.ok(read.includes(F), "F's own height read again");
+    // The reconciliation shows the watermark's anchor on F's chain before it reads the key's count at F, as its first
+    // read at F after F itself; the search, which reads the same anchor in the same decision, comes after the count.
+    const window = stack.proxy.counted.slice(from);
+    const Fhash = String((await f.copy.pool.query<{ h: string }>('SELECT final_block_hash AS h FROM crosses WHERE bet_hash = $1', [f.bet.toLowerCase()])).rows[0]?.h).toLowerCase();
+    const anchorAt = window.findIndex((r) => r.method === 'eth_getBlockByNumber' && typeof r.params?.[0] === 'string' && /^0x[0-9a-fA-F]+$/.test(r.params[0] as string) && BigInt(r.params[0] as string) === anchor);
+    const countAt = window.findIndex((r) => r.method === 'eth_getTransactionCount' && String((r.params?.[1] as { blockHash?: string } | undefined)?.blockHash).toLowerCase() === Fhash);
+    assert.ok(anchorAt >= 0 && countAt >= 0 && anchorAt < countAt, `the anchor read before the count at F: ${JSON.stringify({ anchorAt, countAt })}`);
+    const hold = await f.copy.pool.query(`SELECT 1 FROM events WHERE kind = 'incident' AND reason = 'RESTORE_SHUT'`);
+    assert.equal(hold.rowCount, 1, 'the hold stands');
+  } finally {
+    await stopAll();
+    await stack.restartCourier({ hooked: true });
+  }
+});

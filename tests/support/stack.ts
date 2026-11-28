@@ -71,6 +71,8 @@ export interface StackOptions {
   genesisTime?: bigint;
   coin?: 'TestCoin' | 'RefusingCoin' | 'FalseCoin';
   blockTime?: number;
+  /** The rig's chain keeps the state at only this many of its latest blocks (tests/support/rig.ts). */
+  keptStates?: number;
   sending?: true;
   /**
    * Why this file's records cannot be held to its sends at the close, in the file's own words. `copies`: its couriers
@@ -87,6 +89,7 @@ export async function startStack(prefix: string, options: StackOptions = {}): Pr
     ...(options.genesisTime === undefined ? {} : { genesisTime: options.genesisTime }),
     ...(options.coin === undefined ? {} : { coin: options.coin }),
     ...(options.blockTime === undefined ? {} : { blockTime: options.blockTime }),
+    ...(options.keptStates === undefined ? {} : { keptStates: options.keptStates }),
   });
   const proxy = await startProxy(rig.url);
   const db = testServer();
