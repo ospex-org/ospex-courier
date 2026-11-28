@@ -357,24 +357,37 @@ are not Polygon's.
 
 ### The catch-up, counted apart
 
-Each grows with the gap it covers, not with the history.
+Catch-up has two different costs: locating missing history can grow with the gap, while the selected
+deep-compatibility check grows with the number of required distinct heights, not their distance below F.
 
-- **A walk of parent hashes past 256 blocks.** A receipt, or the lane's watermark, more than 256 blocks below the final block is
-  shown on its chain by reading the final block's parents by hash down to it, one request a block. Measured after a
-  quiet spell of 300 blocks with no bet (`tests/lane-measured.test.ts`): the next bet's send checks read 304 headers
-  by hash, and the bet after it none, the watermark raised by the bet before. On Polygon's two-second blocks a quiet
-  hour is about 1,800 such reads before the next bet can be sent.
+- **Deep anchors, receipts and found blocks.** A block more than 256 below F is compared with the canonical header at
+  its height, and F's original height/hash is checked again after the decision's evidence. q distinct deep heights
+  require q successful numbered-header reads plus that one final F check. An anchor-only proof therefore needs 2 such
+  reads after either a quiet hour or a quiet day; an old anchor plus a distinct old explaining receipt needs 3. The
+  ordinary pre-check, count, state, receipt and total reads are additional. There is no periodic anchor write and no
+  ancestry work for a quiet day with no unresolved work. These are design counts. Measured
+  (`tests/lane-measured.test.ts`, which holds the count): after a quiet spell of 300 blocks, the next bet's send checks
+  read 3 headers by number, the watermark's anchor's, the last bet's receipt's and the final block's own, none of them
+  twice, and none by hash; the bet after it read none. Measured (`tests/quiet-anchor.test.ts`, which holds the count):
+  with the watermark's anchor 257 blocks below the final block and the last bet's receipt inside the window, the next
+  bet's send checks read 2 headers by number, the anchor's and the final block's own, none of them twice, and none by
+  hash. This method accepts the coherent-provider/finalized-prefix assumption documented in the API and the plan.
+- **The earlier build's result, not a measurement of this design:** at `be80d9b`, the explicit parent walk after a
+  300-block quiet spell caused the next bet's send checks to read 304 headers by hash; the following bet read none,
+  after the watermark advanced. At an illustrative two-second interval, the old algorithm needs about 1,800 ancestry
+  reads after an hour and 43,200 after a day.
 - **The search for what used a nonce:** about log₂ of the gap in blocks for the counts that find the block, then that
-  block in full, then its place on the final block's chain. Measured once, across a gap of 4 blocks, where a restored
-  database's courier finds its intent's transaction (`tests/restore.test.ts`): from its start to the intent settled,
-  3 headers read by height, 6 counts of the key at a header's hash, the start's own among them, and the block found
-  read in full.
+  block in full, then its place on the final block's chain. The earlier build measured it once, across a gap of 4
+  blocks, where a restored database's courier finds its intent's transaction (`tests/restore.test.ts`): from its start
+  to the intent settled, 3 headers read by height, 6 counts of the key at a header's hash, the start's own among them,
+  and the block found read in full.
 - **A backlog of marks:** 200 a pass, at each read of the final block the courier makes anyway.
 - **The first start after a restore:** the count check read from the lane's older watermark; recovery looks again at a
-  gap widening to 30 seconds for as long as the process runs, and writes only what it finds. Measured in the same case:
-  the start, 56 requests to the node (28 `eth_call`, 11 `eth_getCode`, 6 `eth_getBlockByNumber`, 5 `eth_estimateGas`,
-  3 `eth_getTransactionCount`, and one each of `eth_chainId`, `eth_getStorageAt` and `eth_maxPriorityFeePerGas`) and 18
-  commands to the database; then, to the intent settled, 16 requests and 44 commands.
+  gap widening to 30 seconds for as long as the process runs, and writes only what it finds. The earlier build
+  measured it in the same case: the start, 56 requests to the node (28 `eth_call`, 11 `eth_getCode`, 6
+  `eth_getBlockByNumber`, 5 `eth_estimateGas`, 3 `eth_getTransactionCount`, and one each of `eth_chainId`,
+  `eth_getStorageAt` and `eth_maxPriorityFeePerGas`) and 18 commands to the database; then, to the intent settled, 16
+  requests and 44 commands.
 
 ### Idle
 

@@ -394,10 +394,11 @@ export function said(what: string, r: { sent: Sent; target: bigint; ancestry: An
 
 /**
  * A file's cases for one long quiet spell (tests/quiet-41000.test.ts, tests/quiet-day.test.ts): a real earlier Cross;
- * then the spell, `total` empty blocks, mined in steps of `step` blocks, each a case of its own under the ten-minute
- * time-out, in each of which the courier asks the chain nothing and writes nothing; then the bet at 7:12:00 PM. The
- * chain keeps the state at only its latest 1,024 blocks, so that it can grow by a day of blocks inside the cases' time;
- * its blocks and receipts are all kept (tests/support/rig.ts).
+ * then the spell, `total` empty blocks, mined in steps of `step` blocks, each a case of its own, in each of which the
+ * courier asks the chain nothing and writes nothing; then the bet at 7:12:00 PM. The chain keeps the state at only its
+ * latest 1,024 blocks, so that it can grow by a day of blocks as fast as it can; its blocks and receipts are all kept
+ * (tests/support/rig.ts). Even so a file of these takes seven minutes or more, mining alone, so the two run in a
+ * script of their own, one at a time, apart from the suite's whole runs (package.json, test:quiet).
  */
 export function quietSpellCases(prefix: string, what: string, total: number, step: number): void {
   let stack: Stack;

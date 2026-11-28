@@ -4,15 +4,17 @@ import { after, before, test } from 'node:test';
 import pg from 'pg';
 import type { HDAccount } from 'viem/accounts';
 import { closeEach } from './support/close';
-import { orderOn, postOrder, type Order } from './support/orders';
+import type { HookControl } from './support/courier';
+import { crossFromTheTest, orderOn, postOrder, sign, type Order } from './support/orders';
 import { clockFrom, crossOf, finalOf, funded, instant, laneOf, numbered, oneCent, quote, until } from './support/quiet';
 import { startStack, type Stack } from './support/stack';
 
 // The other readers of a block's place on the final block's chain, each with its block more than 256 below F, through
 // the whole courier on the rig: the read again of an expired unmined Cross that the chain mined later, at the next
-// bet's check; the search for what used a nonce, which finds the key's own transaction the records do not hold; and
-// the operator's clear of that hold, which shows the found transaction on F's chain again. Each reads the deep block's
-// header by number, F's own height once more before it writes, and nothing by a walk of parents.
+// bet's check; the search for what used a nonce, which finds the key's own transaction the records do not hold; the
+// operator's clear of that hold, which shows the found transaction on F's chain again; and a ran Cross's H, where
+// another courier had filled part of the bet before the check. Each reads the deep block's header by number, F's own
+// height once more before it writes, and nothing by a walk of parents.
 
 let stack: Stack;
 let pool: pg.Pool;
@@ -94,7 +96,9 @@ test("an expired unmined Cross the chain mined later, its receipt more than 256 
   assert.equal(recorded?.wasExpiredUnmined, true, 'written reverted, as expired unmined before');
   const receiptAt = BigInt(mined.blockNumber);
   assert.ok(BigInt(String(second.cross.proofF)) - receiptAt > 256n, 'its receipt more than 256 below F');
-  assert.ok(readByNumber(from).includes(receiptAt), "its receipt's header read by number");
+  // Read twice by number, each in a decision of its own: by the read again of the expired unmined Cross, and then by
+  // the next proof, where its receipt now explains its nonce.
+  assert.equal(readByNumber(from).filter((n) => n === receiptAt).length, 2, "its receipt's header read by number, by the read again and by the next proof");
   assert.equal(stack.proxy.counted.slice(from).filter((c) => c.method === 'eth_getBlockByHash' && String(c.params?.[0]).toLowerCase() !== String(again?.receipt_block_hash).toLowerCase() && String(c.params?.[0]).toLowerCase() !== String(second.cross.receipt_block_hash).toLowerCase()).length, 0, 'by hash, only the receipts\' own blocks');
 });
 
@@ -153,4 +157,53 @@ test("the search after a quiet spell: the key's own transaction the records do n
   const m2 = await market();
   const sent = await oneCent(stack, pool, m2.B, m2.game);
   assert.equal(sent.cross.state, 'confirmed', JSON.stringify(sent.cross));
+});
+
+test("a Cross whose bet another courier filled in part before its check: its receipt and its check's block H both more than 256 blocks below F at its first look as final; each read by number, and F's own height once more; confirmed, the part filled at H held to the total at F with the receipt's own", async () => {
+  const hooks = stack.courier.hooks as HookControl;
+  await instant(stack);
+  const game = await stack.rig.createGame();
+  const { M, B } = await funded(stack, next);
+  const M1 = stack.rig.account(next + 2);
+  await stack.rig.fund(M1);
+  next += 3;
+  await quote(stack, M, game);
+  await clockFrom(stack);
+  const T = await stack.rig.time();
+  const part: Order = { ...orderOn(stack.rig, M1, { expiry: T + 3_000n, oddsTick: 204, riskAmount: 1_200n, gameId: game }), positionType: 0 };
+  const b: Order = { ...orderOn(stack.rig, B, { expiry: T + 30n, oddsTick: 196, riskAmount: 10_000n, gameId: game }), positionType: 1 };
+  await hooks.arm('after-reservation', 1);
+  await hooks.arm('after-intent', 1);
+  const posted = await postOrder(stack.courier.url, stack.rig, B, 'take', b, { 'x-forwarded-for': '198.18.245.200' });
+  assert.equal(posted.status, 202, JSON.stringify(posted.body));
+  const bet = String(posted.body.orderHash).toLowerCase();
+  const reserved = await hooks.reached('after-reservation');
+  // Another courier's Cross of part of the bet, mined before the check reads H.
+  const other = await crossFromTheTest(stack.rig, { order: b, signature: posted.signature }, [{ order: part, signature: await sign(M1, part, 31337, stack.rig.addresses.matching) }]);
+  assert.equal(other.filled, true, JSON.stringify(other));
+  await hooks.go(reserved);
+  const intent = await hooks.reached('after-intent');
+  // F held at the head while the Cross is signed, sent and mined above it; then 300 blocks; then F one behind the head.
+  stack.proxy.finalFollows(null);
+  stack.proxy.setFinal(await headNow());
+  await hooks.go(intent);
+  await until(stack, () => crossOf(pool, bet), (c) => c?.state === 'pending', 60_000, 'pending above the held final block');
+  const H = (await pool.query<{ n: string; f: string | null }>(`SELECT block_number::text AS n, checked->>'betFilled' AS f FROM crosses WHERE bet_hash = $1`, [bet])).rows[0];
+  assert.ok(H !== undefined && H.f !== null && BigInt(H.f) > 0n, `a part filled at H: ${JSON.stringify(H)}`);
+  await stack.rig.rpc('evm_setIntervalMining', [0]);
+  await stack.rig.rpc('anvil_mine', ['0x12c', '0x2']);
+  await clockFrom(stack);
+  const from = stack.proxy.counted.length;
+  stack.proxy.setFinal(null);
+  stack.proxy.finalFollows(1n);
+  const c = await finalOf(stack, pool, bet);
+  assert.equal(c.state, 'confirmed', JSON.stringify(c));
+  const F = BigInt(String(c.final_block_number));
+  const receipt = BigInt(String(c.receipt_block_number));
+  assert.ok(F - BigInt(H.n) > 256n && F - receipt > 256n, 'H and the receipt both more than 256 below F');
+  const read = readByNumber(from);
+  assert.ok(read.includes(receipt), "the receipt's header read by number");
+  assert.ok(read.includes(BigInt(H.n)), "H's header read by number");
+  assert.ok(read.includes(F), "F's own height read again");
+  assert.equal(c.hand_offs, 1, 'one hand-off');
 });

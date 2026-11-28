@@ -98,9 +98,11 @@ test("the nonce proof's last check of F fails: after its deep reads, F's own hei
     assert.equal(posted.status, 202, JSON.stringify(posted.body));
     bet = String(posted.body.orderHash).toLowerCase();
     await hooks().go(await hooks().reached('before-result'));
+    // The first proof's end: its last check answered another block, or, where none was made, the bet went on to a Cross.
+    await until(stack, async () => rule.changed.length > 0 || (await crossOf(pool, bet).then((c) => c?.state ?? null)) !== null, (v) => v, 60_000, 'the first proof at its end');
+    assert.equal(rule.changed.length, 1, "F's own height answered another block, once");
     // The second check's result: the first proof has run and been set aside by then.
     const second = await hooks().reached('before-result');
-    assert.equal(rule.changed.length, 1, "F's own height answered another block, once");
     assert.ok(stack.courier.lines.some((l) => /cannot be compared with the records yet \(the final block's own height, read again, holds another block\)/.test(l)), stack.courier.lines.slice(-6).join(' | '));
     assert.equal(await crossOf(pool, bet).then((c) => c?.state ?? null), null, 'no intent from the set-aside proof');
     assert.equal(hooks().signed.length, signedBefore, 'no signature');
@@ -179,7 +181,15 @@ test("a watermark anchored more than 256 blocks down under a hash that is not th
     const posted = await postOrder(stack.courier.url, stack.rig, B, 'take', b, { 'x-forwarded-for': '198.18.246.3' });
     assert.equal(posted.status, 202, JSON.stringify(posted.body));
     const bet = String(posted.body.orderHash).toLowerCase();
-    const state = await until(stack, async () => (await pool.query<{ bet_state: string }>('SELECT bet_state FROM orders WHERE hash = $1', [bet])).rows[0]?.bet_state, (s) => s === 'lapsed' || s === 'refused', 90_000, 'the bet at its end');
+    // The bet's end here: lapsed or refused at its turn, or, where its proof went on, a Cross.
+    const end = await until(
+      stack,
+      async () => ({ state: (await pool.query<{ bet_state: string }>('SELECT bet_state FROM orders WHERE hash = $1', [bet])).rows[0]?.bet_state, cross: (await crossOf(pool, bet))?.state ?? null }),
+      (v) => v.state === 'lapsed' || v.state === 'refused' || v.cross !== null,
+      90_000,
+      'the bet at its end',
+    );
+    const state = end.state;
     assert.equal(state, 'lapsed', 'lapsed at its turn');
     assert.ok(stack.courier.lines.some((l) => /the watermark's anchor is not shown on the final block's chain/.test(l)), 'not comparable, for the anchor');
     assert.equal(await crossOf(pool, bet).then((c) => c?.state ?? null), null, 'no Cross');
