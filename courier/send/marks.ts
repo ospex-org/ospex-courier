@@ -7,7 +7,7 @@ import type { ChainReader } from '../chain/snapshot';
 import { lockKey } from '../orders/door';
 import { quoteEnd } from '../orders/standing';
 import { inLockOrder } from '../orders/stops';
-import { BLOCKHASH_WINDOW, onFinalChain } from './chain';
+import { BLOCKHASH_WINDOW, decisionAt, onFinalChain } from './chain';
 
 // The marks, read again at the final block. A quote marked ended at a block
 // that was not yet final can be marked at a block that is later orphaned, and
@@ -59,9 +59,10 @@ export async function repairMarks(deps: MarksDeps, F: Header): Promise<Repaired>
     [F.number.toString(), MARKS_PER_PASS],
   );
   if (rows.length === 0) return out;
-  // The heights within the window: shown on F's chain, or not. Further back: read at F.
+  // The heights within the window: shown on F's chain, or not. Further back: read at F. No header is read by number
+  // here, so this decision has no last check of F to make.
   const windowed = rows.filter((r) => F.number - BigInt(r.ended_block) <= BLOCKHASH_WINDOW);
-  const shown = windowed.length === 0 ? [] : await onFinalChain(deps.chain, deps.rpc, F, windowed.map((r) => ({ number: BigInt(r.ended_block), hash: r.ended_block_hash })));
+  const shown = windowed.length === 0 ? [] : await onFinalChain(deps.chain, deps.rpc, decisionAt(F), windowed.map((r) => ({ number: BigInt(r.ended_block), hash: r.ended_block_hash })));
   const final = windowed.filter((_, i) => shown[i] === true);
   const orphaned = rows.filter((r) => !final.includes(r));
   if (final.length > 0) {

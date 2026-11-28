@@ -3,7 +3,7 @@ import { blockWithTransactions, byHash, headerByNumber, receiptOf, transactionCo
 import type { BettingSet } from '../chain/set';
 import { ChainUnreachable, type ChainReader } from '../chain/snapshot';
 import type { CrossRow } from '../records/crosses';
-import { filledAtF, onFinalChain, readCrossReceipt, type CrossReceipt, type Named } from './chain';
+import { decisionAt, filledAtF, onFinalChain, readCrossReceipt, type CrossReceipt, type Decision, type Named } from './chain';
 
 // The outcome of a Cross, from the chain and from nothing else. Each look
 // reads, in this order: the final block F by the tag, and from then on by its
@@ -15,6 +15,9 @@ import { filledAtF, onFinalChain, readCrossReceipt, type CrossReceipt, type Name
 // before; no receipt with the nonce used at F is the search for what used it.
 // Nothing here is written; the lane writes what a look decides. A read that
 // fails twice is a transient: the look says what it could not read, at which F.
+// Each look is one decision at its F, returned with it: where the look read a
+// block's header by number, its writer reads F's own height again before it
+// writes anything the look decided (./chain.ts).
 
 export interface OutcomeDeps {
   chain: ChainReader;
@@ -70,6 +73,9 @@ export type Look =
   /** The second reads disagree with the receipt: a contradiction, never a transient. */
   | { kind: 'contradiction'; F: Header; facts: Record<string, unknown> };
 
+/** A look, with the decision it made at its F: what its writer holds to a last check of F before it writes. */
+export type Looked = Look & { decision: Decision };
+
 /** The bet's filled amount at F alone, or with each quote's: one multicall at F by its hash. */
 async function filled(deps: OutcomeDeps, F: Header, bet: Hex, quotes: readonly Hex[]): Promise<{ bet: bigint; quotes: Map<string, bigint> }> {
   const m = await filledAtF(deps.chain, deps.set, F, [bet, ...quotes]);
@@ -80,14 +86,16 @@ async function filled(deps: OutcomeDeps, F: Header, bet: Hex, quotes: readonly H
  * The search for what used a nonce at F, where no receipt is found: the block where the key's count passed the
  * nonce, by halving the gap from the recorded height at which the nonce was unused; that block in full, for the one
  * transaction from this key at this nonce; and that block shown on F's chain. About log₂ of the gap in reads, and a
- * hold where a historical read is unavailable: no replacement is guessed.
+ * hold where a historical read is unavailable: no replacement is guessed. Its reads are part of the caller's decision
+ * at F, and fall under that decision's last check.
  */
-export async function searchNonce(deps: OutcomeDeps, F: Header, nonce: bigint, unusedAt: Named | null): Promise<{ found: { hash: Hex; block: Named }; reads: number } | { missing: string; reads: number }> {
+export async function searchNonce(deps: OutcomeDeps, decision: Decision, nonce: bigint, unusedAt: Named | null): Promise<{ found: { hash: Hex; block: Named }; reads: number } | { missing: string; reads: number }> {
+  const F = decision.F;
   let reads = 0;
   if (unusedAt === null) return { missing: 'no recorded height at which the nonce was unused', reads };
   if (unusedAt.number >= F.number) return { missing: 'the recorded height at which the nonce was unused is not below the final block', reads };
   try {
-    const [anchorShown] = await onFinalChain(deps.chain, deps.rpc, F, [unusedAt]);
+    const [anchorShown] = await onFinalChain(deps.chain, deps.rpc, decision, [unusedAt]);
     reads++;
     if (anchorShown !== true) return { missing: "the recorded height at which the nonce was unused is not on the final block's chain", reads };
     let lo = unusedAt.number;
@@ -108,7 +116,7 @@ export async function searchNonce(deps: OutcomeDeps, F: Header, nonce: bigint, u
     const tx = block.transactions.find((t) => t.from.toLowerCase() === deps.key.toLowerCase() && t.nonce === nonce);
     if (tx === undefined) return { missing: `the block at height ${hi} holds no transaction from the key at nonce ${nonce}`, reads };
     const named = { number: block.header.number, hash: block.header.hash };
-    const [shown] = await onFinalChain(deps.chain, deps.rpc, F, [named]);
+    const [shown] = await onFinalChain(deps.chain, deps.rpc, decision, [named]);
     reads++;
     if (shown !== true) return { missing: `the block at height ${hi} is not shown on the final block's chain`, reads };
     return { found: { hash: tx.hash, block: named }, reads };
@@ -131,9 +139,17 @@ export function unusedAtOf(cross: CrossRow): Named | null {
  * reads of a ran Cross. `lastF` is the highest F this process has read for it. `ours` names the courier's own
  * transactions the records hold at this nonce, by hash, for the search.
  */
-export async function look(deps: OutcomeDeps, cross: CrossRow, expected: Expected, lastF: Header | null, ours: ReadonlyMap<string, Hex>): Promise<Look> {
+export async function look(deps: OutcomeDeps, cross: CrossRow, expected: Expected, lastF: Header | null, ours: ReadonlyMap<string, Hex>): Promise<Looked> {
   if (cross.txHash === null || cross.nonce === null) throw new Error('a Cross is looked at only from its signed record on');
   const F = await deps.chain.finalHeader();
+  const decision = decisionAt(F);
+  return { ...(await lookAt(deps, decision, cross, expected, lastF, ours)), decision };
+}
+
+/** The look's reads and its table, at the decision's F. */
+async function lookAt(deps: OutcomeDeps, decision: Decision, cross: CrossRow, expected: Expected, lastF: Header | null, ours: ReadonlyMap<string, Hex>): Promise<Look> {
+  const F = decision.F;
+  if (cross.txHash === null || cross.nonce === null) throw new Error('a Cross is looked at only from its signed record on');
   if (lastF !== null && F.number < lastF.number) return { kind: 'not comparable', F, facts: { why: 'the final block is lower than one already read', final: finalFacts(F), last: finalFacts(lastF) } };
   try {
     const count = await deps.chain.ask(F, () => transactionCountAt(deps.rpc, deps.key, byHash(F.hash)));
@@ -141,10 +157,10 @@ export async function look(deps: OutcomeDeps, cross: CrossRow, expected: Expecte
     if (receipt !== null) {
       if (receipt.transactionHash.toLowerCase() !== cross.txHash.toLowerCase()) return { kind: 'contradiction', F, facts: { why: 'the receipt is of another transaction', final: finalFacts(F), asked: cross.txHash, got: receipt.transactionHash } };
       if (receipt.blockNumber > F.number) return { kind: 'pending', F, receipt };
-      const [shown] = await onFinalChain(deps.chain, deps.rpc, F, [{ number: receipt.blockNumber, hash: receipt.blockHash }]);
+      const [shown] = await onFinalChain(deps.chain, deps.rpc, decision, [{ number: receipt.blockNumber, hash: receipt.blockHash }]);
       if (shown !== true) return { kind: 'orphan', F, receipt };
       // Awaited here, so that a second read at F that fails twice is caught below as what it is: unavailable.
-      return await ran(deps, F, cross, expected, receipt, count);
+      return await ran(deps, decision, cross, expected, receipt, count);
     }
     if (count <= cross.nonce) {
       if (F.timestamp < expected.expiry) return { kind: 'nothing yet', F };
@@ -152,7 +168,7 @@ export async function look(deps: OutcomeDeps, cross: CrossRow, expected: Expecte
       return { kind: 'expired unmined', F, betFilled: f.bet };
     }
     // The nonce used at F, and no receipt: the search.
-    const found = await searchNonce(deps, F, cross.nonce, unusedAtOf(cross));
+    const found = await searchNonce(deps, decision, cross.nonce, unusedAtOf(cross));
     if ('missing' in found) return { kind: 'unavailable', F, missing: found.missing, facts: { search: 'unanswered', reads: found.reads, nonce: s(cross.nonce), countAtFinal: s(count) } };
     if (found.found.hash.toLowerCase() === cross.txHash.toLowerCase()) return { kind: 'missing receipt', F, block: found.found.block, reads: found.reads };
     const f = await filled(deps, F, expected.betHash, []);
@@ -166,9 +182,10 @@ export async function look(deps: OutcomeDeps, cross: CrossRow, expected: Expecte
 /**
  * The second reads of a ran Cross, held against the chain's own state at the same F, and the record from the receipt's
  * module events. The settling's look makes them, and so does recovery for a retained intent whose transaction the
- * search found.
+ * search found, each inside its own decision at F.
  */
-export async function ran(deps: OutcomeDeps, F: Header, cross: CrossRow, expected: Expected, receipt: Receipt, count: bigint): Promise<Look> {
+export async function ran(deps: OutcomeDeps, decision: Decision, cross: CrossRow, expected: Expected, receipt: Receipt, count: bigint): Promise<Look> {
+  const F = decision.F;
   const base = { final: finalFacts(F), receipt: { number: s(receipt.blockNumber), hash: receipt.blockHash }, txHash: receipt.transactionHash };
   if (count <= (cross.nonce as bigint)) return { kind: 'contradiction', F, facts: { ...base, why: "the key's count at the final block is not above the Cross's nonce", countAtFinal: s(count), nonce: s(cross.nonce as bigint) } };
   if (receipt.from.toLowerCase() !== deps.key.toLowerCase() || receipt.to === null || receipt.to.toLowerCase() !== deps.set.relay.toLowerCase()) {
@@ -191,7 +208,7 @@ export async function ran(deps: OutcomeDeps, F: Header, cross: CrossRow, expecte
   let baseline = 0n;
   // Nothing filled at H adds nothing, wherever H stands: its place on F's chain is read only where there is an amount to add.
   if (expected.atH !== null && expected.atH.betFilled > 0n) {
-    const [hShown] = await onFinalChain(deps.chain, deps.rpc, F, [expected.atH.block]);
+    const [hShown] = await onFinalChain(deps.chain, deps.rpc, decision, [expected.atH.block]);
     if (hShown === true) baseline = expected.atH.betFilled;
   }
   if (f.bet < record.crossed.totalTakerRisk + baseline) {

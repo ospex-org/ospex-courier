@@ -10,7 +10,7 @@ import { firstWaitingBet, type OrderRow } from '../records/orders';
 import { free, holdBet, lockBet, lockLane, lockLaneToReserve, otherOpenCrosses, putBack, raiseWatermark, readLane, reserve, restoreHold, setBetState, shareLane, shutLane, take, type LaneRow, type Taken } from '../records/lanes';
 import type { Run } from '../records/runs';
 import { failureCode, type Store } from '../records/store';
-import { onFinalChain, type Named } from '../send/chain';
+import { decisionAt, onFinalChain, stillFinal, type Named } from '../send/chain';
 import { searchNonce } from '../send/outcome';
 import { repairMarks } from '../send/marks';
 import { reconcileRestored, unresolvedWaiting } from '../send/recovery';
@@ -413,7 +413,9 @@ export function createLane(deps: LaneDeps): Lane {
 
   /**
    * The nonce proof's reads and its decision: the lane's row, the key's Crosses, and the blocks the proof needs shown
-   * on F's chain, read at F by its hash. The decision is the proof's; nothing here is written.
+   * on F's chain, read at F. Where one of them was read by number, F's own height is read again after them, the
+   * proof's last read of the chain, and another block there discards the proof: the lane holds and reads again, as at
+   * an F not yet comparable. The decision is the proof's; nothing here is written.
    */
   async function nonceProof(c: ReadyCross): Promise<{ proof: NonceProof | null; lane: LaneRow }> {
     const { client, done } = await laneClient(store.lane);
@@ -429,8 +431,12 @@ export function createLane(deps: LaneDeps): Lane {
     // The lane not shut, first: a shut lane reads nothing more.
     if (lane.shutLine !== null) return { proof: null, lane };
     const F = c.send.final;
+    const decision = decisionAt(F);
     const toShow = blocksToShow(F, lane.watermark, crosses);
-    const shown = toShow.length === 0 ? [] : await onFinalChain(deps.check.chain, deps.check.rpc, F, toShow);
+    const shown = toShow.length === 0 ? [] : await onFinalChain(deps.check.chain, deps.check.rpc, decision, toShow);
+    if (!(await stillFinal(deps.check.chain, deps.check.rpc, decision))) {
+      return { proof: { kind: 'not comparable', facts: { final: { number: F.number.toString(), hash: F.hash }, why: "the final block's own height, read again, holds another block" } }, lane };
+    }
     const onF = new Map(toShow.map((b, i) => [b.hash.toLowerCase(), shown[i] as boolean | 'not comparable']));
     return { proof: proveNonce({ F, countAtFinal: c.send.countAtFinal, countAtH: c.nonce, watermark: lane.watermark, crosses, onF }), lane };
   }
@@ -442,7 +448,9 @@ export function createLane(deps: LaneDeps): Lane {
    * signed.
    */
   async function shutForNonce(res: Reserved, facts: Record<string, unknown>, F: Header, nonce: bigint, unusedAt: Named | null): Promise<Carried> {
-    const hit = await searchNonce({ chain: deps.check.chain, rpc: deps.check.rpc, set: deps.check.set, key }, F, nonce, unusedAt);
+    // The search, a decision of its own at F. What it found goes on the hold's line; the hold grants nothing, and is not
+    // held back for a last check of F.
+    const hit = await searchNonce({ chain: deps.check.chain, rpc: deps.check.rpc, set: deps.check.set, key }, decisionAt(F), nonce, unusedAt);
     const found = 'missing' in hit ? { found: 'the node could not answer', missing: hit.missing } : { found: { hash: hit.found.hash, block: { number: hit.found.block.number.toString(), hash: hit.found.block.hash } } };
     const { line: opened } = await store.conditions.raise('cross-unreconciled', { lane: key, why: "the key's nonce was used at a final block and nothing the records hold explains it", ...facts, ...found, searchReads: hit.reads }, run.id);
     const { client, done } = await laneClient(store.lane);

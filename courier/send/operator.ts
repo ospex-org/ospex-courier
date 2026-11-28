@@ -7,7 +7,7 @@ import { ChainUnreachable, type ChainReader } from '../chain/snapshot';
 import { crossesOfKey } from '../records/crosses';
 import { lockLane, raiseWatermark, readLane, restoreHold } from '../records/lanes';
 import type { Store } from '../records/store';
-import { onFinalChain } from './chain';
+import { decisionAt, onFinalChain, stillFinal } from './chain';
 import { blocksToShow, explainingBlock } from './checks';
 import { searchNonce } from './outcome';
 
@@ -27,7 +27,10 @@ import { searchNonce } from './outcome';
 // below the key's count at a compatible final block is explained, by the
 // records or by a transaction this step shows on that block's chain and
 // records. It refuses a lane shut at a restore, whatever the final block shows
-// and however complete the nonce account. Nothing clears by time.
+// and however complete the nonce account. Nothing clears by time. Where its
+// reads took a block's header by number, the final block's own height is read
+// again after them and before the clear is written; another block there clears
+// nothing.
 
 export interface OperatorDeps {
   store: Store;
@@ -120,9 +123,10 @@ export async function clearLane(deps: OperatorDeps, lane: Address, found: string
   let F: Header;
   try {
     F = await deps.chain.finalHeader();
+    const decision = decisionAt(F);
     const crosses = await crossesOfKey(deps.store.pool, lane, row.watermark.to);
     const toShow = blocksToShow(F, row.watermark, crosses);
-    const shown = toShow.length === 0 ? [] : await onFinalChain(deps.chain, deps.rpc, F, toShow);
+    const shown = toShow.length === 0 ? [] : await onFinalChain(deps.chain, deps.rpc, decision, toShow);
     const onF = new Map(toShow.map((b, i) => [b.hash.toLowerCase(), shown[i]]));
     if (row.watermark.anchor !== null && (F.number < row.watermark.anchor.number || onF.get(row.watermark.anchor.hash.toLowerCase()) !== true)) {
       return { cleared: false, why: "the final block is not compatible with the lane's watermark: read again at a later one" };
@@ -136,10 +140,11 @@ export async function clearLane(deps: OperatorDeps, lane: Address, found: string
     const bySearch: Array<{ nonce: string; txHash: Hex; block: { number: string; hash: Hex } }> = [];
     for (let n = row.watermark.to; n < count; n++) {
       if (explained.has(n)) continue;
-      const hit = await searchNonce({ chain: deps.chain, rpc: deps.rpc, set: deps.set, key: lane }, F, n, row.watermark.anchor);
+      const hit = await searchNonce({ chain: deps.chain, rpc: deps.rpc, set: deps.set, key: lane }, decision, n, row.watermark.anchor);
       if ('missing' in hit) return { cleared: false, why: `nonce ${n} is not explained: ${hit.missing}` };
       bySearch.push({ nonce: s(n), txHash: hit.found.hash, block: { number: s(hit.found.block.number), hash: hit.found.block.hash } });
     }
+    if (!(await stillFinal(deps.chain, deps.rpc, decision))) return { cleared: false, why: "the final block's own height, read again, holds another block: run it again" };
     const run = deps.run;
     {
       const client = await deps.store.lane.connect();
