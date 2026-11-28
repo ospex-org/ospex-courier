@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
+import { appendFileSync } from 'node:fs';
 import pg from 'pg';
 import { applySchema, openPool } from '../../courier/records/store';
 
 // The test Postgres: TEST_DATABASE_URL names a server on this machine (CI
 // starts one). Each test file creates its own databases there and drops them.
+// Where TEST_DATABASE_NAMES_FILE names a file, each database's name is
+// written to it, one a line, as the database is made: what a run made is on
+// record, whatever its close did.
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
 
@@ -29,6 +33,8 @@ export function testServer() {
       const name = `${prefix}_${randomBytes(5).toString('hex')}`;
       await admin.query(`CREATE DATABASE ${name}`);
       created.push(name);
+      const names = process.env.TEST_DATABASE_NAMES_FILE;
+      if (names !== undefined && names !== '') appendFileSync(names, `${name}\n`, 'utf8');
       return name;
     },
     /** A new database with db/schema.sql applied, and its URL. */
@@ -49,15 +55,22 @@ export function testServer() {
      * then would cut one still closing, so wait until the server shows none.
      */
     async end() {
+      // Each database's drop in its own try: one that fails does not keep the others, or the pool's end, from running.
+      const failures: unknown[] = [];
       for (const name of created) {
-        for (let i = 0; i < 100; i++) {
-          const { rows } = await admin.query('SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = $1', [name]);
-          if ((rows[0] as { n: number }).n === 0) break;
-          await new Promise((r) => setTimeout(r, 50));
+        try {
+          for (let i = 0; i < 100; i++) {
+            const { rows } = await admin.query('SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = $1', [name]);
+            if ((rows[0] as { n: number }).n === 0) break;
+            await new Promise((r) => setTimeout(r, 50));
+          }
+          await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+        } catch (err) {
+          failures.push(err);
         }
-        await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
       }
       await admin.end();
+      if (failures.length > 0) throw failures[0];
     },
   };
 }

@@ -38,6 +38,7 @@ import {
   type Order,
 } from './support/orders';
 import type { Rig } from './support/rig';
+import { closeEach } from './support/close';
 import { publishedList, startStack, type Stack } from './support/stack';
 
 // The door, from a user's side: signed orders posted over HTTP to the courier
@@ -51,14 +52,13 @@ let pool: pg.Pool;
 
 before(async () => {
   stack = await startStack('orders');
+  // The final block follows the head: a ready bet is now sent, and its Cross settles once a final block holds it.
+  stack.proxy.finalFollows(0n);
   rig = stack.rig;
   pool = openPool(stack.databaseUrl, null);
 });
 
-after(async () => {
-  await pool?.end();
-  await stack?.close();
-});
+after(() => closeEach(() => pool?.end(), () => stack?.close()));
 
 const url = () => stack.courier.url;
 
@@ -507,7 +507,7 @@ test("the order's standing on chain: cancelled is CANCELLED; a nonce under the a
   const refusedLines = await lines(`WHERE kind = 'order refused' AND reason IN ('CANCELLED', 'EXPIRED')`);
   assert.ok(refusedLines.length >= 3, 'each admitted refusal is a line');
 
-  // Filled: one Cross sent by the test, from the relay's sender, fills a quote whole; the quote is then FILLED at the door.
+  // Filled: one Cross sent by the test, through another courier, fills a quote whole; the quote is then FILLED at the door.
   T = await rig.time();
   const quote = orderOn(rig, maker, { expiry: T + 600n, oddsTick: 200, riskAmount: 10_000n, scorer: rig.addresses.spread, lineTicks: -55 });
   const bet: Order = { ...orderOn(rig, taker, { expiry: T + 20n, oddsTick: 200, riskAmount: 10_000n, scorer: rig.addresses.spread, lineTicks: -55 }), positionType: 1 };
@@ -1214,7 +1214,7 @@ test("an agent's order at the door: signed by its grant's agent within the cap a
   assert.equal(over.body.stakeCap, cap.toString());
 
   // The controls. On the listed line the other account's grant admits; and the admitted order fills: one Cross sent by
-  // the test from the relay's sender, the agent's signature on the quote.
+  // the test through another courier, the agent's signature on the quote.
   const onList = await sendOrderAs(url(), rig, agent, 'rest', under(listed, gListed));
   assert.equal(onList.status, 201, `the line the grant names: ${JSON.stringify(onList.body)}`);
   const fills = under(owner, g);

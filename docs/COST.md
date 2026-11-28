@@ -3,7 +3,9 @@
 What one request to the book costs the database, measured against the three books the plan names, two of them at
 two sizes, each in two maintenance states; and the orders table's maintenance settings, chosen with the figures in
 view. Then what one bet's check costs: its requests to the node and its commands to the database, counted by path,
-and its candidate statement, measured on the same books ("A bet's check", below).
+and its candidate statement, measured on the same books ("A bet's check", below). Then what a sent bet costs: its
+requests and commands end to end, the sender's own statements measured, the lane measured with twenty bets at once,
+and the catch-up counted apart ("A sent bet", below).
 The statement measured is the one the courier runs (`SCAN_SQL` in `courier/records/orders.ts`): the book's index
 walked in its order for one side of one market, at most 2,000 rows returned, the expired among them marked where the
 final block's time plus one has reached their expiry, the live among them passed. The test is `tests/cost.test.ts`;
@@ -156,10 +158,10 @@ pass through in the tests (`tests/lane.test.ts`, "the cost, in commands to the d
 | The candidate statement | 1 | the design |
 | The marks | 0 or 1 | the design |
 | An outcome: a lapse or a refusal | 7: `BEGIN`, the lane's lock, the bet read again, the line, the bet's state, the lane freed, `COMMIT` | the lane's cost case |
-| An outcome: ready | 9, with the Cross and its legs in one insert | the design |
+| A ready bet's check, to its result | as the ready path above; its send and its outcome are counted below ("A sent bet") | the design |
 
-With the door's, about 19 for a bet, the ordinary path in all is about 33 for a lapse, 34 for a refusal at read A,
-and 44 to 48 for a ready bet. Each attempt lost to a stop adds 5. A second round adds its own requests' bookkeeping,
+With the door's, about 19 for a bet, the ordinary path in all is about 33 for a lapse and 34 for a refusal at read A.
+A ready bet goes on to its send, counted below. Each attempt lost to a stop adds 5. A second round adds its own requests' bookkeeping,
 one candidate statement and 0 or 1 marks.
 
 ### The candidate statement, measured
@@ -192,6 +194,192 @@ reported and held to nothing, as the scan's are.
 
 Nothing. With no request, an hour of blocks writes no row and no line and makes no request to the node (the lane's
 idle case).
+
+## A sent bet
+
+What one sent bet costs, beside the check's figures above: its requests to the node, its commands to the database,
+the sender's own statements measured as the book's scan is, the lane measured with twenty bets at once, and the
+catch-up counted apart. Every figure here is the local chain's and this machine's: the rig runs the pinned Foundry's
+anvil (1.6.0-nightly on this machine, v1.10.0 in CI), whose gas schedule predates Polygon's Chicago fork, so no gas or
+POL figure below is Polygon's, and none is a figure the courier acts on. The first real bets record what was paid.
+
+### One bet, end to end
+
+Counted at the proxy and at the database's relay, from the bet's post to its Cross `confirmed`, on the rig's
+two-second clock with the final block one behind the head (`tests/userside.test.ts`, "one bet end to end").
+
+| | measured | the design's estimate |
+| -- | -- | -- |
+| Requests to the node | 30: `eth_getBlockByNumber` 8, `eth_call` 8, `eth_getTransactionCount` 6, `eth_getTransactionReceipt` 4, `eth_estimateGas` 1, `eth_maxPriorityFeePerGas` 1, `eth_sendRawTransaction` 1, `eth_getBlockByHash` 1 | 20 to 31 |
+| Commands to the database | 154 | 75 to 95 |
+| Signatures, hand-offs | 1, 1 | 1, 1 |
+
+The database's count is above the design's estimate, and is reported as measured; it includes the door, the check, the
+send's steps, each look's reads while the Cross was not yet final, and the outcome.
+
+### The check's own path, and the sender's reads in it
+
+A ready bet's check, counted from its reservation to its result, before any step of the send: 10 requests in the
+lane's cost case, inside the check's 9 to 12 above. Beside them the check now makes the sender's two reads, the key's
+count at the final block and the tip, held to exactly one of each by method (`tests/lane.test.ts`,
+`tests/precheck.test.ts`). The send's own checks then show the lane's watermark on the final block's chain: no request
+where its anchor is the final block itself, one call at the final block within 256 blocks of it, and a walk below that
+(the catch-up, below).
+
+### The sender's statements, measured
+
+Each from its own `EXPLAIN (ANALYZE, BUFFERS)`, the scan nodes' shared buffer accesses added, on a key's history of
+1,000 and of 100,000 confirmed Crosses, with four lines each and a lane shut by a line (`tests/cost-sender.test.ts`).
+
+| statement | 1,000 Crosses | 100,000 Crosses | how |
+| -- | -- | -- | -- |
+| The nonce proof's read, the key's Crosses from the lane's watermark up | 2 | 3 | `crosses_sender_nonce` |
+| A nonce's Crosses (a replacement's fees, a search's find) | 3 | 4 | `crosses_sender_nonce` |
+| The restore's hold | 1 | 1 | `events_restore_shut`, index only: empty on a database never restored |
+| The reservation's lock statement, with the drain and the hold | 5 | 5 | the lanes, which are few, and `events_restore_shut` |
+| The gate's read of the stops on the hashes it locked | 3 | 4 | `orders_pkey`, and the stops |
+
+The index `crosses_sender_nonce` is two levels deep at 100,000 and one at 1,000; each figure stays within one page a
+level of it, and the test holds them there.
+
+The marks waiting for the final block: one pass reads at most 200 of a backlog of 10,000 among 100,000 quotes, 20
+buffers, through the partial index `orders_marks_not_final`.
+
+### One sent bet's statements, on the three books
+
+Every statement the courier's own sessions run for one sent bet, from its post to its outcome and the outcome's marks,
+each from its own `EXPLAIN (ANALYZE, BUFFERS)`, made by the database's `auto_explain` as the statement runs, on the
+book scan's three books, each in a market of its own: ten live quotes; 50,000 and 500,000 orders ended by the mark,
+ahead of ten live quotes; and 50,000 and 500,000 expired quotes not yet marked, behind the bet's live quote
+(`tests/cost-sent.test.ts`, `tests/cost-sent-ended.test.ts`). Ahead of its live quote, as the book scan's figures lay it, the backlog leaves no bet to
+send: the check meets the bound of 2,000 rows first, and refuses the bet there. Each book is measured before vacuum,
+with the dead versions its marking leaves, and after `VACUUM`; the backlog also with the final block held behind its
+expiry while the bet is checked. Buffers: all the statements' shared buffer accesses, a statement's largest call each,
+and in brackets their scans' alone, the book scan's measure.
+
+| book | size | state | statements, calls | buffers (scans) | candidate statement | outcome's marks | nonce's floor | marks' read |
+| -- | -- | -- | -- | -- | -- | -- | -- | -- |
+| ten live quotes | 10 | before vacuum | 45, 116 | 523 (98) | 12 (3) | 12 (4) | 2 (2) | 4 (1) |
+| | 10 | after vacuum | 45, 118 | 373 (47) | 3 (3) | 10 (2) | 1 (1) | 1 (1) |
+| ended by the mark, ahead of ten live quotes | 50,000 | before vacuum, 50,000 dead planted | 45, 117 | 6,366 (5,939) | 5,848 (5,842) | 21 (8) | 1 (1) | 1 (1) |
+| | 50,000 | after vacuum | 45, 118 | 460 (97) | 8 (8) | 20 (8) | 2 (2) | 1 (1) |
+| | 500,000 | before vacuum, 500,000 dead planted | 45, 117 | 58,908 (58,449) | 58,346 (58,340) | 26 (10) | 2 (2) | 1 (1) |
+| | 500,000 | after vacuum | 45, 118 | 481 (104) | 4 (4) | 28 (10) | 2 (2) | 1 (1) |
+| expired, not yet marked, behind the bet's live quote | 50,000 | the final block held behind them: nothing marked | 45, 117 | 797 (303) | 195 (189) | 24 (8) | 3 (3) | 1 (1) |
+| | 50,000 | the final block past them, before vacuum: 1,999 marked | 45, 118 | 41,064 (16,280) | 40,608 (16,175) | 20 (8) | 4 (4) | 1 (1) |
+| | 50,000 | after vacuum: the next 1,999 marked | 45, 118 | 43,248 (16,281) | 42,761 (16,180) | 20 (8) | 4 (4) | 1 (1) |
+| | 500,000 | held behind | 45, 117 | 816 (316) | 200 (191) | 29 (10) | 4 (4) | 1 (1) |
+| | 500,000 | past, before vacuum | 45, 118 | 49,096 (20,290) | 48,603 (20,172) | 22 (10) | 4 (4) | 1 (1) |
+| | 500,000 | after vacuum | 45, 118 | 51,280 (20,289) | 50,769 (20,180) | 27 (10) | 4 (4) | 1 (1) |
+
+What the figures show:
+
+- **Dead versions before vacuum.** The bet's own scan is the first to meet the dead entries the mark left, so it reads
+  each one's page: 5,848 buffers at 50,000 and 58,346 at 500,000. The book scan's figures above, 1,253 and 12,504, are
+  taken after an earlier scan has marked those entries dead. After vacuum, 8 and 4.
+- **A request that marks the bound.** Where the final block has passed the backlog, the candidate statement marks the
+  1,999 quotes its page returned, and its own writes are most of the bet's work: 40,608 to 50,769 buffers in all, about
+  20 a quote marked, of which its scans are 16,175 to 20,180. Its scans walk the primary key twice a quote marked, once
+  to lock it and once to write it, so at 500,000, a level deeper, they read 4,000 more. The book scan's figures above
+  count its scan node alone.
+- **The rest stays small.** The outcome's marks, the nonce's floor and the marks' read stay within a few buffers at
+  every size and in both states.
+- **The planner's choice at 50,000.** At 50,000 the planner may lock the quotes a page marks by reading the table
+  whole, where that costs less than walking the primary key a quote at a time: one run read 50,005 rows in 3,334
+  buffers that way, and another walked the key. At 500,000 it walks the key, and the test holds that no statement there
+  reads more of the table by a sequential scan than the bound of 2,000 rows.
+
+After vacuum, the test holds each statement that reads the orders table and is planned the same way at both sizes to
+its figure at 50,000, within one page a level of each index for each of the plan's loops over that index. A write's own
+accesses (the heap's free space, index entries, page splits) are reported and not held to that. The gate's lookup of
+stopped hashes is held to a budget of its own instead (below).
+
+The table above was measured before the large books held stops.
+
+### The gate's lookup of stopped hashes
+
+Just before the hand-off, under the hash locks a stop takes, the courier reads whether any of the Cross's hashes is
+stopped: the bet's and each listed quote's (`courier/check/lane.ts`). It is one statement with two reads: the orders
+the hashes name that a stop has marked, by the orders table's primary key, and the stops' rows for those hashes, by
+the stops table's primary key. A stop is kept for good, so a live courier's stops table is never empty, and only grows.
+
+So the large books hold stops too: as many as each book's laid orders, under one stop message, their hashes spread over
+a hash's whole range, so that the bet's and its quote's fall among them (`tests/support/sentcost.ts`). The plan is the
+same in every book, size and state: one index scan of the orders' primary key and one index-only scan of the stops'
+primary key, each run once. Each makes one search of its index for each leaf page its keys fall on: with a bet and one
+quote, two keys, at most two searches of each. The stops' index is two levels deep at 50,000 and at 500,000 stops.
+
+Shared buffer accesses, hits and reads, of each node that reads a table or an index, each once, the heap's with the
+index's, in one sent bet (`tests/cost-sent.test.ts`, `tests/cost-sent-ended.test.ts`):
+
+| book | size | the final block held behind it | before vacuum | after vacuum |
+| -- | -- | -- | -- | -- |
+| ten live quotes, no stops | 10 | | 4 | 1 |
+| ended by the mark, ahead of ten live quotes | 50,000 | | 12 | 11 |
+| | 500,000 | | 13 | 17 |
+| expired, not yet marked, behind the bet's live quote | 50,000 | 15 | 12 | 13 |
+| | 500,000 | 17 | 13 | 18 |
+
+**The budget.** After vacuum, on both large books at both sizes, each execution of the lookup reads at most 32 shared
+buffers by that count (`LOOKUP_BUDGET` in `tests/support/sentcost.ts`), and its plan has no node that reads a table, an
+index or a page that the count does not take. Before vacuum, and on the small book, the figures are reported and not
+held. The budget guards against a regression, such as a read that grows with the book. It is not a bound for every
+size.
+
+**What still stands:**
+
+- These books measure a bet and one quote. A Cross that lists more quotes has more keys, and each read makes up to one
+  more search for each.
+- The stops' index is two levels deep here. A deeper one adds a page to each search.
+- The sender's table above measures the same statement on a key's history with no stops on record.
+- The figures are this machine's, from one run.
+
+### The lane, measured
+
+Twenty bets posted at once, each against its own quote on a market of its own, on the rig's two-second clock with
+the final block one behind the head (`tests/lane-measured.test.ts`): 7 sent and settled, 6 of them confirmed, and 13
+lapsed at their turn (by the order they were posted: 2, 4 to 7, 13 to 20); 11.9 Crosses a minute through the one lane.
+Each hop from the records' own times, the median and the most, in milliseconds:
+
+| hop | median | most |
+| -- | -- | -- |
+| The queue and the check together, from the post to the intent | 14,115 | 28,032 |
+| The intent to the signed record | 31 | 36 |
+| The gate | 10 | 12 |
+| The hand-off, to the node's answer | 15 | 17 |
+| Into a block, to the receipt first seen | 1,089 | 3,115 |
+| To final, to the outcome written | 2,066 | 4,080 |
+| The lane held, from the intent to the outcome | 3,212 | 7,251 |
+
+The lane, not the chain, is what bounds a bet's 30 seconds: behind one lane, the bets posted after the first few
+lapse at their turn. The rig's block interval is a setting, so the figures past the hand-off check the method and
+are not Polygon's.
+
+### The catch-up, counted apart
+
+Each grows with the gap it covers, not with the history.
+
+- **A walk of parent hashes past 256 blocks.** A receipt, or the lane's watermark, more than 256 blocks below the final block is
+  shown on its chain by reading the final block's parents by hash down to it, one request a block. Measured after a
+  quiet spell of 300 blocks with no bet (`tests/lane-measured.test.ts`): the next bet's send checks read 304 headers
+  by hash, and the bet after it none, the watermark raised by the bet before. On Polygon's two-second blocks a quiet
+  hour is about 1,800 such reads before the next bet can be sent.
+- **The search for what used a nonce:** about log₂ of the gap in blocks for the counts that find the block, then that
+  block in full, then its place on the final block's chain. Measured once, across a gap of 4 blocks, where a restored
+  database's courier finds its intent's transaction (`tests/restore.test.ts`): from its start to the intent settled,
+  3 headers read by height, 6 counts of the key at a header's hash, the start's own among them, and the block found
+  read in full.
+- **A backlog of marks:** 200 a pass, at each read of the final block the courier makes anyway.
+- **The first start after a restore:** the count check read from the lane's older watermark; recovery looks again at a
+  gap widening to 30 seconds for as long as the process runs, and writes only what it finds. Measured in the same case:
+  the start, 56 requests to the node (28 `eth_call`, 11 `eth_getCode`, 6 `eth_getBlockByNumber`, 5 `eth_estimateGas`,
+  3 `eth_getTransactionCount`, and one each of `eth_chainId`, `eth_getStorageAt` and `eth_maxPriorityFeePerGas`) and 18
+  commands to the database; then, to the intent settled, 16 requests and 44 commands.
+
+### Idle
+
+Nothing, as before. With a Cross open, the looks come at a widening gap of 30 seconds at most, and write no row (the
+user's side's idle case).
 
 ## The growth
 
@@ -251,12 +439,12 @@ row, before their messages and lines; a stop of carried orders is bounded by the
 about 296 bytes on top of each stopped order's 1,306, and one message row a message, about 9,500 bytes for one of
 a hundred hashes.
 
-### The shape this build does not yet write
+### The shape of a sent Cross
 
-A Cross sent, with its transaction, its receipt and its lines, is written by no build yet: this build closes a Cross
-not sent, with its legs and one line. Measured from fixture rows the same test lays in the schema's shape: every column as the schema has it, and the free parts (a line's `facts`, a Cross's `node_answer`, both
-`jsonb`) holding what this fixture puts there, small objects of a few fields. These are fixture figures, to be read
-again from real rows once the sender's build writes them.
+A Cross sent, with its transaction, its receipt and its lines, is what this build writes; the figures here are still
+the fixture's. Measured from fixture rows the same test lays in the schema's shape: every column as the schema has it, and the free parts (a line's `facts`, a Cross's `node_answer`, both
+`jsonb`) holding what this fixture puts there, small objects of a few fields. These are fixture figures, not yet read
+again from real rows.
 
 | shape | rows | bytes with indexes |
 | -- | -- | -- |

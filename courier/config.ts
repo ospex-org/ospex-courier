@@ -1,4 +1,4 @@
-import { getAddress, isAddress, type Address } from 'viem';
+import { getAddress, isAddress, type Address, type Hex } from 'viem';
 
 // The courier's settings, read from the environment. Every problem is listed
 // at once, and no value is ever echoed: a problem names the setting and what
@@ -9,8 +9,8 @@ import { getAddress, isAddress, type Address } from 'viem';
 // courier sends from: an address, not a secret. The bet's check is made from
 // it, its lane is named by it, and the relay's sender is held to it at every
 // check, so it is required, and never taken from the chain. The key itself
-// (COURIER_KEYSTORE_JSON, COURIER_KEYSTORE_PASSWORD) arrives with the sender,
-// which is the build that first holds one.
+// (COURIER_KEYSTORE_JSON, COURIER_KEYSTORE_PASSWORD) is read at the start, in
+// courier/startup.ts, and kept only inside the signer.
 
 export interface CourierConfig {
   /** The courier's own Postgres. */
@@ -37,6 +37,13 @@ export interface CourierConfig {
    * It can name another list and nothing else; the game rule is never off.
    */
   publishedReportersFile?: string;
+  /**
+   * A transaction of the chain that reverted, which the node check at start
+   * traces with the call tracer, to see that the node traces. Without it the
+   * trace is not tried at start, and the courier still traces each reverted
+   * Cross; a node that cannot trace refuses nothing.
+   */
+  traceCheckTransaction?: Hex;
 }
 
 export type ConfigResult = { ok: true; config: CourierConfig } | { ok: false; problems: string[] };
@@ -106,6 +113,8 @@ export function readCourierConfig(env: Record<string, string | undefined>): Conf
 
   const databaseCaFile = get('DATABASE_CA_FILE');
   const publishedReportersFile = get('PUBLISHED_REPORTERS_FILE');
+  const traceCheckTransaction = get('TRACE_CHECK_TRANSACTION');
+  if (traceCheckTransaction !== '' && !/^0x[0-9a-fA-F]{64}$/.test(traceCheckTransaction)) problems.push('TRACE_CHECK_TRANSACTION must be a transaction hash: 0x and 64 hex characters');
 
   if (problems.length > 0) return { ok: false, problems };
   return {
@@ -120,6 +129,7 @@ export function readCourierConfig(env: Record<string, string | undefined>): Conf
       port,
       ...(databaseCaFile === '' ? {} : { databaseCaFile }),
       ...(publishedReportersFile === '' ? {} : { publishedReportersFile }),
+      ...(traceCheckTransaction === '' ? {} : { traceCheckTransaction: traceCheckTransaction.toLowerCase() as Hex }),
     },
   };
 }

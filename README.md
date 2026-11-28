@@ -10,15 +10,24 @@ contract checks every signed value, and the relay passes the call through unread
 
 ## This build
 
-The fourth build: the check of a bet. A bet admitted waits its turn in one lane, the lane of the courier's key; one
+The fifth build: the sender. A bet the check finds ready is sent: the courier signs one transaction for it, a Cross
+to the relay built from the orders the check verified, at a nonce, gas and fees it chose and checked, and hands it to
+the node once. Before it signs, it holds its key's count of transactions at the final block against its own records;
+just before the hand-off, under the same locks a stop takes, it looks for a stop of the bet or of any quote listed,
+and a stop found there keeps the transaction from the node. The lane holds the bet until the chain shows what became
+of the transaction at a final block, read by its hash: confirmed, reverted, expired unmined or replaced, never by a
+timer. The record says which, with the bet's total filled at that block and one next step (`docs/API.md`, part 3a).
+A process that stops at any point never signs or sends for that bet again. A database restored from an older copy
+is held whole: the operator's command records the restore before any courier starts on it, and nothing is reserved,
+signed or handed off on it after (below).
+
+On the fourth build's, the check of a bet. A bet admitted waits its turn in one lane, the lane of the courier's key; one
 process owns the lane at a time, taken at its start, and checks one bet at a time in the order the bets were
 recorded. At its turn the courier reads the chain at one block named by its hash and judges the bet there: its own
 standing, in the door's order; the quotes on the other side that meet its price, walked in the published order
 (`docs/FILL_PRIORITY.md`), with what each wallet would actually be pulled, net of what the account already holds on
 the market; then the exact call it would send, run at that block, its gas, and a comparison of its own working with
-the contract's. Each outcome is written: ready, refused with a code and a sentence, or lapsed. It still holds no key
-and sends nothing: a bet found ready is closed `not sent`, with the Cross it would have sent recorded beside it. A
-bet's record says which (`docs/API.md`, part 3a).
+the contract's. Each outcome is written: ready, refused with a code and a sentence, or lapsed.
 
 On the third build's, the stop. An account, or the agent of its current grant, signs one message that names orders of
 the account by hash and posts it (`POST /v1/stops`); from the moment the courier writes it down those orders are
@@ -35,7 +44,7 @@ measured against the plan's three books in both maintenance states (`docs/COST.m
 settings set from the measurement. And on the first build's: the repository, the settings, the schema, the
 start-up against the set read from a signpost, the local chain rig and the proxy, the runs and the status address,
 what a node does with a block's hash and with an override, and the store's TLS check. What it does not yet do is
-listed on its own status address under `notYetBuilt`: the sender and the key, and the incidents' cursor.
+listed on its own status address under `notYetBuilt`: the incidents and their cursor.
 
 ## Running it
 
@@ -48,7 +57,9 @@ a value in this repository (`.env.example` lists them).
 | `POLYGON_RPC_URL` | The node. https, or plain http to this machine only, where the tests run a local chain. |
 | `SIGNPOST_ADDRESS`, `BETTING_ENTRY_ID` | Where the set is: the signpost, and the betting entry's number on it. Every address of the set is read from the entry at start, and none is written in this repository. |
 | `COURIER_ADDRESS` | The courier's key's address: an address, never a key. Required: the courier does not start without it. A bet's check judges the relay's sender against it, and the node's check makes its calls from it. |
-| `COURIER_LOW_POL` | Under this many POL the key's wallet is reported low. 3 unless set. Read now, used from the sender's build. |
+| `COURIER_KEYSTORE_JSON`, `COURIER_KEYSTORE_PASSWORD` | The key: an encrypted keystore, as `cast wallet new` writes one (Web3 Secret Storage v3, scrypt and AES-128-CTR), and its password. Required. The keystore's address must be `COURIER_ADDRESS`, or the start is refused, naming the settings and no value. At start the keystore is opened, the key kept only inside the signer, and both settings leave the process's environment. |
+| `COURIER_LOW_POL` | Under this many POL the key's wallet is reported low. 3 unless set. |
+| `TRACE_CHECK_TRANSACTION` | Optional: a transaction of the chain that reverted with a named error, which the node's check traces to show the node gives a reverted Cross's reason. |
 | `PORT` | Where the process listens. 0 is any free port, which is how the tests start it. |
 | `DATABASE_CA_FILE` | Optional: a file holding the certificate authority the database is verified against, in place of the pinned `db/database-ca.pem`. It can name another authority and nothing else; verification is never off. |
 | `PUBLISHED_REPORTERS_FILE` | Optional: a file holding the published list of reporters, in place of the repository's `published-reporters.json`; the tests name the rig's reporter. It can name another list and nothing else; the game rule is never off. |
@@ -63,10 +74,18 @@ a value in this repository (`.env.example` lists them).
   latest block's hash, at the hash of a block 50 back, and at a hash no block has, which must be refused. It also
   reads the relay's storage slot 0 and holds it to the relay's sender; overrides that slot and reads the sender
   back; and runs a call whose answer depends on the block's time at two hashes of two times, so a node that ran a
-  call at the wrong block's time is caught. Its calls are made from `COURIER_ADDRESS`, or, where that is not set,
-  from the relay's sender, and it records which. It prints the verdicts, writes them to `runs/`, and exits 1 when
+  call at the wrong block's time is caught. For the sender it reads the latest block's base fee and the tip the node
+  suggests, and traces `TRACE_CHECK_TRANSACTION` where it is set; a node that cannot trace is not refused, and a
+  reverted Cross's reason then reads "unavailable". Its calls are made from `COURIER_ADDRESS`, or, where that is not
+  set, from the relay's sender, and it records which. It prints the verdicts, writes them to `runs/`, and exits 1 when
   the node fails a request the check needs. The web process runs the same check at every start and serves the
   verdicts on the status address; while its node fails one, the door takes no order (`NODE_UNUSABLE`).
+- **`yarn operator`** is the operator's command, run by hand. `yarn operator shut --copy-time <time>`, after every
+  old courier process is stopped and before any courier starts on a database restored from an older copy, records
+  the restore and shuts every lane by its line: no lane, old or new, reserves, signs or hands off on that database
+  again, and nothing in this build lifts that. `yarn operator clear --lane <address> --found "<what was found>"`
+  opens a lane shut because its key's nonce was used by a transaction the records do not hold, only when every
+  nonce below the key's count at a compatible final block is explained; it refuses a lane shut at a restore.
 - **`yarn typecheck`**, **`yarn build:contracts`** (the set the tests deploy, from the pinned contracts) and
   **`yarn test`** (below).
 
@@ -149,9 +168,10 @@ not admitted, and the row counts how many and when last.
 
 `GET /v1/orders/{hash}` is the courier's record of one order. Its `state` is `resting` for a quote the courier has
 not marked ended, else how the order ended here: `stopped`, `expired`, `filled`, or `cancelled`, with `endedAt` and,
-for `cancelled`, `endedBlock`, the block the chain was read at. A bet's is `queued` while it waits (`turn: waiting`)
-or is being checked (`turn: checking`), and then its first end: `refused` or `lapsed` with its verdict, `not sent`
-with its Cross, or `stopped`. An order that ended twice keeps the first end. For a hash stopped ahead of its order, which holds no order here, the
+for `cancelled`, `endedBlock`, the block the chain was read at. A bet's is `queued` while it waits (`turn: waiting`),
+is being checked (`turn: checking`) or is being signed and handed to the chain (`turn: sending`); then `refused` or
+`lapsed` with its verdict, `stopped`, or its Cross's state with the Cross: `unknown`, `sent`, `pending`, `confirmed`,
+`reverted`, `expired unmined`, `replaced` or `not sent` (`docs/API.md`, part 3a). An order that ended twice keeps the first end. For a hash stopped ahead of its order, which holds no order here, the
 answer is `state: "stopped ahead"` with `stoppedAt` and no field of the order: the signed original a stop ahead
 was recorded with is served on no route.
 
@@ -161,11 +181,11 @@ at the block it read, and a marked quote is asked about no more: `cancelled` whe
 a version the account has left, under its floor at its version, or under a grant that is gone (not the account's
 current grant, or ending at or before the block's time plus one), the account's own acts or its grant's own end;
 `filled` where it shows less than a lot of its stake
-left, a fill through another courier the account registered (this courier's own fills are the sender build's, marked
-`filled` too, at their final block). A quote partly filled with a lot or more left stands, counted and listed with
-what remains. The mark is at the block read and not at finality: if a reorganization undoes the cancel or the fill,
-the quote stays marked here, this courier carries it no further, and a maker who wants it carried signs a new one;
-the block's number and hash on the mark let a later build tell a mark whose block is no longer on the chain. One thing
+left, a fill through another courier the account registered (this courier's own fills are marked `filled` too, at
+their final block). A quote partly filled with a lot or more left stands, counted and listed with
+what remains. The mark is at the block read and not at finality, so it is read again once the final block reaches that
+height: where the block is on the final block's chain the mark stands, final; where it is not, the order is read at
+the final block, and the mark is written again there or lifted, and a quote with a stop on record is set stopped. One thing
 a read can show is not marked: an account that has dropped the relay, which is not an end of the quote and is undone
 by the account itself, so its quotes are not listed while it stands unregistered and are listed again after. The
 expiry mark is unchanged: against the final block's time, in the book's reads. The plan's fill marks were this
@@ -193,8 +213,10 @@ courier waits on; Node's own default is five minutes.
   block the courier read, and when (a quiet courier reads no chain, so an old one means a quiet courier and nothing
   more); the set, every address, as read from the signpost at start, and the block it was read at; the relay's
   sender, the key's address (`COURIER_ADDRESS`), and the lane: the run that owns it, its epoch, and whether this
-  process takes bets; what the node can do; the published bounds, and the chain's limits (the most gas one
-  transaction may carry); the settings;
+  process takes bets; every lane's open Cross, its state and, once recorded, its transaction and nonce, and no bet
+  hash; and each lane shut, with the line
+  that shut it, a restore's hold among them; what the node can do, its trace included; the published bounds, and the
+  chain's limits (the most gas one transaction may carry); the settings;
   this run's counts of requests refused before admission, by code; the database's size; and what is not yet built.
   If the database cannot be read it answers `503` and says that: it does not serve what it last knew as if it were
   now. A condition listed means the last state-changing decision the records made for it was an opening; one not
@@ -231,7 +253,10 @@ courier waits on; Node's own default is five minutes.
   they stand, right once any request has asked the chain about the quotes, and the market's page is the one checked
   against the chain.
 
-One standing condition is raised in this build: `chain-unreachable`. It opens when the records process a read of
+Two standing conditions are raised in this build. `cross-unreconciled` opens where a nonce of the courier's key is
+used at a final block by a transaction its records do not explain; it shuts that key's lane until the operator clears
+it with every nonce explained, or a rotation read at a final block retires the key. `chain-unreachable` opens when
+the records process a read of
 the chain that failed and failed again on its one retry, including a required header or state value that cannot be
 decoded or a refusal to read the named block; it clears when the records next process a usable read that succeeded
 while it is open, whichever process made the read. An intelligible negative answer from a contract (a game the set
@@ -262,7 +287,7 @@ lines are the writing transaction's, diagnostics: neither is proof of the order 
 The courier's own Postgres, `db/schema.sql`: eleven tables (orders, stop_messages, stops, lanes, crosses, legs,
 events, conditions, accounts, runs, games) and the indexes the book, the door and the stop read along. A bet's
 check writes `lanes` (which run owns the lane, its epoch, the bet it holds) and, for a bet found ready, `crosses`
-and `legs`: the Cross it would have sent, `not sent` with its reason, and what the check found. The process holds
+and `legs`: the Cross it sends, from its intent to what became of it on the chain, and what the check found. The process holds
 three pools on it: four
 connections for the reads and the records, one for the lane's steps, and one for the door, on which a post's admission transaction (the
 budgets' rows locked, through the record's commit, a read of the chain inside it) runs one post at a time in the
@@ -306,7 +331,12 @@ messages signed with real keys, posted over HTTP to the courier running as its o
 answer, the rows and the lines. A bet's check is `tests/precheck.test.ts`; the lane, its take, its reservation and
 what a lost database or a stop does to it, `tests/lane.test.ts`; and `tests/differential.test.ts` holds the
 courier's record of a Cross against what the contract does with the same orders in the next block, from the same
-state. Where a case must hold the lane at a known step, the courier is started through the tests' own start file
+state. The sender's cases run on a chain that mines a block every two seconds with its pool open, and whose final
+block the proxy names: the gate and the stops around it (`tests/sender.test.ts`); send once across the process's
+lives, killed at each step (`tests/sendonce.test.ts`); a restore and the operator's command
+(`tests/restore.test.ts`); a rotation and the key's hold (`tests/rotation.test.ts`); the marks read again at the
+final block (`tests/marks.test.ts`); and the outcome and a revert's reason (`tests/outcome.test.ts`). Signatures are
+counted at the signer and hand-offs at the proxy, across every life of the process. Where a case must hold the lane at a known step, the courier is started through the tests' own start file
 (`tests/support/hooked-server.ts`), the production start with a test's hold points passed in; the production start
 file has none. The stop's cases are `tests/stops.test.ts`, numbered as its plan numbers them; several start a
 second courier process on the same chain and database, and the ones that need two requests in a known order hold
@@ -337,12 +367,13 @@ courier/
   server.ts  config.ts  startup.ts
   http/      service.ts  routes.ts  limits.ts
   chain/     abi.ts  set.ts  snapshot.ts  rpc.ts  node.ts  reads.ts
-  orders/    order.ts  door.ts  standing.ts  budgets.ts  published.ts  stop.ts  stops.ts
+  orders/    order.ts  door.ts  standing.ts  budgets.ts  published.ts  stop.ts  stops.ts  wire.ts
   check/     lane.ts  precheck.ts  walk.ts  pull.ts  decode.ts  sentences.ts  hooks.ts
-  records/   store.ts  orders.ts  stops.ts  lanes.ts  events.ts  runs.ts  conditions.ts
+  send/      signer.ts  checks.ts  chain.ts  outcome.ts  settle.ts  reason.ts  marks.ts  recovery.ts  operator.ts
+  records/   store.ts  orders.ts  stops.ts  lanes.ts  crosses.ts  events.ts  runs.ts  conditions.ts
   status/    status.ts
   book/      read.ts
-scripts/     apply-schema.ts  check-node.ts
+scripts/     apply-schema.ts  check-node.ts  operator.ts
 docs/        API.md  INCIDENT_NOTES.md  FILL_PRIORITY.md  COST.md
 tests/       the suite, its support (the rig, the proxy, the TLS front, the tests' start file) and fixtures
 contracts/   a submodule: the contracts repository at the pinned commit, for the tests only

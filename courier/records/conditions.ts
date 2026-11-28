@@ -44,6 +44,13 @@ export interface Conditions {
   applyFailure(key: ConditionKey, facts: Record<string, unknown>, run: number): Promise<{ opened: boolean }>;
   /** A read that succeeded. Closed: nothing, and no line. Open: the clearing and its line, under the writer's lock. Returns whether this call cleared it. */
   applySuccess(key: ConditionKey, facts: Record<string, unknown>, run: number): Promise<{ cleared: boolean }>;
+  /**
+   * A condition the sender raises, which no read's success clears: `cross-unreconciled`. Closed: the opening and its
+   * line, under the writer's lock. Open: nothing. Returns the opening line of the condition that stands, this call's or
+   * an earlier one's, so a lane can be shut by it. The sender's other faults are incident lines with the reads it
+   * judged, from which the operator's build opens `courier-fault`, as from the check's own.
+   */
+  raise(key: ConditionKey, facts: Record<string, unknown>, run: number): Promise<{ opened: boolean; line: number }>;
   /** The conditions open now, oldest first. */
   open_(): Promise<Condition[]>;
 }
@@ -118,6 +125,18 @@ export function createConditions(pool: pg.Pool): Conditions {
         const line = await events.write({ run, kind: 'condition cleared', reason: key, facts }, client);
         await client.query('UPDATE conditions SET cleared_at = now(), cleared_line = $2 WHERE id = $1', [openId, line]);
         return { cleared: true };
+      });
+    },
+
+    async raise(key, facts, run) {
+      return write(key, async (client, openId) => {
+        if (openId !== null) {
+          const { rows } = await client.query<{ opened_line: string }>('SELECT opened_line::text AS opened_line FROM conditions WHERE id = $1', [openId]);
+          return { opened: false, line: Number((rows[0] as { opened_line: string }).opened_line) };
+        }
+        const line = await events.write({ run, kind: 'condition opened', reason: key, facts }, client);
+        await client.query('INSERT INTO conditions (key, opened_line, facts) VALUES ($1, $2, $3)', [key, line, JSON.stringify(facts)]);
+        return { opened: true, line };
       });
     },
 

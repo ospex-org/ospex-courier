@@ -1,4 +1,4 @@
-import { decodeFunctionResult, encodeFunctionData, type Abi, type Address, type Hex } from 'viem';
+import { decodeFunctionResult, encodeFunctionData, keccak256, type Abi, type Address, type Hex } from 'viem';
 import { MULTICALL_ABI, MULTICALL_ADDRESS } from './abi';
 
 // The courier's own JSON-RPC client: one HTTP request per call, no retry, no
@@ -24,6 +24,12 @@ export interface Header {
    * node behind it, need not invent one; the bet's check refuses to go on from a header without it.
    */
   gasLimit?: bigint;
+  /**
+   * The block's base fee, where the node's block carries one: the fee the sender's cap is set from. Absent from a
+   * header written by hand, and from a block of a chain before its base fee; the node check requires it of the latest
+   * block, and the sender reads it as the chain's own rule for a read, so a block without it is not sent on.
+   */
+  baseFee?: bigint;
 }
 
 export type NodeFailureKind = 'refused' | 'unreachable' | 'timeout' | 'malformed';
@@ -80,7 +86,14 @@ function withheld(text: string): string {
 }
 
 export interface JsonRpc {
+  /** One request. */
   request<T = unknown>(method: string, params: unknown[]): Promise<T>;
+  /**
+   * The one hand-off of a signed transaction (see `handOff`): one eth_sendRawTransaction, made once to this node, with
+   * no retry and no redirect followed, its time-out running through the answer's body. What the node answered is read
+   * inside the client, against this request's own id and the transaction's own hash, and nothing of its text leaves.
+   */
+  handOff(raw: Hex): Promise<HandOff>;
 }
 
 /**
@@ -140,6 +153,41 @@ export function createJsonRpc(url: string, timeoutMs = 10_000): JsonRpc {
         clearTimeout(timer);
       }
     },
+    async handOff(raw) {
+      const expected = keccak256(raw).toLowerCase();
+      const requestId = ++id;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        let response: Response;
+        try {
+          response = await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: requestId, method: 'eth_sendRawTransaction', params: [raw] }),
+            signal: controller.signal,
+            // A redirect is not followed: the one request goes to this node and to no other.
+            redirect: 'manual',
+          });
+        } catch {
+          return { kind: 'unknown' };
+        }
+        if (response.status !== 200) {
+          // A redirect, or any other HTTP answer: the body is not read, and the request is done with.
+          controller.abort();
+          return { kind: 'unknown' };
+        }
+        let text: string;
+        try {
+          text = await response.text();
+        } catch {
+          return { kind: 'unknown' };
+        }
+        return readHandOff(text, requestId, expected);
+      } finally {
+        clearTimeout(timer);
+      }
+    },
   };
 }
 
@@ -158,13 +206,22 @@ function toHeader(raw: unknown, method: string): Header {
   const parentHash = block?.parentHash;
   const timestamp = block?.timestamp;
   const gasLimit = block?.gasLimit;
+  const baseFee = block?.baseFeePerGas;
   if (
     typeof number !== 'string' || !QUANTITY.test(number) || typeof timestamp !== 'string' || !QUANTITY.test(timestamp) || typeof hash !== 'string' || !HASH.test(hash) ||
-    typeof parentHash !== 'string' || !HASH.test(parentHash) || typeof gasLimit !== 'string' || !QUANTITY.test(gasLimit)
+    typeof parentHash !== 'string' || !HASH.test(parentHash) || typeof gasLimit !== 'string' || !QUANTITY.test(gasLimit) ||
+    (baseFee !== undefined && baseFee !== null && (typeof baseFee !== 'string' || !QUANTITY.test(baseFee)))
   ) {
     throw new NodeFailure('malformed', method, null, 'the block lacks a field the header needs, or one does not decode');
   }
-  return { number: BigInt(number), hash: hash as Hex, parentHash: parentHash as Hex, timestamp: BigInt(timestamp), gasLimit: BigInt(gasLimit) };
+  return {
+    number: BigInt(number),
+    hash: hash as Hex,
+    parentHash: parentHash as Hex,
+    timestamp: BigInt(timestamp),
+    gasLimit: BigInt(gasLimit),
+    ...(typeof baseFee === 'string' ? { baseFee: BigInt(baseFee) } : {}),
+  };
 }
 
 /** The header of the block a tag names. */
@@ -326,10 +383,240 @@ export async function multicallAt(rpc: JsonRpc, header: Header, calls: Array<{ t
   return results.slice(3);
 }
 
+// ──────────────────────────── the sender's requests ────────────────────────────
+
+const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+const BYTES = /^0x(?:[0-9a-fA-F]{2})*$/;
+
+/** eth_maxPriorityFeePerGas: the tip the node suggests. Not a value at a block: the node's suggestion now. */
+export async function maxPriorityFee(rpc: JsonRpc): Promise<bigint> {
+  const answer = await rpc.request<unknown>('eth_maxPriorityFeePerGas', []);
+  if (typeof answer !== 'string' || !QUANTITY.test(answer)) throw new NodeFailure('malformed', 'eth_maxPriorityFeePerGas', null, 'the tip is not a hex quantity');
+  return BigInt(answer);
+}
+
+/**
+ * The node's named errors to a transaction it will not take: the texts Bor's pool and RPC give (Bor v2.10.2), found in
+ * any letter case anywhere in the node's text, tried in this order, and the fixed words the courier keeps for each. A
+ * longer text comes before one it contains. The words are kept for diagnosis only: a named error after the hand-off
+ * does not show that no node took the transaction, and it decides nothing.
+ */
+const NAMED = [
+  ['replacement transaction underpriced', 'replacement transaction underpriced'],
+  ['transaction underpriced', 'transaction underpriced'],
+  ['transaction gas price below minimum', 'transaction gas price below minimum'],
+  ['nonce too low', 'nonce too low'],
+  ['nonce too high', 'nonce too high'],
+  ['insufficient funds for gas * price + value', 'insufficient funds for gas * price + value'],
+  ['exceeds block gas limit', 'exceeds block gas limit'],
+  ['transaction gas limit too high', 'transaction gas limit too high'],
+  ['intrinsic gas too low', 'intrinsic gas too low'],
+  ['max priority fee per gas higher than max fee per gas', 'max priority fee per gas higher than max fee per gas'],
+  ['max fee per gas less than block base fee', 'max fee per gas less than block base fee'],
+  ['exceeds the configured cap', "the transaction's fee exceeds the node's configured cap"],
+  ['txpool is full', 'txpool is full'],
+  ['future transaction tries to replace pending', 'future transaction tries to replace pending'],
+  ['account limit exceeded', 'account limit exceeded'],
+  ['in-flight transaction limit reached for delegated accounts', 'in-flight transaction limit reached for delegated accounts'],
+  ['address already reserved', 'address already reserved'],
+  ['invalid sender', 'invalid sender'],
+  ['oversized data', 'oversized data'],
+] as const;
+
+export type NamedError = (typeof NAMED)[number][1];
+
+/** Every named error's words, in the order they are tried. */
+export const NAMED_ERRORS: readonly NamedError[] = NAMED.map(([, words]) => words);
+
+/**
+ * The node's answer to the one hand-off: taken, bound to this request; or not known, with the list's fixed words where
+ * the node's error named one. A named error is not known too: the words say which error the node gave, and nothing
+ * more.
+ */
+export type HandOff = { kind: 'taken' } | { kind: 'unknown'; words?: NamedError };
+
+/**
+ * The node's answer to this request, read inside the client: this request's own answer only, JSON-RPC 2.0 with its id,
+ * and a result or an error, never both: a member that is present counts, whatever its value, so a result beside
+ * `"error": null` is both. Taken where the result is this transaction's own hash, or where the error is an object,
+ * not an array, with an integer code and a string message, and that whole message, in any letter case and with the
+ * space around it, is "already known". Every other answer is not known, with the list's fixed words where the error
+ * names one. Only those words come out.
+ */
+function readHandOff(text: string, requestId: number, expected: string): HandOff {
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return { kind: 'unknown' };
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return { kind: 'unknown' };
+  const envelope = body as Record<string, unknown>;
+  if (envelope.jsonrpc !== '2.0' || envelope.id !== requestId) return { kind: 'unknown' };
+  const hasResult = 'result' in envelope;
+  const hasError = 'error' in envelope;
+  if (hasResult === hasError) return { kind: 'unknown' };
+  if (hasResult) return typeof envelope.result === 'string' && envelope.result.toLowerCase() === expected ? { kind: 'taken' } : { kind: 'unknown' };
+  const error = envelope.error;
+  const message = typeof error === 'object' && error !== null && typeof (error as { message?: unknown }).message === 'string' ? (error as { message: string }).message : '';
+  const wellFormed = typeof error === 'object' && error !== null && !Array.isArray(error) && Number.isInteger((error as { code?: unknown }).code) && typeof (error as { message?: unknown }).message === 'string';
+  if (wellFormed && message.trim().toLowerCase() === 'already known') return { kind: 'taken' };
+  const lower = message.toLowerCase();
+  const found = NAMED.find(([match]) => lower.includes(match));
+  return found === undefined ? { kind: 'unknown' } : { kind: 'unknown', words: found[1] };
+}
+
+/**
+ * The hand-off: one eth_sendRawTransaction of the signed bytes, made once, with no retry and no redirect followed, its
+ * time-out running through the answer's body. Taken only where the node's answer to this request is this
+ * transaction's own hash, or a well-formed error whose whole message is "already known"; every other answer is not known: a
+ * time-out, a failure of the connection, an HTTP failure or a redirect, an answer that is not this request's, and a
+ * named error, which keeps only the list's words. It never throws for the node, and nothing of the node's text leaves
+ * it.
+ */
+export async function handOff(rpc: JsonRpc, raw: Hex): Promise<HandOff> {
+  return rpc.handOff(raw);
+}
+
+/** One log of a receipt, as the node gives it, every field checked. */
+export interface ReceiptLog {
+  address: Address;
+  topics: Hex[];
+  data: Hex;
+  logIndex: number;
+  blockHash: Hex;
+  transactionHash: Hex;
+}
+
+/** A transaction's receipt: where it was mined, whether it succeeded, what it cost, its sender and target, and its logs. */
+export interface Receipt {
+  transactionHash: Hex;
+  status: 'success' | 'reverted';
+  blockNumber: bigint;
+  blockHash: Hex;
+  transactionIndex: number;
+  from: Address;
+  to: Address | null;
+  gasUsed: bigint;
+  effectiveGasPrice: bigint;
+  logs: ReceiptLog[];
+}
+
+/** The receipt of the transaction with this hash, or null where the node has none. An answer that does not decode is the node's `malformed` failure. */
+export async function receiptOf(rpc: JsonRpc, hash: Hex): Promise<Receipt | null> {
+  const raw = await rpc.request<unknown>('eth_getTransactionReceipt', [hash]);
+  if (raw === null) return null;
+  const r = typeof raw === 'object' ? (raw as Record<string, unknown>) : null;
+  const bad = () => new NodeFailure('malformed', 'eth_getTransactionReceipt', null, 'the receipt lacks a field, or one does not decode');
+  if (r === null) throw bad();
+  const q = (v: unknown) => typeof v === 'string' && QUANTITY.test(v);
+  const h = (v: unknown) => typeof v === 'string' && HASH.test(v);
+  const a = (v: unknown) => typeof v === 'string' && ADDRESS.test(v);
+  if (!h(r.transactionHash) || !q(r.status) || !q(r.blockNumber) || !h(r.blockHash) || !q(r.transactionIndex) || !a(r.from) || !(r.to === null || a(r.to)) || !q(r.gasUsed) || !q(r.effectiveGasPrice) || !Array.isArray(r.logs)) throw bad();
+  const status = BigInt(r.status as string);
+  if (status !== 0n && status !== 1n) throw bad();
+  const logs = (r.logs as unknown[]).map((l): ReceiptLog => {
+    const g = typeof l === 'object' && l !== null ? (l as Record<string, unknown>) : null;
+    if (g === null || !a(g.address) || !Array.isArray(g.topics) || !(g.topics as unknown[]).every(h) || typeof g.data !== 'string' || !BYTES.test(g.data) || !q(g.logIndex) || !h(g.blockHash) || !h(g.transactionHash)) throw bad();
+    return { address: g.address as Address, topics: (g.topics as string[]).map((t) => t.toLowerCase() as Hex), data: (g.data as string).toLowerCase() as Hex, logIndex: Number(BigInt(g.logIndex as string)), blockHash: (g.blockHash as string).toLowerCase() as Hex, transactionHash: (g.transactionHash as string).toLowerCase() as Hex };
+  });
+  return {
+    transactionHash: (r.transactionHash as string).toLowerCase() as Hex,
+    status: status === 1n ? 'success' : 'reverted',
+    blockNumber: BigInt(r.blockNumber as string),
+    blockHash: (r.blockHash as string).toLowerCase() as Hex,
+    transactionIndex: Number(BigInt(r.transactionIndex as string)),
+    from: r.from as Address,
+    to: r.to === null ? null : (r.to as Address),
+    gasUsed: BigInt(r.gasUsed as string),
+    effectiveGasPrice: BigInt(r.effectiveGasPrice as string),
+    logs,
+  };
+}
+
+/** A block's header and its transactions in full, as far as the search for what used a nonce needs them: each one's hash, sender and nonce. Null where the node has no block of that number. */
+export async function blockWithTransactions(rpc: JsonRpc, number: bigint): Promise<{ header: Header; transactions: Array<{ hash: Hex; from: Address; nonce: bigint }> } | null> {
+  const raw = await rpc.request<unknown>('eth_getBlockByNumber', [`0x${number.toString(16)}`, true]);
+  if (raw === null) return null;
+  const header = toHeader(raw, 'eth_getBlockByNumber');
+  const txs = (raw as Record<string, unknown>).transactions;
+  if (!Array.isArray(txs)) throw new NodeFailure('malformed', 'eth_getBlockByNumber', null, 'the block lacks its transactions');
+  return {
+    header,
+    transactions: txs.map((t) => {
+      const x = typeof t === 'object' && t !== null ? (t as Record<string, unknown>) : null;
+      if (x === null || typeof x.hash !== 'string' || !HASH.test(x.hash) || typeof x.from !== 'string' || !ADDRESS.test(x.from) || typeof x.nonce !== 'string' || !QUANTITY.test(x.nonce)) {
+        throw new NodeFailure('malformed', 'eth_getBlockByNumber', null, 'a transaction of the block lacks its hash, sender or nonce');
+      }
+      return { hash: x.hash.toLowerCase() as Hex, from: x.from as Address, nonce: BigInt(x.nonce) };
+    }),
+  };
+}
+
+/** One frame of the call tracer's trace: the call, its output where it returned or reverted with data, its error where it failed, and the calls it made. */
+export interface TraceFrame {
+  type: string;
+  from: Address | null;
+  to: Address | null;
+  input: Hex;
+  output: Hex | null;
+  error: string | null;
+  calls: TraceFrame[];
+}
+
+function toFrame(raw: unknown): TraceFrame {
+  const f = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : null;
+  const bad = () => new NodeFailure('malformed', 'debug_traceTransaction', null, 'a frame of the trace does not decode');
+  if (f === null || typeof f.type !== 'string') throw bad();
+  const addr = (v: unknown) => (typeof v === 'string' && ADDRESS.test(v) ? (v as Address) : null);
+  const bytes = (v: unknown) => (typeof v === 'string' && BYTES.test(v) ? (v.toLowerCase() as Hex) : null);
+  const calls = f.calls === undefined || f.calls === null ? [] : Array.isArray(f.calls) ? f.calls.map(toFrame) : (() => { throw bad(); })();
+  return { type: f.type, from: addr(f.from), to: addr(f.to), input: bytes(f.input) ?? '0x', output: bytes(f.output), error: typeof f.error === 'string' ? f.error.slice(0, 120) : null, calls };
+}
+
+/**
+ * The node's trace of a mined transaction, with the call tracer: the top call and every call below it, each with its
+ * output and its error. The node's failure to trace, or an answer that does not decode as frames, is thrown as the
+ * node's failure; what an incomplete trace means is the reader's to say.
+ */
+export async function traceOf(rpc: JsonRpc, hash: Hex): Promise<TraceFrame> {
+  const raw = await rpc.request<unknown>('debug_traceTransaction', [hash, { tracer: 'callTracer' }]);
+  return toFrame(raw);
+}
+
 /** The class and code of a failure, for a record or a log: the node's text is never copied whole. */
 export function describeNodeFailure(err: unknown): { kind: string; code: number | string | null; method: string | null } {
   if (err instanceof NodeFailure) return { kind: err.kind, code: err.code, method: err.method };
   if (err instanceof StateMismatch) return { kind: 'state-mismatch', code: null, method: 'eth_call' };
   const name = err instanceof Error ? err.name : typeof err;
   return { kind: name, code: null, method: null };
+}
+
+/** A mined or pending transaction as the recovery under a restore's hold reads it: its sender, its nonce, its target and its input, and its block where it has one. */
+export interface TransactionSeen {
+  hash: Hex;
+  from: Address;
+  nonce: bigint;
+  to: Address | null;
+  input: Hex;
+  block: { number: bigint; hash: Hex } | null;
+}
+
+/** The transaction with this hash, or null where the node has none. An answer that does not decode is the node's `malformed` failure. */
+export async function transactionOf(rpc: JsonRpc, hash: Hex): Promise<TransactionSeen | null> {
+  const raw = await rpc.request<unknown>('eth_getTransactionByHash', [hash]);
+  if (raw === null) return null;
+  const t = typeof raw === 'object' ? (raw as Record<string, unknown>) : null;
+  const bad = () => new NodeFailure('malformed', 'eth_getTransactionByHash', null, 'the transaction lacks a field, or one does not decode');
+  if (t === null || typeof t.hash !== 'string' || !HASH.test(t.hash) || typeof t.from !== 'string' || !ADDRESS.test(t.from) || typeof t.nonce !== 'string' || !QUANTITY.test(t.nonce)) throw bad();
+  if (!(t.to === null || (typeof t.to === 'string' && ADDRESS.test(t.to))) || typeof t.input !== 'string' || !BYTES.test(t.input)) throw bad();
+  const mined = typeof t.blockNumber === 'string' && QUANTITY.test(t.blockNumber) && typeof t.blockHash === 'string' && HASH.test(t.blockHash);
+  return {
+    hash: t.hash.toLowerCase() as Hex,
+    from: t.from as Address,
+    nonce: BigInt(t.nonce),
+    to: t.to === null ? null : (t.to as Address),
+    input: t.input.toLowerCase() as Hex,
+    block: mined ? { number: BigInt(t.blockNumber as string), hash: (t.blockHash as string).toLowerCase() as Hex } : null,
+  };
 }

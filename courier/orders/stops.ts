@@ -4,6 +4,7 @@ import type { BettingSet } from '../chain/set';
 import { ChainUnreachable, type ChainReader } from '../chain/snapshot';
 import { BOUNDS, type Counters } from '../http/limits';
 import type { HttpAnswer } from '../http/routes';
+import { handOffsNaming, type HandOffAnswer } from '../records/crosses';
 import type { Run } from '../records/runs';
 import type { NewStop } from '../records/stops';
 import type { Store } from '../records/store';
@@ -67,7 +68,22 @@ const refusal = (status: number, code: string, error: string, extra: Record<stri
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
 /** One hash's result, as the answer carries it. */
-export type StopResult = { orderHash: Hex; status: 'stopped' | 'already stopped' | 'stopped ahead' } | { orderHash: Hex; status: 'refused'; code: string; error: string };
+/**
+ * One hash's result. A successful one carries `handOff` where a Cross that names the order is through the gate and not
+ * yet final: where its hand-off stood, from the build that sends.
+ */
+export type StopResult = { orderHash: Hex; status: 'stopped' | 'already stopped' | 'stopped ahead'; handOff?: HandOffAnswer } | { orderHash: Hex; status: 'refused'; code: string; error: string };
+
+/** Each successful result with its hand-off, read now: inside the stop's transaction for a new stop, after its rows; when the answer is made for one already stopped. */
+async function withHandOffs(on: Parameters<typeof handOffsNaming>[0], results: StopResult[]): Promise<StopResult[]> {
+  const succeeded = results.filter((r) => r.status !== 'refused').map((r) => r.orderHash);
+  const handOffs = await handOffsNaming(on, succeeded);
+  return results.map((r) => {
+    if (r.status === 'refused') return r;
+    const h = handOffs.get(r.orderHash.toLowerCase());
+    return h === undefined ? r : { ...r, handOff: h };
+  });
+}
 
 const refused = (orderHash: Hex, code: string, error: string): StopResult => ({ orderHash, status: 'refused', code, error });
 
@@ -159,8 +175,8 @@ async function judgeOriginal(deps: StopDeps, original: Original, account: Addres
   return { ok: true, passed: { grantNumber: g, originalExpiry } };
 }
 
-/** The hashes in the order their locks are taken: ascending by the 64-bit key, compared as numbers and never as text. */
-function inLockOrder(hashes: readonly Hex[]): Hex[] {
+/** The hashes in the order their locks are taken: ascending by the 64-bit key, compared as numbers and never as text. The sender's gate takes its locks in this order too. */
+export function inLockOrder(hashes: readonly Hex[]): Hex[] {
   return [...hashes].sort((a, b) => {
     const ka = BigInt(lockKey(a));
     const kb = BigInt(lockKey(b));
@@ -237,12 +253,15 @@ export async function postStop(deps: StopDeps, raw: unknown): Promise<HttpAnswer
   // A hash the account has stopped already is answered from its row, whatever grant its order was under: judged
   // before the agent's grant is compared, and nothing is written for it.
   const answeredFromItsRow = (s: Standing): boolean => s.stopped;
-  const allStopped = (): HttpAnswer => ({ status: 200, body: { account, results: message.orderHashes.map((orderHash): StopResult => ({ orderHash, status: 'already stopped' })) } });
+  const allStopped = async (): Promise<HttpAnswer> => ({
+    status: 200,
+    body: { account, results: await withHandOffs(deps.store.pool, message.orderHashes.map((orderHash): StopResult => ({ orderHash, status: 'already stopped' }))) },
+  });
 
   if (byKey) {
     // 4. The account's own key. Every hash stopped already: answered now, from the lookup, with no chain read, no
     // transaction, no row, no line and no budget.
-    if (standing.every(answeredFromItsRow)) return allStopped();
+    if (standing.every(answeredFromItsRow)) return await allStopped();
   } else {
     // 5. Not the account: its agent, or nobody. The chain says which, at the block read.
     read = await readChain(signer);
@@ -276,7 +295,7 @@ export async function postStop(deps: StopDeps, raw: unknown): Promise<HttpAnswer
         ),
       );
     }
-    if (standing.every(answeredFromItsRow)) return allStopped();
+    if (standing.every(answeredFromItsRow)) return await allStopped();
   }
 
   // Free of the budgets: a message that carries no original and names only hashes the account has stopped already
@@ -383,8 +402,8 @@ export async function postStop(deps: StopDeps, raw: unknown): Promise<HttpAnswer
       }
     }
 
-    const answered = message.orderHashes.map((hash) => results.get(hash) as StopResult);
-    const refusals = answered.flatMap((r) => (r.status === 'refused' ? [{ hash: r.orderHash, code: r.code }] : []));
+    const answeredNow = message.orderHashes.map((hash) => results.get(hash) as StopResult);
+    const refusals = answeredNow.flatMap((r) => (r.status === 'refused' ? [{ hash: r.orderHash, code: r.code }] : []));
     // The writes, in this order: the message's row, the lines, the stops, the marks. The lines go before the rows the
     // database could refuse, all on this transaction's connection, so a line and its rows commit together or not at all.
     let messageId: number | null = null;
@@ -402,6 +421,8 @@ export async function postStop(deps: StopDeps, raw: unknown): Promise<HttpAnswer
       await deps.store.stops.insertStops(client, account, messageId, rows);
       await deps.store.stops.markStopped(client, carriedStopped);
     }
+    // Where each hand-off stood, read in this transaction, under its hash locks, after its rows: no gate can pass between.
+    const answered = await withHandOffs(client, answeredNow);
     await client.query('COMMIT');
     // 10. The answer, in the message's order.
     return { status: 200, body: { account, results: answered } };

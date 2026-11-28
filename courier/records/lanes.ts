@@ -16,12 +16,30 @@ import type { OrderRow } from './orders';
 
 export type Client = Pick<pg.PoolClient, 'query'>;
 
-/** The take's result: every lane and its new epoch, this key's epoch, and the held bets it put back to waiting or finished as stopped. */
+/** The take's result: every lane and its new epoch, this key's epoch, the held bets it put back to waiting or finished as stopped, and the Crosses before the gate it closed. */
 export interface Taken {
   epoch: bigint;
   lanes: Array<{ sender: string; epoch: string }>;
   returned: Hex[];
   stopped: Array<{ hash: Hex; account: string; gameId: string }>;
+  /** Each open Cross before the gate (`intent` or `signed`), closed not sent COURIER_RESTARTED, never handed off: none under a restore's hold. */
+  closed: Array<{ hash: Hex; lane: string; state: string; account: string; gameId: string; txHash: string | null; nonce: string | null }>;
+  /** The restore's line, where the database is held: nothing is reserved, signed or handed off on it. */
+  restoreHold: number | null;
+}
+
+/**
+ * The database-wide restore hold: the restore's incident line, or null. Once written it holds the whole database,
+ * every lane old or new and none at all: a lane made later is shut by the same line, and nothing in this build lifts
+ * it. It is read from the line itself, not from a lane it shut: a shut that could not read the relay's sender makes
+ * no lane, and the hold stands all the same. One lookup in the index of those lines, which is empty on a database never
+ * restored.
+ */
+export async function restoreHold(on: Client): Promise<number | null> {
+  const { rows } = await on.query<{ number: string }>(
+    `SELECT e.number::text AS number FROM events e WHERE e.kind = 'incident' AND e.reason = 'RESTORE_SHUT' ORDER BY e.number LIMIT 1`,
+  );
+  return rows[0] === undefined ? null : Number(rows[0].number);
 }
 
 /**
@@ -32,7 +50,9 @@ export interface Taken {
  * the caller's, with STOPPED). Then every lane that holds a bet and no open Cross is freed.
  */
 export async function take(on: Client, key: Address, run: number): Promise<Taken> {
-  await on.query('INSERT INTO lanes (sender) VALUES ($1) ON CONFLICT DO NOTHING', [key.toLowerCase()]);
+  // A lane made under a restore's hold is shut by the same line: the decision governs its making.
+  const held = await restoreHold(on);
+  await on.query('INSERT INTO lanes (sender, shut_line) VALUES ($1, $2) ON CONFLICT DO NOTHING', [key.toLowerCase(), held]);
   await on.query('SELECT sender FROM lanes ORDER BY sender FOR UPDATE');
   const raised = await on.query<{ sender: string; epoch: string }>('UPDATE lanes SET epoch = epoch + 1, owner_run = $1 RETURNING sender, epoch::text AS epoch', [run]);
   const judged = await on.query<{ hash: Hex; bet_state: string; account: string; game_id: string }>(
@@ -46,6 +66,27 @@ export async function take(on: Client, key: Address, run: number): Promise<Taken
      RETURNING o.hash, o.bet_state, o.account, o.game_id::text AS game_id`,
   );
   await on.query('UPDATE lanes SET held_bet = NULL, reservation = NULL, reserved_at = NULL WHERE held_bet IS NOT NULL AND open_cross IS NULL');
+  // Then each open Cross, by the bet's hash: one before the gate is closed not sent, COURIER_RESTARTED, never handed
+  // off, and its lane freed; one at or past the gate is left open, for its owner to settle from the chain before the
+  // lane reserves anything. Under a restore's hold none is closed: an uncertain attempt is reconciled, never called
+  // not sent.
+  const open = await on.query<{ bet_hash: Hex; state: string; lane: string; tx_hash: string | null; nonce: string | null; account: string; game_id: string }>(
+    `SELECT c.bet_hash, c.state, c.lane, c.tx_hash, c.nonce::text AS nonce, o.account, o.game_id::text AS game_id
+     FROM crosses c JOIN lanes l ON l.open_cross = c.bet_hash JOIN orders o ON o.hash = c.bet_hash
+     ORDER BY c.bet_hash FOR UPDATE OF c`,
+  );
+  const closed: Taken['closed'] = [];
+  if (held === null) {
+    for (const c of open.rows) {
+      if (c.state !== 'intent' && c.state !== 'signed') continue;
+      await on.query(
+        `UPDATE crosses SET state = 'not sent', not_sent_reason = 'COURIER_RESTARTED', hand_offs = 0, outcome_at = now(), updated_at = now() WHERE bet_hash = $1 AND state IN ('intent', 'signed')`,
+        [c.bet_hash],
+      );
+      await on.query('UPDATE lanes SET held_bet = NULL, reservation = NULL, reserved_at = NULL, open_cross = NULL WHERE sender = $1 AND open_cross = $2', [c.lane, c.bet_hash]);
+      closed.push({ hash: c.bet_hash, lane: c.lane, state: c.state, account: c.account, gameId: c.game_id, txHash: c.tx_hash, nonce: c.nonce });
+    }
+  }
   const lanes = raised.rows.map((r) => ({ sender: r.sender, epoch: r.epoch })).sort((a, b) => (a.sender < b.sender ? -1 : 1));
   const mine = lanes.find((l) => l.sender === key.toLowerCase());
   if (mine === undefined) throw new Error('the take found no lane for its own key');
@@ -54,18 +95,97 @@ export async function take(on: Client, key: Address, run: number): Promise<Taken
     lanes,
     returned: judged.rows.filter((r) => r.bet_state === 'waiting').map((r) => r.hash),
     stopped: judged.rows.filter((r) => r.bet_state === 'refused').map((r) => ({ hash: r.hash, account: r.account, gameId: r.game_id })),
+    closed,
+    restoreHold: held,
   };
 }
 
-/** The lane's row under its lock: FOR UPDATE for a lane step, the epoch, reservation and what it holds. */
-export async function lockLane(on: Client, key: Address): Promise<{ epoch: bigint; reservation: bigint | null; heldBet: Hex | null; openCross: Hex | null } | null> {
-  const { rows } = await on.query<{ epoch: string; reservation: string | null; held_bet: Hex | null; open_cross: Hex | null }>(
-    'SELECT epoch::text AS epoch, reservation::text AS reservation, held_bet, open_cross FROM lanes WHERE sender = $1 FOR UPDATE',
+/** The lanes other than this key's that hold an open Cross: what the drain waits for, and what this process settles before its own lane reserves. */
+export async function otherOpenCrosses(on: Client, key: Address): Promise<Array<{ sender: Address; betHash: Hex }>> {
+  const { rows } = await on.query<{ sender: Address; open_cross: Hex }>('SELECT sender, open_cross FROM lanes WHERE open_cross IS NOT NULL AND sender <> $1 ORDER BY sender', [key.toLowerCase()]);
+  return rows.map((r) => ({ sender: r.sender, betHash: r.open_cross }));
+}
+
+/** The lane's row, as a lane step reads it: the epoch, the reservation, what it holds, the line that shut it, and its watermark. */
+export interface LaneRow {
+  epoch: bigint;
+  reservation: bigint | null;
+  heldBet: Hex | null;
+  openCross: Hex | null;
+  /** The line that shut the lane, while it is shut; null while it is open. */
+  shutLine: number | null;
+  /** Every nonce below `to` explained at the anchor, a final block named by number and hash; no anchor before the first proof. */
+  watermark: { to: bigint; anchor: { number: bigint; hash: Hex } | null };
+}
+
+const LANE_COLUMNS = `epoch::text AS epoch, reservation::text AS reservation, held_bet, open_cross, shut_line::text AS shut_line,
+  verified_nonce_to::text AS verified_nonce_to, verified_block_number::text AS verified_block_number, verified_block_hash`;
+
+function toLane(r: Record<string, unknown>): LaneRow {
+  return {
+    epoch: BigInt(String(r.epoch)),
+    reservation: r.reservation === null ? null : BigInt(String(r.reservation)),
+    heldBet: (r.held_bet as Hex | null) ?? null,
+    openCross: (r.open_cross as Hex | null) ?? null,
+    shutLine: r.shut_line === null ? null : Number(r.shut_line),
+    watermark: {
+      to: BigInt(String(r.verified_nonce_to)),
+      anchor: r.verified_block_number === null ? null : { number: BigInt(String(r.verified_block_number)), hash: r.verified_block_hash as Hex },
+    },
+  };
+}
+
+/** The lane's row under its lock: FOR UPDATE for a lane step. */
+export async function lockLane(on: Client, key: Address): Promise<LaneRow | null> {
+  const { rows } = await on.query(`SELECT ${LANE_COLUMNS} FROM lanes WHERE sender = $1 FOR UPDATE`, [key.toLowerCase()]);
+  return rows[0] === undefined ? null : toLane(rows[0] as Record<string, unknown>);
+}
+
+/**
+ * The lane's row under its lock for a reservation, with what decides whether it may reserve, in the same statement:
+ * whether another lane holds an open Cross (the drain), and the restore's line where one holds the database. One
+ * statement, as the reservation's lock was before.
+ */
+export async function lockLaneToReserve(on: Client, key: Address): Promise<(LaneRow & { othersOpen: boolean; restoreHold: number | null }) | null> {
+  const { rows } = await on.query(
+    `SELECT ${LANE_COLUMNS},
+       EXISTS (SELECT 1 FROM lanes o WHERE o.open_cross IS NOT NULL AND o.sender <> $1) AS others_open,
+       (SELECT e.number::text FROM events e WHERE e.kind = 'incident' AND e.reason = 'RESTORE_SHUT' ORDER BY e.number LIMIT 1) AS restore_hold
+     FROM lanes WHERE sender = $1 FOR UPDATE`,
     [key.toLowerCase()],
   );
-  const r = rows[0];
+  const r = rows[0] as (Record<string, unknown> & { others_open: boolean; restore_hold: string | null }) | undefined;
   if (r === undefined) return null;
-  return { epoch: BigInt(r.epoch), reservation: r.reservation === null ? null : BigInt(r.reservation), heldBet: r.held_bet, openCross: r.open_cross };
+  return { ...toLane(r), othersOpen: r.others_open, restoreHold: r.restore_hold === null ? null : Number(r.restore_hold) };
+}
+
+/** The lane's row read with no lock, as the send's own checks read it before deciding: what a step decides is decided again under the lock. */
+export async function readLane(on: Client, key: Address): Promise<LaneRow | null> {
+  const { rows } = await on.query(`SELECT ${LANE_COLUMNS} FROM lanes WHERE sender = $1`, [key.toLowerCase()]);
+  return rows[0] === undefined ? null : toLane(rows[0] as Record<string, unknown>);
+}
+
+/** The watermark raised to the count at a final block, that block its anchor: only from the watermark the proof read. True where it moved. */
+export async function raiseWatermark(on: Client, key: Address, from: LaneRow['watermark'], to: LaneRow['watermark']): Promise<boolean> {
+  if (to.anchor === null) throw new Error('a watermark rises only at a final block');
+  const { rowCount } = await on.query(
+    `UPDATE lanes SET verified_nonce_to = $2, verified_block_number = $3, verified_block_hash = $4
+     WHERE sender = $1 AND verified_nonce_to = $5 AND verified_block_hash IS NOT DISTINCT FROM $6`,
+    [key.toLowerCase(), to.to.toString(), to.anchor.number.toString(), to.anchor.hash.toLowerCase(), from.to.toString(), from.anchor === null ? null : from.anchor.hash.toLowerCase()],
+  );
+  return (rowCount ?? 0) === 1;
+}
+
+/** The lane shut by a line, where it is open: the line that opened cross-unreconciled. */
+export async function shutLane(on: Client, key: Address, line: number): Promise<void> {
+  await on.query('UPDATE lanes SET shut_line = $2 WHERE sender = $1 AND shut_line IS NULL', [key.toLowerCase(), line]);
+}
+
+/** The held bet back to waiting and the lane freed: a send that cannot go on now and has signed nothing. True where the bet was held. */
+export async function putBack(on: Client, key: Address, hash: Hex): Promise<boolean> {
+  const { rowCount } = await on.query(`UPDATE orders SET bet_state = 'waiting' WHERE hash = $1 AND bet_state = 'held'`, [hash.toLowerCase()]);
+  await on.query('UPDATE lanes SET held_bet = NULL, reservation = NULL, reserved_at = NULL WHERE sender = $1', [key.toLowerCase()]);
+  return (rowCount ?? 0) === 1;
 }
 
 /** The lane's row as it stands, for the status: the run that owns it and its epoch, read with no lock, or null where the lane has no row. */
@@ -76,10 +196,11 @@ export async function laneNow(on: Client, key: Address): Promise<{ ownerRun: num
   return { ownerRun: r.owner_run === null ? null : Number(r.owner_run), epoch: BigInt(r.epoch) };
 }
 
-/** Check 17's read, in the door's transaction: the lane's epoch under a share lock, or null where the lane has no row. */
-export async function shareLane(on: Client, key: Address): Promise<bigint | null> {
-  const { rows } = await on.query<{ epoch: string }>('SELECT epoch::text AS epoch FROM lanes WHERE sender = $1 FOR SHARE', [key.toLowerCase()]);
-  return rows[0] === undefined ? null : BigInt(rows[0].epoch);
+/** Check 17's read, in the door's transaction: the lane's epoch and the line that shut it, under a share lock, or null where the lane has no row. */
+export async function shareLane(on: Client, key: Address): Promise<{ epoch: bigint; shutLine: number | null } | null> {
+  const { rows } = await on.query<{ epoch: string; shut_line: string | null }>('SELECT epoch::text AS epoch, shut_line::text AS shut_line FROM lanes WHERE sender = $1 FOR SHARE', [key.toLowerCase()]);
+  const r = rows[0];
+  return r === undefined ? null : { epoch: BigInt(r.epoch), shutLine: r.shut_line === null ? null : Number(r.shut_line) };
 }
 
 /** The reservation's guarded update: the bet becomes held only if it is still a waiting bet no stop has ended, judged on the row after any wait. True where it took it. */
@@ -121,38 +242,6 @@ export interface LegRow {
   orderHash: Hex;
   makerRisk: bigint;
   takerRisk: bigint;
-}
-
-/** A ready bet's Cross, closed in this build: not sent, never handed off, with the reason and the check's figures. */
-export interface NotSentCross {
-  betHash: Hex;
-  lane: Address;
-  epoch: bigint;
-  reservation: bigint;
-  block: { number: bigint; hash: Hex; time: bigint };
-  checked: Record<string, unknown>;
-  legs: LegRow[];
-}
-
-/** The Cross's row and its legs, the legs in one statement. */
-export async function writeNotSent(on: Client, cross: NotSentCross): Promise<void> {
-  await on.query(
-    `INSERT INTO crosses (bet_hash, lane, epoch, reservation, block_number, block_hash, block_time, state, hand_offs, not_sent_reason, checked)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'not sent', 0, 'SENDER_NOT_BUILT', $8)`,
-    [cross.betHash.toLowerCase(), cross.lane.toLowerCase(), cross.epoch.toString(), cross.reservation.toString(), cross.block.number.toString(), cross.block.hash.toLowerCase(), cross.block.time.toString(), JSON.stringify(cross.checked)],
-  );
-  await on.query(
-    `INSERT INTO legs (bet_hash, position, order_hash, expected_maker_risk, expected_taker_risk)
-     SELECT $1, l.position, l.order_hash, l.maker::numeric, l.taker::numeric
-     FROM unnest($2::smallint[], $3::text[], $4::text[], $5::text[]) AS l(position, order_hash, maker, taker)`,
-    [
-      cross.betHash.toLowerCase(),
-      cross.legs.map((_, i) => i),
-      cross.legs.map((l) => l.orderHash.toLowerCase()),
-      cross.legs.map((l) => l.makerRisk.toString()),
-      cross.legs.map((l) => l.takerRisk.toString()),
-    ],
-  );
 }
 
 /** The verdict a bet's record shows, read from its outcome's line along `events_bet_lines`. */

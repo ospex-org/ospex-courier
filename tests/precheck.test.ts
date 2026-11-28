@@ -15,6 +15,7 @@ import { cancelAll, cancelOnChain, contractHash, crossFromTheTest, grantAgent, l
 import { postStop as postStopFrom, stopMessage } from './support/stops';
 import type { ChainProxy } from './support/proxy';
 import type { Rig } from './support/rig';
+import { closeEach } from './support/close';
 import { publishedList, startStack, type Stack } from './support/stack';
 
 // The bet's check, from what a user would see: a signed order posted over
@@ -52,15 +53,14 @@ const postStop = (...a: Parameters<typeof postStopFrom>) => postStopFrom(a[0], a
 
 before(async () => {
   stack = await startStack('precheck', { hooked: true });
+  // The final block follows the head: a ready bet is now sent, and its Cross settles once a final block holds it.
+  stack.proxy.finalFollows(0n);
   rig = stack.rig;
   proxy = stack.proxy;
   pool = openPool(stack.databaseUrl, null);
 });
 
-after(async () => {
-  await pool?.end();
-  await stack?.close();
-});
+after(() => closeEach(() => pool?.end(), () => stack?.close()));
 
 /** A fresh account of the rig's mnemonic, funded: coin, an allowance to the positions contract, the relay registered. */
 let nextAccount = 40;
@@ -70,15 +70,44 @@ async function freshAccount(): Promise<HDAccount> {
   return who;
 }
 
-/** The bet's record once its check has written an outcome: read again until it is no longer queued. */
+/** The states of a bet whose outcome is not yet written: waiting or being checked, or sent and not yet final. */
+const UNSETTLED = new Set(['queued', 'unknown', 'sent', 'pending']);
+
+/** The bet's record once its check has written an outcome: read again until it is no longer queued, nor a Cross not yet final. */
 async function judged(hash: string, on = url()): Promise<Record<string, unknown>> {
   // Read every tenth of a second, at most 300 times: well under the address's 600 a minute.
   for (let i = 0; i < 300; i++) {
     const r = await get(on, `/v1/orders/${hash}`);
-    if (r.body.state !== 'queued') return r.body;
+    if (!UNSETTLED.has(String(r.body.state))) return r.body;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error(`the bet ${hash} was still queued after 30 seconds`);
+  throw new Error(`the bet ${hash} was still queued after 30 seconds${lastLines(on)}`);
+}
+
+/** The stack's courier's last lines, where the wait was on it: what a wait that ran out needs to be read. */
+const lastLines = (on: string) => (on === url() ? `; the courier's last lines: ${stack.courier.lines.slice(-12).join(' | ')}` : '');
+
+/**
+ * The bet's record once its check is done: a ready bet held at its intent, where the send begins and no request of
+ * the send is yet made (the caller armed the hold), or another bet with its outcome written.
+ */
+async function atIntentOrJudged(hash: string, on = url()): Promise<Record<string, unknown>> {
+  for (let i = 0; i < 300; i++) {
+    const r = await get(on, `/v1/orders/${hash}`);
+    if (r.body.state === 'queued' && r.body.turn === 'sending') return r.body;
+    if (!UNSETTLED.has(String(r.body.state))) return r.body;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`the bet ${hash} was neither at its intent nor judged after 30 seconds${lastLines(on)}`);
+}
+
+/**
+ * The sender's two reads a ready bet's check now makes, counted by method at the proxy from `from`: one tip, and the
+ * key's count at the final block beside the check's own count at H. A window of the check's own requests, which ends
+ * at the check's result before any step of the send, leaves them out, and holds them to exactly these.
+ */
+function senderReads(on: ChainProxy, from: { tips: number; keyCounts: number }): { tip: number; keyCounts: number } {
+  return { tip: on.count('eth_maxPriorityFeePerGas') - from.tips, keyCounts: on.count('eth_getTransactionCount') - from.keyCounts };
 }
 
 /** The lines of the events table for a bet, by its hash, in order. */
@@ -92,13 +121,13 @@ async function keyCount(): Promise<bigint> {
   return BigInt((await rig.rpc('eth_getTransactionCount', [rig.accounts.sender.address, 'latest'])) as string);
 }
 
-test("the worked bet: a maker who holds the other side is listed with an empty wallet; the bet is found ready at one block, its record not sent with one leg of 9,600 and 9,984, the maker pulled nothing and paid back 1,400, the bettor pulled 9,984, and nothing was signed or sent", async () => {
+test("the worked bet: a maker who holds the other side is listed with an empty wallet; the bet is found ready at one block, signed once, handed off once and confirmed, with one leg of 9,600 and 9,984: the maker pulled nothing and paid back 1,400, the bettor pulled 9,984, as the check found and the receipt records", async () => {
   const M = await freshAccount();
   const B = await freshAccount();
   const X = await freshAccount();
   const coin = rig.abis.TestCoin as Abi;
   // M takes the away side earlier, for 6,000 against a profit of 5,000: X quotes home at tick 220 and M's bet fills
-  // 50 lots of it, sent by the test from the relay's sender.
+  // 50 lots of it, sent by the test through another courier.
   let T = await rig.time();
   const xQuote: Order = { ...orderOn(rig, X, { expiry: T + 600n, oddsTick: 220, riskAmount: 5_000n }), positionType: 0 };
   const mBet: Order = { ...orderOn(rig, M, { expiry: T + 25n, oddsTick: 180, riskAmount: 6_000n }), positionType: 1 };
@@ -111,6 +140,7 @@ test("the worked bet: a maker who holds the other side is listed with an empty w
 
   const countBefore = await keyCount();
   const sendsBefore = proxy.sends();
+  const bBefore = await rig.read<bigint>(rig.addresses.coin, coin, 'balanceOf', [B.address]);
   T = await rig.time();
   const quote: Order = { ...orderOn(rig, M, { expiry: T + 600n, oddsTick: 204, riskAmount: 100_000n }), positionType: 0 };
   const posted = await postOrder(url(), rig, M, 'rest', quote);
@@ -122,31 +152,40 @@ test("the worked bet: a maker who holds the other side is listed with an empty w
   const hash = taken.body.orderHash as string;
 
   const record = await judged(hash);
-  assert.equal(record.state, 'not sent', JSON.stringify(record));
+  assert.equal(record.state, 'confirmed', JSON.stringify(record));
   const cross = record.cross as Record<string, unknown>;
-  assert.equal(cross.state, 'not sent');
-  assert.equal(cross.handOffs, 0);
-  assert.equal(cross.reason, 'SENDER_NOT_BUILT');
+  assert.equal(cross.state, 'confirmed');
+  assert.equal(cross.handOffs, 1);
+  assert.equal('reason' in cross, false, 'no reason on a confirmed Cross: the field is absent');
   const block = cross.block as { number: string; hash: string; time: string };
-  assert.equal(cross.message, `The courier checked this bet at block ${block.number} and found that it would fill as listed. The sender is a later build, so nothing was signed or sent.`);
-  assert.deepEqual(cross.legs, [{ position: 0, orderHash: posted.body.orderHash, account: M.address.toLowerCase(), oddsTick: 204, makerRisk: '9600', takerRisk: '9984' }]);
+  const receipt = (cross.receipt as { block: { number: string } }).block;
+  assert.ok(
+    String(cross.message).startsWith(`Transaction ${String(cross.txHash)} is in final block ${receipt.number}. It filled 0.009984 USDC of this bet's 0.01 USDC, at the prices of the quotes listed. 0.000016 USDC of it did not fill in this transaction, and this courier does not carry the rest.`),
+    String(cross.message),
+  );
+  assert.deepEqual(cross.legs, [{ position: 0, orderHash: posted.body.orderHash, account: M.address.toLowerCase(), oddsTick: 204, makerRisk: '9600', takerRisk: '9984', recorded: { makerRisk: '9600', takerRisk: '9984' } }]);
   assert.equal(cross.takerRisk, '9984');
   assert.deepEqual(cross.pulls, { [M.address]: '0', [B.address]: '9984' });
   assert.deepEqual(cross.paysBack, { [M.address]: '1400' });
   assert.deepEqual(cross.paysBackRefused, {});
+  assert.equal(cross.betFilled, '9984');
+  // The coin as the receipt moved it: the bettor paid 9,984; the maker, its wallet empty, was paid back 1,400.
+  assert.equal(await rig.read<bigint>(rig.addresses.coin, coin, 'balanceOf', [B.address]), bBefore - 9_984n);
+  assert.equal(await rig.read<bigint>(rig.addresses.coin, coin, 'balanceOf', [M.address]), 1_400n);
 
-  // The rows: one Cross not sent and never handed off, one leg, and the lines.
+  // The rows: one Cross handed off once and confirmed, one leg, and the lines.
   const crosses = await pool.query(`SELECT state, hand_offs, not_sent_reason, block_hash FROM crosses WHERE bet_hash = $1`, [hash.toLowerCase()]);
-  assert.deepEqual(crosses.rows, [{ state: 'not sent', hand_offs: 0, not_sent_reason: 'SENDER_NOT_BUILT', block_hash: block.hash }]);
+  assert.deepEqual(crosses.rows, [{ state: 'confirmed', hand_offs: 1, not_sent_reason: null, block_hash: block.hash }]);
   const legs = await pool.query(`SELECT position, order_hash, expected_maker_risk::text AS m, expected_taker_risk::text AS t FROM legs WHERE bet_hash = $1`, [hash.toLowerCase()]);
   assert.deepEqual(legs.rows, [{ position: 0, order_hash: (posted.body.orderHash as string).toLowerCase(), m: '9600', t: '9984' }]);
-  assert.deepEqual((await linesOf(hash)).map((l) => l.kind), ['order received', 'cross not sent']);
+  // Sent, then confirmed; pending between them where the receipt was first seen above the final block.
+  const kinds = (await linesOf(hash)).map((l) => l.kind).join(', ');
+  assert.ok(['order received, cross sent, cross confirmed', 'order received, cross sent, cross pending, cross confirmed'].includes(kinds), kinds);
   const quoteLines = await pool.query(`SELECT kind FROM events WHERE order_hash = $1 ORDER BY number`, [(posted.body.orderHash as string).toLowerCase()]);
   assert.deepEqual(quoteLines.rows.map((r: { kind: string }) => r.kind), ['order received']);
-  // Nothing was signed or sent: the key's count is what it was, and the proxy saw no send.
-  assert.equal(await keyCount(), countBefore);
-  assert.deepEqual(proxy.sends(), sendsBefore);
-  assert.deepEqual(proxy.sends(), { eth_sendRawTransaction: 0, eth_sendTransaction: 0 });
+  // Signed once and handed off once: the key's count one more, and the proxy saw one send.
+  assert.equal(await keyCount(), countBefore + 1n);
+  assert.deepEqual(proxy.sends(), { eth_sendRawTransaction: sendsBefore.eth_sendRawTransaction + 1, eth_sendTransaction: 0 });
 });
 
 /** A server that answers every request after `headersAfterMs` with its headers, and then its body after `bodyAfterMs` more, or never. */
@@ -351,7 +390,7 @@ test('one block: two quotes and a stale answer. Read B is answered at the block 
   try {
     const bet = await betOn(B, market, { riskAmount: 200n, oddsTick: 200 });
     const record = await judged(bet.hash);
-    assert.equal(record.state, 'not sent', JSON.stringify(record));
+    assert.equal(record.state, 'confirmed', JSON.stringify(record));
     assert.deepEqual(legsOf(record), [y.hash.toLowerCase()], 'ready with Y alone');
     assert.equal(stale, 2, 'read B was answered for the block before H, twice');
   } finally {
@@ -398,9 +437,14 @@ test("one block: every request for a value the check makes names H by its hash, 
   const held = await hooks().reached('after-reservation');
   const log = recording(['eth_call', 'eth_estimateGas', 'eth_getTransactionCount', 'eth_getBlockByNumber', 'eth_getBlockByHash', 'eth_getStorageAt']);
   try {
+    // The check's requests, to its result, before any step of the send: recorded there, and the courier goes on.
+    await hooks().arm('before-result');
     await hooks().go(held);
+    const atResult = await hooks().reached('before-result');
+    log.stop();
+    await hooks().go(atResult);
     const record = await judged(bet.hash);
-    assert.equal(record.state, 'not sent', JSON.stringify(record));
+    assert.equal(record.state, 'confirmed', JSON.stringify(record));
     const H = (record.cross as { block: { number: string; hash: string } }).block;
     const values = log.calls.filter((c) => c.method !== 'eth_getBlockByNumber' && c.method !== 'eth_getBlockByHash');
     assert.ok(values.length >= 6, `the reads, the exact call, its estimate, the call at the limit, the nonce: ${values.length}`);
@@ -436,15 +480,20 @@ test("one block: the last check of H. Its header, read again by its number at th
     },
   });
   try {
+    // The check's headers, to its result, before any step of the send: taken there, and the courier goes on.
+    await hooks().arm('before-result');
     await hooks().go(held);
+    const atResult = await hooks().reached('before-result');
+    const checkHeads = [...heads];
+    await hooks().go(atResult);
     const record = await judged(bet.hash);
-    assert.equal(record.state, 'not sent', JSON.stringify(record));
+    assert.equal(record.state, 'confirmed', JSON.stringify(record));
     const H = (record.cross as { block: { number: string } }).block;
     assert.equal(answeredOtherwise, 1, 'the last check read H by its number and was answered another hash');
     assert.deepEqual(
-      { first: heads.slice(0, 2), firstLast: typeof heads[2] === 'string' && /^0x[0-9a-f]+$/.test(heads[2] as string), second: heads.slice(3) },
+      { first: checkHeads.slice(0, 2), firstLast: typeof checkHeads[2] === 'string' && /^0x[0-9a-f]+$/.test(checkHeads[2] as string), second: checkHeads.slice(3) },
       { first: ['latest', 'finalized'], firstLast: true, second: ['latest', 'finalized', `0x${BigInt(H.number).toString(16)}`] },
-      `the headers read, in order: ${JSON.stringify(heads)}`,
+      `the headers read, in order: ${JSON.stringify(checkHeads)}`,
     );
   } finally {
     proxy.rule('eth_getBlockByNumber', null);
@@ -548,7 +597,7 @@ test('the exact call at the recorded limit: the node halving the estimate, as on
     proxy.clear();
   }
   const control = await betOn(await freshAccount(), market);
-  assert.equal((await judged(control.hash)).state, 'not sent');
+  assert.equal((await judged(control.hash)).state, 'confirmed');
 });
 
 test("the estimate's refusal on the record: the simulation at H clean, and the estimate of the same call refused, once by name (the node made to run it from a stranger, so the relay names the caller) and once with no reason (the node made to run it on too little gas). Each is CROSS_WOULD_REVERT with its reason, the named one with the error's arguments; `step` names the estimate, and `at` is the time the outcome was recorded, never a word; no Cross row", async () => {
@@ -683,11 +732,12 @@ test("the relay's sender at H is the key: with the sender set to another key thr
     await rig.throughTimelock(rig.addresses.relay, encodeFunctionData({ abi: relayAbi, functionName: 'setSender', args: [rig.accounts.sender.address] } as never));
   }
   const control = await betOn(await freshAccount(), market);
-  assert.equal((await judged(control.hash)).state, 'not sent');
+  assert.equal((await judged(control.hash)).state, 'confirmed');
 });
 
 test('the exact call from the key: a coin that refuses the bettor, with its balance and its allowance enough and no override to compare, is caught by the exact call alone: CROSS_WOULD_REVERT naming TakerPullRefused, and no Cross row; the control, the bettor not blocked, is ready', async () => {
   const refusing = await startStack('precheck_refusing', { coin: 'RefusingCoin', hooked: true });
+  refusing.proxy.finalFollows(0n);
   try {
     const r = refusing.rig;
     const M = r.account(40);
@@ -723,7 +773,7 @@ test('the exact call from the key: a coin that refuses the bettor, with its bala
     const T2 = await r.time();
     const again: Order = { ...orderOn(r, B, { expiry: T2 + 25n, oddsTick: 200, riskAmount: 10_000n, ...market }), positionType: 1 };
     const ok = await postOrder(courier.url, r, B, 'take', again);
-    assert.equal((await judged(ok.body.orderHash as string, courier.url)).state, 'not sent');
+    assert.equal((await judged(ok.body.orderHash as string, courier.url)).state, 'confirmed');
   } finally {
     refusing.proxy.clear();
     await refusing.close();
@@ -763,7 +813,7 @@ test("a stop ahead's original is never a candidate: an original that would meet 
   const posted = await quoteOn(M, market);
   const control = await betOn(await freshAccount(), market);
   const ready = await judged(control.hash);
-  assert.equal(ready.state, 'not sent');
+  assert.equal(ready.state, 'confirmed');
   assert.deepEqual(legsOf(ready), [posted.hash.toLowerCase()]);
 });
 
@@ -771,7 +821,7 @@ test("a stop ahead's original is never a candidate: an original that would meet 
 
 /**
  * An account that holds the other side of the market, as the worked fixture has it: it took side B earlier for 3,000
- * against a profit of 2,500, by a Cross the test sends from the relay's sender, so it holds 3,000 there.
+ * against a profit of 2,500, by a Cross the test sends through another courier, so it holds 3,000 there.
  */
 async function holdingOtherSide(market: { scorer: Address; lineTicks: number }, on: Rig = rig, fresh: () => Promise<HDAccount> = freshAccount): Promise<HDAccount> {
   const M = await fresh();
@@ -784,16 +834,28 @@ async function holdingOtherSide(market: { scorer: Address; lineTicks: number }, 
   return M;
 }
 
-/** The requests the courier makes of the node while a held check runs to its outcome: the outcome's record, and the count at the proxy. */
+/**
+ * The requests the courier makes of the node while a held check runs to its result, before any step of the send: the
+ * outcome's record, and the count at the proxy. A ready bet's count leaves out the sender's two reads its check now
+ * makes, held to exactly one tip and one key's count at the final block.
+ */
 async function countedCheck(bet: () => Promise<{ hash: Hex }>, during?: () => void): Promise<{ record: Record<string, unknown>; requests: number }> {
   await hooks().arm('after-reservation');
   const posted = await bet();
   const held = await hooks().reached('after-reservation');
   during?.();
   const before = proxy.count();
+  const from = { tips: proxy.count('eth_maxPriorityFeePerGas'), keyCounts: proxy.count('eth_getTransactionCount') };
+  await hooks().arm('before-result');
   await hooks().go(held);
+  const atResult = await hooks().reached('before-result');
+  const requests = proxy.count() - before;
+  const reads = senderReads(proxy, from);
+  await hooks().go(atResult);
   const record = await judged(posted.hash);
-  return { record, requests: proxy.count() - before };
+  if (record.state !== 'confirmed') return { record, requests };
+  assert.deepEqual(reads, { tip: 1, keyCounts: 2 }, "the sender's two reads, beside the check's own count at H");
+  return { record, requests: requests - 2 };
 }
 
 test('the gas: the limit is the estimate and a fifth of it, in whole gas, to the unit, for estimates either side of a multiple of five', async () => {
@@ -808,8 +870,10 @@ test('the gas: the limit is the estimate and a fifth of it, in whole gas, to the
     try {
       const bet = await betOn(await freshAccount(), market);
       const record = await judged(bet.hash);
-      assert.equal(record.state, 'not sent', JSON.stringify(record));
-      assert.deepEqual((record.cross as { gas: unknown }).gas, { estimate: g.toString(), limit: limit.toString() });
+      assert.equal(record.state, 'confirmed', JSON.stringify(record));
+      const gas = (record.cross as { gas: { estimate: string; limit: string; used: string } }).gas;
+      assert.deepEqual({ estimate: gas.estimate, limit: gas.limit }, { estimate: g.toString(), limit: limit.toString() });
+      assert.ok(BigInt(gas.used) <= limit, `the gas used is within the limit: ${gas.used}`);
     } finally {
       proxy.rule('eth_estimateGas', null);
     }
@@ -861,10 +925,14 @@ async function fortyQuotes(market: { scorer: Address; lineTicks: number }): Prom
 
 test('the gas: a fit found. With the ceiling set so forty legs do not fit and a shorter prefix does, the bet is ready with that prefix, its own simulation, comparison and call at the limit run on it, every step of the search in the figures, and the limit never cut', async () => {
   const market = ownMarket();
-  await fortyQuotes(market);
-  const whole = await judged((await betOn(await freshAccount(), market, { oddsTick: 200, riskAmount: 4_000n })).hash);
+  // The forty legs' limit, measured on a twin market stocked the same way by makers of its own: the measuring bet is
+  // sent, and fills the market it measured, where a second Cross would find the makers' slots written and cost less.
+  const twin = ownMarket();
+  await fortyQuotes(twin);
+  const whole = await judged((await betOn(await freshAccount(), twin, { oddsTick: 200, riskAmount: 4_000n })).hash);
   assert.equal(legsOf(whole).length, 40, JSON.stringify(whole));
   const wholeLimit = BigInt((whole.cross as { gas: { limit: string } }).gas.limit);
+  await fortyQuotes(market);
   // The ceiling half a leg's gas under the forty legs' limit: another bet's calldata (its signature, its fields) has
   // other zero bytes, so its forty-leg estimate is not this one's to the unit, and a ceiling one gas under would let
   // a slightly cheaper forty legs fit. An eightieth of the limit, about half a leg's share of it, keeps forty over the
@@ -874,7 +942,7 @@ test('the gas: a fit found. With the ceiling set so forty legs do not fit and a 
   try {
     const B = await freshAccount();
     const { record, requests } = await countedCheck(() => betOn(B, market, { oddsTick: 200, riskAmount: 4_000n }));
-    assert.equal(record.state, 'not sent', JSON.stringify(record));
+    assert.equal(record.state, 'confirmed', JSON.stringify(record));
     const legs = legsOf(record).length;
     assert.ok(legs >= 1 && legs < 40, `a shorter prefix: ${legs}`);
     const gas = (record.cross as { gas: { estimate: string; limit: string } }).gas;
@@ -894,9 +962,13 @@ test('the gas: a fit found. With the ceiling set so forty legs do not fit and a 
 test('the gas: no reason at a step. One step\'s estimate answered with the node\'s out-of-gas error and no data: the search goes below it, the bet is ready with a shorter prefix, and the figures name that step as one where no reason came back', async () => {
   const market = ownMarket();
   const makers = [await freshAccount(), await freshAccount(), await freshAccount()];
-  for (const m of makers) await quoteOn(m, market, { oddsTick: 200, riskAmount: 100n });
-  const whole = await judged((await betOn(await freshAccount(), market, { oddsTick: 200, riskAmount: 300n })).hash);
+  // The three legs' limit, measured on a twin market stocked the same way by makers of its own: the measuring bet is
+  // sent, and fills the market it measured, where a second Cross would find the makers' slots written and cost less.
+  const twin = ownMarket();
+  for (const m of [await freshAccount(), await freshAccount(), await freshAccount()]) await quoteOn(m, twin, { oddsTick: 200, riskAmount: 100n });
+  const whole = await judged((await betOn(await freshAccount(), twin, { oddsTick: 200, riskAmount: 300n })).hash);
   assert.equal(legsOf(whole).length, 3, JSON.stringify(whole));
+  for (const m of makers) await quoteOn(m, market, { oddsTick: 200, riskAmount: 100n });
   // The ceiling a twelfth under the three legs' limit, not one gas: another bet's calldata has other zero bytes, so its
   // three-leg estimate can be a little lower, and one gas under let it fit. One leg's limit is far under either.
   const wholeLimit = BigInt((whole.cross as { gas: { limit: string } }).gas.limit);
@@ -907,7 +979,7 @@ test('the gas: no reason at a step. One step\'s estimate answered with the node\
       () => betOn(B, market, { oddsTick: 200, riskAmount: 300n }),
       () => proxy.rule('eth_estimateGas', { kind: 'refuseWhen', refuse: (nth) => nth === 2, code: -32003, message: 'Out of gas: gas required exceeds allowance: 1' }),
     );
-    assert.equal(record.state, 'not sent', JSON.stringify(record));
+    assert.equal(record.state, 'confirmed', JSON.stringify(record));
     assert.equal(legsOf(record).length, 1);
     const { rows } = await pool.query<{ checked: { gas: { trim: { steps: Array<{ k: number; answer?: string; fits?: boolean }> } } } }>('SELECT checked FROM crosses WHERE bet_hash = $1', [String(record.orderHash).toLowerCase()]);
     const steps = rows[0]?.checked.gas.trim.steps ?? [];
@@ -920,6 +992,7 @@ test('the gas: no reason at a step. One step\'s estimate answered with the node\
 
 test("the gas: a step refused, with no override. The node takes no override; the first listed maker's coin refuses its pull, a survivor behind it; the ceiling below the whole call: the one-quote step's estimate is refused NothingFilled naming PullRefused, so the search ends, and the bet is CROSS_WOULD_REVERT with trimmedTo 1, no estimate after it", async () => {
   const refusing = await startStack('precheck_step', { coin: 'RefusingCoin', hooked: true });
+  refusing.proxy.finalFollows(0n);
   try {
     const r = refusing.rig;
     const fund = async (i: number) => {
@@ -1022,7 +1095,7 @@ test("a stored bet changed: each of the ten fields and the signature, one at a t
   await h.disarm('after-empty-reservation');
   const control = await betOn(await freshAccount(), market);
   await h.go(held);
-  assert.equal((await judged(control.hash)).state, 'not sent', 'the control');
+  assert.equal((await judged(control.hash)).state, 'confirmed', 'the control');
   await stack.restartCourier({ hooked: true });
 });
 
@@ -1054,6 +1127,7 @@ async function clocked(which: 'ahead' | 'behind'): Promise<Clocked> {
   }
   if (behind === null) {
     const s = await startStack('precheck_behind', { hooked: true, genesisTime: BigInt(Math.floor(Date.now() / 1000)) - 2n * 86_400n });
+    s.proxy.finalFollows(0n);
     let next = 80;
     behind = {
       stack: s,
@@ -1071,15 +1145,28 @@ async function clocked(which: 'ahead' | 'behind'): Promise<Clocked> {
   return behind;
 }
 
-/** Holds the check after its reservation, mines H at `time`, and lets the check go: the outcome's record. */
+/**
+ * Holds the check after its reservation, mines H at `time`, and lets the check go: the outcome's record. A bet found
+ * ready is held again at its intent, and its Cross is mined in the block at H's time + 1, the next block its check
+ * judged it for, as the live chain's next block follows H.
+ */
 async function checkedAt(env: Clocked, post: () => Promise<Hex>, time: bigint): Promise<Record<string, unknown>> {
   await env.hooks.arm('after-reservation');
+  await env.hooks.arm('after-intent');
   const hash = await post();
   const held = await env.hooks.reached('after-reservation');
   await env.rig.setNextBlockTime(time);
   await env.rig.mine(1);
   assert.equal(await env.rig.time(), time);
   await env.hooks.go(held);
+  const first = await atIntentOrJudged(hash, env.url);
+  if (first.state !== 'queued') {
+    await env.hooks.disarm('after-intent');
+    return first;
+  }
+  const atIntent = await env.hooks.reached('after-intent');
+  await env.rig.setNextBlockTime(time + 1n);
+  await env.hooks.go(atIntent);
   return judged(hash, env.url);
 }
 
@@ -1100,7 +1187,7 @@ for (const which of ['ahead', 'behind'] as const) {
     const T0 = await env.rig.time();
     const M = await env.fresh();
     await postAs(env, M, 'rest', { ...orderOn(env.rig, M, { expiry: T0 + 600n, oddsTick: 200, riskAmount: 100_000n, ...market }), positionType: 0 });
-    for (const [gap, expect] of [[1n, 'lapsed'], [2n, 'not sent']] as const) {
+    for (const [gap, expect] of [[1n, 'lapsed'], [2n, 'confirmed']] as const) {
       const B = await env.fresh();
       const T = await env.rig.time();
       const order: Order = { ...orderOn(env.rig, B, { expiry: T + 20n, oddsTick: 200, riskAmount: 10_000n, ...market }), positionType: 1 };
@@ -1147,7 +1234,7 @@ for (const which of ['ahead', 'behind'] as const) {
     // End to end, at H's time `at`: the bet is ready with the later quote alone.
     const bet: Order = { ...orderOn(env.rig, B, { expiry: (await env.rig.time()) + 30n, oddsTick: 196, riskAmount: 10_000n, ...market }), positionType: 1 };
     const record = await checkedAt(env, () => postAs(env, B, 'take', bet), at);
-    assert.equal(record.state, 'not sent', JSON.stringify(record));
+    assert.equal(record.state, 'confirmed', JSON.stringify(record));
     assert.deepEqual(legsOf(record), [lateHash.toLowerCase()]);
   });
 
@@ -1174,7 +1261,7 @@ for (const which of ['ahead', 'behind'] as const) {
     }
     const bet: Order = { ...orderOn(env.rig, B, { expiry: (await env.rig.time()) + 30n, oddsTick: 196, riskAmount: 10_000n, ...market }), positionType: 1 };
     const record = await checkedAt(env, () => postAs(env, B, 'take', bet), at);
-    assert.equal(record.state, 'not sent', JSON.stringify(record));
+    assert.equal(record.state, 'confirmed', JSON.stringify(record));
     assert.deepEqual(legsOf(record), [(quotes[1] as Hex).toLowerCase()], 'the grant that ends at T + 2 only');
   });
 
@@ -1191,22 +1278,27 @@ for (const which of ['ahead', 'behind'] as const) {
     await new Promise((resolve) => setTimeout(resolve, 20_000));
     await env.hooks.go(held);
     const record = await judged(hash, env.url);
-    assert.equal(record.state, 'not sent', JSON.stringify(record));
+    assert.equal(record.state, 'confirmed', JSON.stringify(record));
     const { rows } = await env.pool.query<{ kind: string; at: Date }>(`SELECT kind, at FROM events WHERE bet_hash = $1 OR (order_hash = $1 AND kind = 'order received') ORDER BY number`, [hash.toLowerCase()]);
     const received = rows.find((r) => r.kind === 'order received')?.at as Date;
-    const outcome = rows.find((r) => r.kind === 'cross not sent')?.at as Date;
+    const outcome = rows.find((r) => r.kind === 'cross sent')?.at as Date;
     assert.ok(outcome.getTime() - received.getTime() >= 20_000, `the times show the hold: ${outcome.getTime() - received.getTime()} ms`);
   });
 
   test(`time, ${clock}: the game's close at T + 1 at the check is BETS_CLOSED, and at T + 2 the bet is ready; the door's check 11 at the same boundary refuses a quote and a bet alike, and takes each one second earlier`, async (t) => {
-    const env = await clocked(which);
+    // A stack of its own: the bet at T + 2 is sent and confirmed near the close, and the chain is taken back below it.
+    const env = await ownClocked(which);
     // The chain is taken back at the end: its time at the rig's game's close would close that game for every case after.
     const snapshot = (await env.rig.rpc('evm_snapshot', [])) as Hex;
     t.after(async () => {
-      await env.rig.rpc('evm_revert', [snapshot]);
-      await env.rig.mine(1);
-      const start = await env.rig.read<bigint>(env.rig.addresses.games, env.rig.abis.OspexGames as Abi, 'getGameStart', [env.rig.gameId]);
-      assert.ok((await env.rig.time()) < start + 86_400n - 3_600n, 'the chain taken back from the close, its next block too');
+      try {
+        await env.rig.rpc('evm_revert', [snapshot]);
+        await env.rig.mine(1);
+        const start = await env.rig.read<bigint>(env.rig.addresses.games, env.rig.abis.OspexGames as Abi, 'getGameStart', [env.rig.gameId]);
+        assert.ok((await env.rig.time()) < start + 86_400n - 3_600n, 'the chain taken back from the close, its next block too');
+      } finally {
+        await env.close();
+      }
     });
     const market = timeMarket(env);
     const gamesAbi = env.rig.abis.OspexGames as Abi;
@@ -1219,27 +1311,44 @@ for (const which of ['ahead', 'behind'] as const) {
     await env.rig.setNextBlockTime(closesAt - 20n);
     await env.rig.mine(1);
     await postAs(env, M, 'rest', { ...orderOn(env.rig, M, { expiry: closesAt + 600n, oddsTick: 200, riskAmount: 100_000n, ...market }), positionType: 0 });
-    // T + 2 first: its bet is admitted twenty seconds before the close. Then T + 1: its bet is admitted at the chain's
-    // time closesAt − 2, where the door takes it (the close is above T + 1), as it takes a quote there.
-    for (const [gap, expect] of [[2n, 'not sent'], [1n, 'refused']] as const) {
-      const B = gap === 2n ? B2 : B1;
-      const T = await env.rig.time();
-      if (gap === 1n) {
-        assert.equal(T, closesAt - 2n);
-        await postAs(env, Q, 'rest', { ...orderOn(env.rig, Q, { expiry: T + 600n, oddsTick: 445, ...market }), positionType: 0 });
-      }
-      const bet: Order = { ...orderOn(env.rig, B, { expiry: T + 30n, oddsTick: 200, riskAmount: 10_000n, ...market }), positionType: 1 };
-      const record = await checkedAt(env, () => postAs(env, B, 'take', bet), closesAt - gap);
-      assert.equal(record.state, expect, JSON.stringify(record));
-      if (expect === 'refused') {
-        const v = record.verdict as Record<string, unknown>;
-        assert.equal(v.code, 'BETS_CLOSED');
-        const block = v.block as { number: string };
-        assert.equal(v.error, `At block ${block.number}, bets on game ${env.rig.gameId} close at ${closesAt}, the start plus its window. The chain's time is ${closesAt - 1n}, so no later block can take this bet. Nothing was sent.`);
-      }
-    }
+    // T + 2 first: its bet is admitted twenty seconds before the close, checked at closesAt − 2 and found ready, and
+    // held at its intent, before anything is signed or sent. Then T + 1: its bet is admitted at the chain's time
+    // closesAt − 2, where the door takes it (the close is above T + 1), as it takes a quote there. The first is let go,
+    // and its Cross mined in the block at closesAt − 1, the next block its check judged it for: that block is the
+    // second's H.
+    let T = await env.rig.time();
+    const ready: Order = { ...orderOn(env.rig, B2, { expiry: T + 30n, oddsTick: 200, riskAmount: 10_000n, ...market }), positionType: 1 };
+    await env.hooks.arm('after-reservation');
+    await env.hooks.arm('after-intent');
+    const readyHash = await postAs(env, B2, 'take', ready);
+    const readyHeld = await env.hooks.reached('after-reservation');
+    await env.rig.setNextBlockTime(closesAt - 2n);
+    await env.rig.mine(1);
+    await env.hooks.go(readyHeld);
+    const atIntent = await atIntentOrJudged(readyHash, env.url);
+    assert.equal(atIntent.state, 'queued', JSON.stringify(atIntent));
+    const intentHeld = await env.hooks.reached('after-intent');
+    T = await env.rig.time();
+    assert.equal(T, closesAt - 2n);
+    await postAs(env, Q, 'rest', { ...orderOn(env.rig, Q, { expiry: T + 600n, oddsTick: 445, ...market }), positionType: 0 });
+    const closing: Order = { ...orderOn(env.rig, B1, { expiry: T + 30n, oddsTick: 200, riskAmount: 10_000n, ...market }), positionType: 1 };
+    await env.hooks.arm('after-reservation');
+    const closingHash = await postAs(env, B1, 'take', closing);
+    await env.rig.setNextBlockTime(closesAt - 1n);
+    await env.hooks.go(intentHeld);
+    const record = await judged(readyHash, env.url);
+    assert.equal(record.state, 'confirmed', JSON.stringify(record));
+    const closingHeld = await env.hooks.reached('after-reservation');
+    assert.equal(await env.rig.time(), closesAt - 1n);
+    await env.hooks.go(closingHeld);
+    const refused = await judged(closingHash, env.url);
+    assert.equal(refused.state, 'refused', JSON.stringify(refused));
+    const v = refused.verdict as Record<string, unknown>;
+    assert.equal(v.code, 'BETS_CLOSED');
+    const block = v.block as { number: string };
+    assert.equal(v.error, `At block ${block.number}, bets on game ${env.rig.gameId} close at ${closesAt}, the start plus its window. The chain's time is ${closesAt - 1n}, so no later block can take this bet. Nothing was sent.`);
     // The door, at the chain's time closesAt − 1: a quote and a bet are refused; at closesAt − 2 (above) each was taken.
-    const T = await env.rig.time();
+    T = await env.rig.time();
     assert.equal(T, closesAt - 1n);
     for (const [role, order] of [
       ['rest', { ...orderOn(env.rig, D, { expiry: T + 600n, oddsTick: 444, ...market }), positionType: 0 }],
@@ -1251,6 +1360,38 @@ for (const which of ['ahead', 'behind'] as const) {
       assert.equal(answer.body.error, `Bets on game ${env.rig.gameId} close at ${closesAt}, the start plus its window. The chain's time is ${T}, so no later block can take this order.`);
     }
   });
+}
+
+/**
+ * A clocked stack of its own, for a case whose chain is taken back at its end below a Cross the courier has sent and
+ * recorded final: no other case's courier holds that Cross. Closed by the case.
+ */
+async function ownClocked(which: 'ahead' | 'behind'): Promise<Clocked & { close(): Promise<void> }> {
+  const s = await startStack(`precheck_close_${which}`, which === 'ahead' ? { hooked: true } : { hooked: true, genesisTime: BigInt(Math.floor(Date.now() / 1000)) - 2n * 86_400n });
+  s.proxy.finalFollows(0n);
+  if (which === 'ahead') {
+    const wall = BigInt(Math.floor(Date.now() / 1000));
+    const T = await s.rig.time();
+    if (T < wall + 86_400n) await s.rig.increaseTime(wall + 86_400n - T);
+  }
+  let next = 80;
+  const ownPool = openPool(s.databaseUrl, null);
+  return {
+    stack: s,
+    rig: s.rig,
+    url: s.courier.url,
+    hooks: s.courier.hooks as HookControl,
+    pool: ownPool,
+    async fresh() {
+      const who = s.rig.account(next++);
+      await s.rig.fund(who);
+      return who;
+    },
+    async close() {
+      await ownPool.end();
+      await s.close();
+    },
+  };
 }
 
 /** The market's key, as the contract computes it. */
@@ -1296,11 +1437,14 @@ test("netting from the bettor's side: a bettor that holds side A (it rested 5,00
   const M = await freshAccount();
   await quoteOn(M, market, { oddsTick: 200, riskAmount: 100_000n });
   const record = await judged((await betOn(B, market, { oddsTick: 200, riskAmount: 4_000n })).hash);
-  assert.equal(record.state, 'not sent', JSON.stringify(record));
+  assert.equal(record.state, 'confirmed', JSON.stringify(record));
   const id = await marketIdOf(market);
   const positions = rig.abis.OspexPositions as Abi;
-  const [bettorPull] = await rig.read<[bigint, bigint]>(rig.addresses.positions, positions, 'previewFill', [id, B.address, 1, 4_000n, 4_000n]);
-  const [makerPull] = await rig.read<[bigint, bigint]>(rig.addresses.positions, positions, 'previewFill', [id, M.address, 0, 4_000n, 4_000n]);
+  // Read at H, the block the record's pulls are of: the Cross has since filled, at a later block.
+  const atH = BigInt((record.cross as { block: { number: string } }).block.number);
+  const preview = async (args: readonly unknown[]) => (await rig.publicClient.readContract({ address: rig.addresses.positions, abi: positions, functionName: 'previewFill', args, blockNumber: atH })) as readonly [bigint, bigint];
+  const [bettorPull] = await preview([id, B.address, 1, 4_000n, 4_000n]);
+  const [makerPull] = await preview([id, M.address, 0, 4_000n, 4_000n]);
   const pulls = pullsOf(record);
   assert.deepEqual(
     { bettor: pulls[B.address.toLowerCase()] ?? '0', maker: pulls[M.address.toLowerCase()] ?? '0' },
@@ -1333,7 +1477,7 @@ test('a maker that cannot pay is passed: its quote, the better price, not listed
   await walletTo(poor, 0n);
   const second = await quoteOn(able, market, { oddsTick: 200, riskAmount: 10_000n });
   const record = await judged((await betOn(await freshAccount(), market, { oddsTick: 196, riskAmount: 1_000n })).hash);
-  assert.equal(record.state, 'not sent', JSON.stringify(record));
+  assert.equal(record.state, 'confirmed', JSON.stringify(record));
   assert.deepEqual(legsOf(record), [second.hash.toLowerCase()], `the first, ${first.hash}, is passed`);
 });
 
@@ -1375,7 +1519,7 @@ test("NOT_ENOUGH_DEPTH, and the minimum's two edges: a bet of 10,000 with a mini
   const posted = await postOrder(url(), rig, B, 'take', bet);
   assert.equal(posted.status, 202, JSON.stringify(posted.body));
   const last = await judged(posted.body.orderHash as string);
-  assert.equal(last.state, 'not sent', `the bet's last 100 meets its minimum: ${JSON.stringify(last)}`);
+  assert.equal(last.state, 'confirmed', `the bet's last 100 meets its minimum: ${JSON.stringify(last)}`);
   assert.deepEqual(legsOf(last), [small.hash.toLowerCase()]);
 
   // The quote's last 100: a quote of 10,000 with a minimum of 9,900, 9,900 of it filled by a Cross the test sends.
@@ -1390,7 +1534,7 @@ test("NOT_ENOUGH_DEPTH, and the minimum's two edges: a bet of 10,000 with a mini
   const rest = await postOrder(url(), rig, M, 'rest', q);
   assert.equal(rest.status, 201, JSON.stringify(rest.body));
   const ready = await judged((await betOn(await freshAccount(), quoteMarket, { oddsTick: 200, riskAmount: 10_000n })).hash);
-  assert.equal(ready.state, 'not sent', `the quote's last 100 is listed: ${JSON.stringify(ready)}`);
+  assert.equal(ready.state, 'confirmed', `the quote's last 100 is listed: ${JSON.stringify(ready)}`);
   assert.deepEqual((ready.cross as { legs: Array<{ orderHash: string; makerRisk: string }> }).legs.map((l) => [l.orderHash.toLowerCase(), l.makerRisk]), [[(rest.body.orderHash as string).toLowerCase(), '100']]);
 });
 
@@ -1549,18 +1693,25 @@ test("the largest read B and read C, on the rig: 200 quotes of 200 registered ac
   const from = proxy.counted.length;
   const log = recording(['eth_call']);
   let record: Record<string, unknown>;
+  let to: number;
   try {
+    // The check's calls, to its result, before any step of the send: recorded there, and the courier goes on.
+    await hooks().arm('before-result');
     await hooks().go(held);
+    const atResult = await hooks().reached('before-result');
+    log.stop();
+    to = proxy.counted.length;
+    await hooks().go(atResult);
     record = await judged(bet.hash);
   } finally {
     log.stop();
   }
-  assert.equal(record.state, 'not sent', JSON.stringify(record));
+  assert.equal(record.state, 'confirmed', JSON.stringify(record));
   const H = (record.cross as { block: { hash: string } }).block;
   assert.deepEqual(legsOf(record), [rows[0]?.hash], 'the best price fills the bet');
 
   // The check's calls to the node, each with its bytes as the proxy counted them, in the order they arrived.
-  const counted = proxy.counted.slice(from).filter((c) => c.method === 'eth_call');
+  const counted = proxy.counted.slice(from, to).filter((c) => c.method === 'eth_call');
   assert.equal(counted.length, log.calls.length, 'every call the proxy counted was recorded');
   const name = (target: string, data: Hex) => {
     const abi = target === rig.addresses.matching.toLowerCase() ? rig.abis.OspexMatching : target === rig.addresses.positions.toLowerCase() ? rig.abis.OspexPositions : target === rig.addresses.markets.toLowerCase() ? rig.abis.OspexMarkets : null;
@@ -1607,6 +1758,29 @@ async function checkedAfter(post: () => Promise<{ hash: Hex }>, between: () => P
 
 /** The chain as it stands, kept to be taken back to. */
 const snapshotNow = async (): Promise<Hex> => (await rig.rpc('evm_snapshot', [])) as Hex;
+
+/**
+ * A case that takes its chain back below a bet the courier has sent, run on a stack of its own: this file's stack, its
+ * rig, its proxy and its database stand in for the file's own while the case runs, and are closed after it. On the
+ * file's own stack the lane's records would then hold a final block its chain no longer has, and that lane would
+ * rightly send nothing more for the cases after.
+ */
+async function onOwnStack(name: string, body: () => Promise<void>): Promise<void> {
+  const own = await startStack(name, { hooked: true });
+  own.proxy.finalFollows(0n);
+  const saved = { stack, rig, proxy, pool };
+  stack = own;
+  rig = own.rig;
+  proxy = own.proxy;
+  pool = openPool(own.databaseUrl, null);
+  try {
+    await body();
+  } finally {
+    await pool.end();
+    ({ stack, rig, proxy, pool } = saved);
+    await own.close();
+  }
+}
 /** The chain taken back to the snapshot, and a block mined on it: the next H is a block of that branch. */
 async function backTo(snapshot: Hex): Promise<void> {
   assert.equal(await rig.rpc('evm_revert', [snapshot]), true);
@@ -1694,23 +1868,25 @@ test("the game's reporters at H: a bet admitted by a courier whose published lis
   }
 });
 
-test("the cap: on a branch where the cap is lifted, a bet of 10,100 is admitted and found ready; a second, admitted there and checked after the chain is taken back under the lift, is ABOVE_CAP at its block, with the cap and the sentence", async () => {
-  const market = ownMarket();
-  const B1 = await freshAccount();
-  const B2 = await freshAccount();
-  const M = await freshAccount();
-  const before = await snapshotNow();
-  await liftCap(rig);
-  await quoteOn(M, market, { oddsTick: 200, riskAmount: 100_000n });
-  const lifted = await judged((await betOn(B1, market, { oddsTick: 200, riskAmount: 10_100n })).hash);
-  assert.equal(lifted.state, 'not sent', `after the lift, 10,100 is found ready: ${JSON.stringify(lifted)}`);
-  const capped = await checkedAfter(() => betOn(B2, market, { oddsTick: 200, riskAmount: 10_100n }), () => backTo(before));
-  const v = verdictOf(capped);
-  assert.deepEqual(
-    { state: capped.state, code: v.code, cap: v.cap, error: v.error },
-    { state: 'refused', code: 'ABOVE_CAP', cap: '10000', error: `At block ${v.n}, bets are capped at 0.01 USDC until the cap is lifted. This bet is signed for 0.0101 USDC. Nothing was sent.` },
-  );
-});
+test("the cap: on a branch where the cap is lifted, a bet of 10,100 is admitted and found ready; a second, admitted there and checked after the chain is taken back under the lift, is ABOVE_CAP at its block, with the cap and the sentence", () =>
+  // A stack of its own: the first bet is sent and confirmed on the branch, and the chain is taken back below it.
+  onOwnStack('precheck_cap', async () => {
+    const market = ownMarket();
+    const B1 = await freshAccount();
+    const B2 = await freshAccount();
+    const M = await freshAccount();
+    const before = await snapshotNow();
+    await liftCap(rig);
+    await quoteOn(M, market, { oddsTick: 200, riskAmount: 100_000n });
+    const lifted = await judged((await betOn(B1, market, { oddsTick: 200, riskAmount: 10_100n })).hash);
+    assert.equal(lifted.state, 'confirmed', `after the lift, 10,100 is found ready: ${JSON.stringify(lifted)}`);
+    const capped = await checkedAfter(() => betOn(B2, market, { oddsTick: 200, riskAmount: 10_100n }), () => backTo(before));
+    const v = verdictOf(capped);
+    assert.deepEqual(
+      { state: capped.state, code: v.code, cap: v.cap, error: v.error },
+      { state: 'refused', code: 'ABOVE_CAP', cap: '10000', error: `At block ${v.n}, bets are capped at 0.01 USDC until the cap is lifted. This bet is signed for 0.0101 USDC. Nothing was sent.` },
+    );
+  }));
 
 test('a lapse in the queue: a bet behind a held check, its expiry two seconds past the chain\'s time, reaches its turn after the chain has moved past it, and is lapsed, BET_LAPSED, with no Cross', async () => {
   // Both accounts funded first: a funding mines blocks, and on some nodes each block moves the chain's time on.
@@ -1854,24 +2030,26 @@ test("the bet's own standing at H, each with its sentence: cancelled by its own 
   }
 });
 
-test('a live quote after kickoff, the game\'s start passed and its close not reached, is listed, and the bet is ready (the chain taken back afterwards)', async () => {
-  const before = await snapshotNow();
-  try {
-    const game = await rig.createGame();
-    const start = await rig.read<bigint>(rig.addresses.games, rig.abis.OspexGames as Abi, 'getGameStart', [game]);
-    const M = await freshAccount();
-    const B = await freshAccount();
-    await rig.setNextBlockTime(start + 60n);
-    await rig.mine(1);
-    const market = { ...ownMarket() };
-    const q = await quoteOn(M, market, { gameId: game });
-    const record = await judged((await betOn(B, market, { gameId: game })).hash);
-    assert.equal(record.state, 'not sent', JSON.stringify(record));
-    assert.deepEqual(legsOf(record), [q.hash.toLowerCase()]);
-  } finally {
-    await backTo(before);
-  }
-});
+test('a live quote after kickoff, the game\'s start passed and its close not reached, is listed, and the bet is ready (the chain taken back afterwards)', () =>
+  // A stack of its own: the bet is sent and confirmed after kickoff, and the chain is taken back below it.
+  onOwnStack('precheck_kickoff', async () => {
+    const before = await snapshotNow();
+    try {
+      const game = await rig.createGame();
+      const start = await rig.read<bigint>(rig.addresses.games, rig.abis.OspexGames as Abi, 'getGameStart', [game]);
+      const M = await freshAccount();
+      const B = await freshAccount();
+      await rig.setNextBlockTime(start + 60n);
+      await rig.mine(1);
+      const market = { ...ownMarket() };
+      const q = await quoteOn(M, market, { gameId: game });
+      const record = await judged((await betOn(B, market, { gameId: game })).hash);
+      assert.equal(record.state, 'confirmed', JSON.stringify(record));
+      assert.deepEqual(legsOf(record), [q.hash.toLowerCase()]);
+    } finally {
+      await backTo(before);
+    }
+  }));
 
 test('a judged bet posted again in the same role is answered 200 with its whole record, verdict and all, and nothing is written', async () => {
   const B = await freshAccount();
@@ -1892,7 +2070,7 @@ test("a token sent to the key unasked: its balance at the check's block is in th
   const market = ownMarket();
   await quoteOn(await freshAccount(), market);
   const bet = await betOn(await freshAccount(), market);
-  assert.equal((await judged(bet.hash)).state, 'not sent');
+  assert.equal((await judged(bet.hash)).state, 'confirmed');
   const { rows } = await pool.query<{ checked: { keyCoin: string; relayCoin: string } }>('SELECT checked FROM crosses WHERE bet_hash = $1', [bet.hash.toLowerCase()]);
   assert.deepEqual({ keyCoin: rows[0]?.checked.keyCoin, relayCoin: rows[0]?.checked.relayCoin }, { keyCoin: keyCoin.toString(), relayCoin: relayCoin.toString() });
   assert.ok(keyCoin >= sent);

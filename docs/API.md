@@ -1,8 +1,8 @@
 # The courier's wire contract
 
 What a maker's or a bettor's program sends the courier, what it is answered, and what each answer means. This wire
-contract covers order submission, signed stops and the read routes. This build records bets but does not send them to
-the chain.
+contract covers order submission, signed stops and the read routes. This build sends a bet it finds ready to the
+chain once, as a Cross, and the bet's record says what became of it.
 
 JSON under `/v1`, over https only. No sign-in and no secret: a signed order is its own permission, and the book is
 public. Amounts are decimal strings in the coin's smallest unit; addresses are hex; an order is known by its hash,
@@ -152,50 +152,186 @@ account's budget and leaves no line. A database that cannot be read is `503 DATA
 **The same order posted again** is answered at check 5 from its record, whatever has become of it since: a stopped
 order's record says `ended: "stopped"`, and a judged bet's carries its verdict or its Cross. It writes nothing.
 
-## Part 3a. A bet's check, and its record
+## Part 3a. A bet's check, its Cross, and its record
 
 A bet admitted waits its turn in one lane, the lane of the courier's key. One bet is checked at a time, in the order
 the bets were recorded. At its turn the courier reads the chain at one block, H, named by its hash, and judges the
 bet: its own standing at H, in the door's order; then the quotes on the other side that meet its price, in the
 published order (`docs/FILL_PRIORITY.md`), with what each account's wallet would actually be pulled, net of what it
 already holds on the market; then the exact call the courier would send, run at H, and its gas. Then it writes what
-came of it: ready, refused with a code and a sentence, or lapsed. In this build it sends nothing: a bet found ready
-is closed `not sent`.
+came of it: refused with a code and a sentence, lapsed, or ready. A ready bet is sent: the courier signs one
+transaction for it, a Cross to the relay, and hands it to the node once. The lane holds the bet until the chain shows
+what became of that transaction at a final block, and only then takes the next bet.
+
+**Before it signs,** the courier checks what the send itself needs: that its key's lane is not shut; that every
+nonce of its key the chain has used at the final block is one its records explain; the fees, the tip the node
+suggests and a cap of twice H's base fee plus that tip, each a quarter above any earlier transaction of its own at
+the same nonce that was never mined; and that its key holds enough POL for the gas limit times that cap. It signs
+only the Cross the check built, to the relay, carrying no coin, at the nonce, gas and fees it chose, and reads its
+own signed bytes back before it keeps anything.
+
+**The gate.** Just before the hand-off the courier takes the lock of the bet's hash and of every quote listed, the
+locks a stop takes, and looks for a stop of any of them. A stop recorded before the gate keeps the transaction from
+the node: nothing is handed over, and the Cross is closed `not sent`. A stop that arrives during the hand-off waits on
+those locks until the node's answer is recorded, and is then told where the hand-off stood (part 4).
+
+**Send once.** One bet has one Cross and one transaction; the signed bytes are never stored; the hand-off is one
+request with no retry. A process that stops at any point is followed by a start that never signs or sends again for
+an attempt already begun: one that had not reached the gate is closed `not sent`, and one at or past it is settled
+from the chain before the lane takes anything else.
+
+**The outcome, from the chain alone.** The courier reads the final block, F, and from then on names it by its hash.
+A receipt counts only in a block shown to be on F's chain; a height alone shows nothing. A receipt above F is
+`pending`; one at or under F on F's chain is `confirmed` or `reverted`; a transaction in no block, at a final block
+whose time is at or past the bet's expiry, is `expired unmined`; one whose place in the key's line another
+transaction took, in a final block, is `replaced`. No timer closes a Cross, and no wait running out does. For every
+outcome the bet's total filled at that final block is read and recorded with it. A reverted Cross's reason comes from
+one trace of the transaction, and an account is named only where that trace shows its own act; the courier never
+runs the transaction again to guess.
 
 `GET /v1/orders/{hash}` for a bet:
 
 ```
-"state":   "queued" | "refused" | "lapsed" | "stopped" | "not sent"
-"turn":    "waiting" | "checking"                                       (only while "queued")
+"state":   "queued" | "refused" | "lapsed" | "stopped" | "unknown" | "sent" | "pending" | "confirmed" |
+           "reverted" | "expired unmined" | "replaced" | "not sent"
+"turn":    "waiting" | "checking" | "sending"                           (only while "queued")
 "verdict": { "code", "error",
              "block": { "number", "hash", "time" } | null,
              "lastObservedBlock": { "number", "hash", "time" },         (only where no check decided, and a header was read)
              "at", …the code's own fields }
                                          (when "refused", "lapsed", or "stopped" while held)
 "cross":   { "state", "handOffs", "reason", "message", "block": { … },
-             "legs": [ { "position", "orderHash", "account", "oddsTick", "makerRisk", "takerRisk" } ],
              "takerRisk", "unfilled",
              "pulls": { "<account>": "<amount>" }, "paysBack": { … },
              "paysBackRefused": { "<account>": "<amount>" },
-             "gas": { "estimate", "limit" }, "nonce" }                  (when the check found it ready; else null)
+             "gas": { "estimate", "limit", "used" },
+             "txHash", "nonce", "fees": { "cap", "tip", "paid" }, "cost", "answer",
+             "receipt": { "block": { "number", "hash", "time" } }, "final": { "number", "hash", "time" },
+             "betFilled", "evidence", "values", "expiry", "pinnedOn", "affected",
+             "replacedBy", "replacedByOurs",
+             "recordedPulls", "recordedPaysBack", "recordedPaysBackRefused", "reconciled",
+             "intentAt", "signedAt", "gateAt", "answeredAt", "receiptSeenAt", "outcomeAt",
+             "legs": [ { "position", "orderHash", "account", "oddsTick", "makerRisk", "takerRisk",
+                         "recorded": { "makerRisk", "takerRisk" } | "skipped": "<the contract's reason>" } ] }
+                                         (when the check found it ready; else null)
+"message": a sentence                    (only on a bet kept from before a restore, with no Cross)
 ```
 
 - `verdict.block` is the block where a check finished and decided the outcome: a lapse, or a refusal labelled with
-  its block. A ready bet's block is `cross.block`. It is `null` where no check decided the outcome: for
-  `CHAIN_UNREACHABLE`, where no round finished, and for `STOPPED`, which a stop's mark decided and not a block.
+  its block. A ready bet's block is `cross.block`, the block it was checked at. It is `null` where no check decided
+  the outcome: for `CHAIN_UNREACHABLE`, where no round finished, and for `STOPPED`, which a stop's mark decided and
+  not a block.
 - `lastObservedBlock` is then the last header the check read, where it read one, an observation: it is not the block
   at which a complete decision was made. It is absent where no header was read, and from an outcome a check decided.
   The block a bet was admitted at is never in either field.
 - `at` is the time the outcome was recorded.
 - `step` is `"estimate"` on a `CROSS_WOULD_REVERT` that came from the node's gas estimate for the exact transaction:
   the transaction itself ran at that block, and its estimate was refused. Other verdicts have no `step`.
-- `cross.message` is the sentence of the Cross's state. `paysBackRefused` holds the pay-backs the courier's
-  comparison with the contract saw the coin refuse at H; those amounts stay held for those accounts.
-- **The state is the bet's first end.** `stopped` where a stop's mark came before the judgment: with the verdict
+- **A field the record cannot fill yet is absent,** never null or a made-up value: no `txHash` before the signature,
+  no receipt before a receipt is seen, no final block before the final proof, and no `reason` except on a `reverted`
+  Cross or on a `not sent` Cross whose record holds its not-sent reason. On every other Cross the `reason` property is
+  absent. `"unavailable"` is a value: the courier asked, and the node could not say.
+- `reason` — on `not sent`, the record's not-sent reason; on `reverted`, its recorded revert reason, including
+  explicitly unavailable where that is all the record establishes; absent in every other state.
+- `cross.pulls`, `paysBack` and `paysBackRefused` are what the check expected at H; `recordedPulls`,
+  `recordedPaysBack` and `recordedPaysBackRefused` are what the receipt shows. Where they differ, the chain moved
+  between H and the landing; only a contradiction of the chain's own state is the courier's fault.
+- `cross.betFilled` is the bet's total filled at `cross.final`, across every transaction that filled it, this one
+  included. `cross.cost` is the gas used times the price paid, in POL.
+- `cross.reconciled` is `false` while the courier's operator has an unresolved case open for the key's line at this
+  Cross; an ordinary search that later succeeds resolves it.
+- The times `intentAt` to `outcomeAt` say when each step was recorded. They decide nothing.
+- **The state is the bet's first end.** `stopped` where a stop's mark came before the hand-off: with the verdict
   `STOPPED` if it came while the bet was held, and with none if it came while it waited. Otherwise the judgment's
-  state, with `ended` showing a later stop beside it.
-- **While it waits:** `"state": "queued"`, with `"turn": "waiting"` (its turn has not come) or `"checking"` (the
-  lane holds it). No time is promised: a bet's turn comes after the bets ahead of it.
+  state, or the Cross's, with `ended` showing a later stop beside it.
+- **While it waits:** `"state": "queued"`, with `"turn": "waiting"` (its turn has not come), `"checking"` (the lane
+  holds it) or `"sending"` (it is being signed and handed to the chain). No time is promised: a bet's turn comes
+  after the bets ahead of it.
+
+**The Cross's state on the wire.** For an ordinary attempt, before the hand-off gate is committed, an `intent` or
+`signed` Cross reads `queued`, with `turn: "sending"`. Once that gate is committed, a Cross in `handing off` or
+`unknown` reads `unknown`: the transaction may have left the courier, and no recorded taken answer or current receipt
+supports sent or pending. A named error from the node is unknown too. A recorded taken answer gives `sent`; a
+recorded receipt awaiting final proof gives `pending`. The terminal states `confirmed`, `reverted`,
+`expired unmined`, `replaced` and `not sent` read by those same names. Only a stop found at the gate or an ordinary
+restart before the gate produces `not sent`; no answer to the raw-send request does.
+
+A restored record whose earlier outcome is not established reads `unknown`, not newly being signed or not sent. Its
+transaction hash is absent unless retained or recovered from evidence. An already-proved outcome keeps its evidenced
+answer.
+
+`cross.answer` records `kind: "taken"` or `kind: "unknown"`. An unknown answer may also contain `words`, one of the
+courier's fixed labels for a named node error. Those words record the answer, not proof that the transaction was
+rejected everywhere or that it cannot fill. The courier does not publish the node's raw error text. The answer and its
+words do not determine a final outcome.
+
+**Its sentences** (`cross.message`). Each speaks of this transaction, not of the bet at every courier. `{…}` is a
+value filled in; amounts are in USDC.
+
+| state | code or reason | when | the sentence |
+| -- | -- | -- | -- |
+| `queued`, `turn: "sending"` | — | being signed and recorded | "This bet was checked at block {n} and is being signed and handed to the chain. Next: read this record again in a few seconds." |
+| `unknown` | — | the hand-off gate is committed, and no recorded taken answer or current receipt supports sent or pending, including a named error or any other unknown answer | "The courier may have handed this bet's fill to the chain as transaction {txHash}, and cannot yet say whether the chain has it. It may still fill before its expiry; a final block at or past that expiry proves it cannot fill later. This record changes when the chain shows what became of it. Next: do not sign another bet for this wager yet. Read this record again every few seconds. A compatible final block at or past this bet's expiry, {expiry}, proves it cannot newly fill; this clock does not. If the record is still unresolved then, read this bet's total filled at that same block. If the wager can still be placed, read the quotes again and sign only for what remains unfilled. Without those chain facts, keep waiting. The courier records an unresolved case for its operator; you need not report it." |
+| `sent` | — | the node took it | "The courier handed this bet's fill to the chain as transaction {txHash} at {time}. The courier has not seen it in a final block yet. It may still fill, or the chain may refuse it. Next: do not sign another bet for this wager yet. Read this record again every few seconds. A compatible final block at or past this bet's expiry, {expiry}, proves it cannot newly fill; this clock does not. If the record is still unresolved then, read this bet's total filled at that same block. If the wager can still be placed, read the quotes again and sign only for what remains unfilled. Without those chain facts, keep waiting. The courier records an unresolved case for its operator; you need not report it." |
+| `pending` | — | in a block that is not yet final | "The courier has seen transaction {txHash} in block {n}, which is not final yet; that block can still be dropped. Next: do not sign another bet for this wager yet. Read this record again every few seconds. A compatible final block at or past this bet's expiry, {expiry}, proves it cannot newly fill; this clock does not. If the record is still unresolved then, read this bet's total filled at that same block. If the wager can still be placed, read the quotes again and sign only for what remains unfilled. Without those chain facts, keep waiting. The courier records an unresolved case for its operator; you need not report it." |
+| `confirmed` | — | in a final block, and it filled | "Transaction {txHash} is in final block {n}. It filled {filled} USDC of this bet's {stake} USDC, at the prices of the quotes listed." With a part unfilled: "{unfilled} USDC of it did not fill in this transaction, and this courier does not carry the rest." With a leg the chain skipped: "The chain skipped {k} of the quotes listed: {reasons}." Then the bet's line. |
+| `reverted` | `reason`, from the trace | in a final block, and the chain refused it | "Transaction {txHash} is in final block {n}, and the chain refused it: {reason}. It filled nothing of this bet and moved no USDC; the courier paid its network fee." `{reason}` is the reason's words (below). Then the bet's line. |
+| `reverted` | `reason: "unavailable"` | the same, and the node gives no trace | "Transaction {txHash} is in final block {n}, and the chain refused it. The courier could not read why. It filled nothing of this bet and moved no USDC; the courier paid its network fee. Before you bet again, check this account's USDC balance and its approval to the positions contract." Then the bet's line. |
+| `reverted` | with `expiry` | the same, in a block at or past the bet's expiry | "Transaction {txHash} reached the chain in block {n}, at {blockTime}, at or after this bet's expiry, {expiry}, so it could not fill. It moved no USDC; the courier paid its network fee." Where a trace names the reason: "The chain's reason: {reason}." Then the bet's line. |
+| `expired unmined` | — | in no block up to a final block at or past the expiry | "Transaction {txHash} was in no block up to final block {n}, whose time, {time}, is at or past this bet's expiry, {expiry}. It can no longer fill this bet." Where a restored database held only the attempt's start: "No transaction of the courier's for this bet is in a block up to final block {n}, whose time, {time}, is at or past its expiry, {expiry}. None can fill it now." Then the bet's line. |
+| `replaced` | `replacedBy` | its place in the key's line used, in a final block, by another transaction | "Transaction {txHash} can never be mined: transaction {replacedBy}, which took its place in the courier's line, is in final block {n}." Then the bet's line. |
+| `not sent` | `STOPPED_AT_GATE` | a stop on a quote listed for it, found at the gate | "A stop for a quote listed for this bet was recorded before the courier handed the fill to the chain, so this courier sent nothing for it. Next: before signing another bet for this wager, establish at a compatible final block that the original signed order cannot fill again, by its expiry or an on-chain cancellation, and read its total filled at that block. Then, if the wager can still be placed, read the quotes again and sign only for the amount still unfilled." |
+| `not sent` | `COURIER_RESTARTED` | the courier restarted, or another of its processes took over, before the gate | "This attempt ended before the courier handed this bet's fill to the chain, so this courier sent nothing for it. Next: before signing another bet for this wager, establish at a compatible final block that the original signed order cannot fill again, by its expiry or an on-chain cancellation, and read its total filled at that block. Then, if the wager can still be placed, read the quotes again and sign only for the amount still unfilled." |
+| `unknown` | — | a bet kept from before a restore whose outcome the restored records do not establish, with a Cross or with none | "The restored record does not establish what became of this bet before recovery. Nothing new is being signed for it. Next: do not sign another bet for this wager yet. Read this record again every few seconds. A compatible final block at or past this bet's expiry, {expiry}, proves it cannot newly fill; this clock does not. If the record is still unresolved then, read this bet's total filled at that same block. If the wager can still be placed, read the quotes again and sign only for what remains unfilled. Without those chain facts, keep waiting. The courier records an unresolved case for its operator; you need not report it." |
+
+A bet its own account stopped reads `stopped`, at whatever point before the hand-off the stop came.
+
+**The bet's line,** after an outcome at a final block: the total the chain shows at that block, then one next step,
+chosen by that total against the bet's stake and by that block's time against the bet's expiry, at or past it
+including equality.
+
+- Nothing filled: "Nothing of this bet has filled on the chain as of final block {n}." Before the expiry: "Next: before signing another bet for this wager, establish at a compatible final block that the original signed order cannot fill again, by its expiry or an on-chain cancellation, and read its total filled at that block. Then, if the wager can still be placed, read the quotes again and sign only for the amount still unfilled." At or past the expiry: "Next: this bet's expiry has passed at a final block, so it cannot fill. If the wager can still be placed, read the quotes again and sign a new bet."
+- A part filled: "The chain shows {betFilled} USDC of this bet's {stake} USDC filled in total as of final block {n}." Before the expiry: "The filled part stands. Next: before signing another bet for this wager, establish at a compatible final block that the original signed order cannot fill again, by its expiry or an on-chain cancellation, and read its total filled at that block. Then, if the wager can still be placed, read the quotes again and sign only for the amount still unfilled." At or past the expiry: "Next: the filled part stands. This bet's expiry has passed at a final block, so the rest cannot fill. If the wager can still be placed, read the quotes again and sign a new bet for up to {rest} USDC." `{rest}` is the stake less the total filled.
+- Filled in full: "The chain shows this bet's {stake} USDC filled in full as of final block {n}." It has no next step.
+- Where the chain's reason is the game's (`BetsClosed`, `GameEnded`, `MarketSettled`), the line keeps its first sentence, and its next step is instead: "Next: this game takes no more bets, so choose another game to bet on." A part filled puts "The filled part stands." before that step.
+- Where the courier could not establish an account action that caused the refusal (a reason it does not know, an empty one not shown to be out of gas, or one it knows that the table below does not list), the line's step is followed by: "If the new bet is refused the same way, do not sign another: the cause is not established, and there is nothing to report." Filled in full, the line has no step and no such sentence.
+
+**The chain's reason, in words,** the `{reason}` of a traced `reverted`:
+
+| the reason | its words |
+| -- | -- |
+| `TakerPullRefused`, the bettor's own act shown | "the coin would not move {pull} USDC from this bet's account: its {what} was too low. Raise it to at least {pull} USDC before you bet again". `{what}` is "USDC balance" or "approval to the positions contract", as the coin's own refusal in the trace names it |
+| `TakerPullRefused`, no act shown | "the coin would not move {pull} USDC from this bet's account, and the courier cannot tell why. Check its USDC balance and its approval to the positions contract; the coin can also refuse by a rule of its own" |
+| `TakingOrderGrantGone`, the grant revoked or replaced | "this bet's grant, {grant}, was revoked or replaced before the fill landed. To sign as an agent again, use a suitable current, unexpired grant; if none exists, the account must grant one. The account may instead sign for itself" |
+| `TakingOrderGrantGone`, the grant ended by its time | "this bet's grant, {grant}, ended at {endsAt}, before the fill landed. To sign as an agent again, use a suitable current, unexpired grant; if none exists, the account must grant one. The account may instead sign for itself" |
+| `SenderNotCourier`, the bet's own account | "this bet's account took the courier's relay, {relay}, off its couriers before the fill landed. Register the relay again before you bet again" |
+| `SenderNotCourier`, a quote's account | "this quote's account had not registered the courier's relay at execution" |
+| `TakingOrderCancelled` | "this bet was cancelled on chain before the fill landed: by its own cancel, by its account moving to a new version, or by a floor raised above its order number on this line. A new bet uses a new hash, the account's current version, and an order number at or above this line's floor" |
+| `TakingOrderFilled` | "this bet had already filled on the chain" |
+| `TakingOrderExpired` | "this bet's expiry had come when the fill landed" |
+| `TakingOrderTooLong` | "this bet's expiry was further past the block's time than the contract allows" |
+| `NothingFilled` | "none of the quotes listed could fill when the fill landed: {skips}", each quote's skip by its reason, in list order |
+| `TakingOrderUnderMinFill` | "the quotes left when the fill landed could not fill this bet's minimum, {minFill} USDC" |
+| `BetsClosed`, `GameEnded`, `MarketSettled` | "bets on game {gameId} had closed when the fill landed", "game {gameId} had ended when the fill landed", or "its market had settled when the fill landed" |
+| `NotTheSender`; out of gas | "the courier's own transaction failed: {kind}. Nothing this account did caused it" |
+| any other | "the courier could not establish an account action that caused this refusal; the recorded reason is {reason}, and the courier has put it before its operator" |
+
+A known reason the table does not list keeps its name and values whole in `cross.reason` and `cross.values`.
+
+**Two terms the next steps use.**
+
+- **“A compatible final block”:** A compatible final block F is a block from the node's finalized chain on the signed order's chainId, named by number, hash and chain timestamp, whose hash agrees with every same-height final anchor and whose ancestry contains every earlier final anchor or finalized receipt used for this decision; it must not regress behind them. Bind all proof and total reads to F's hash with requireCanonical: true, not merely its height, and use no proof if finality, ancestry or a required read is unavailable or contradictory.
+- **“Read this bet's filled amount on the chain”:** On the signed order's chainId, call s_filledRisk(bytes32) on the OspexMatching contract named by that order's EIP-712 verifyingContract, passing the record's orderHash, at that same compatible F by block hash; the returned uint256 is the order's total filled risk across all Crosses, in the same raw units as order.riskAmount—not this Cross's contribution and not an amount read from the relay.
+
+The order record already names the fields a next step is chosen by:
+
+- Original identity and terms: `orderHash`, `order.expiry`, `order.riskAmount`. Do not use the transaction hash as the order hash.
+- Variant: top-level `state`; `turn` for queued; `verdict.code` for a refusal; `cross.reason` and its structured execution evidence for a chain outcome. The same named code's sender-mismatch and wallet forms are distinguished by their structured sender facts versus POL/gas-limit/fee-cap facts, not by sentence matching.
+- Timing evidence for an outcome: **`cross.final.time` compared with `order.expiry`**. Equality is the expired branch. `cross.final.number` and `cross.final.hash` bind the block; a height alone does not establish compatibility. Do not compare `outcomeAt`, `receiptSeenAt`, `answeredAt`, `chainTime`, `cross.block` (pre-check H), `verdict.block` or the wall clock.
+- Total: **`cross.betFilled` compared with `order.riskAmount`**, in the same raw integer stake units. Full means equality; zero and partial are separate branches; absent, malformed or out-of-range data is never zero. Use integer values, not floating-point amounts or rendered USDC strings. `{rest}` is the exact integer difference only after those checks.
+
+**Signing again.** To bet again means a new bet: a new order, with a hash of its own, as a new expiry or order number
+gives it. The same signed bet posted again is answered from its record and is not carried again.
 
 **Its verdicts.** Each its own state and code. `{…}` is a value filled in; amounts are in USDC.
 
@@ -234,7 +370,7 @@ is closed `not sent`.
 | `refused` | `CROSS_TOO_LARGE`, with `listed`, `shortestMeetingMinimum` and `estimates` | the search found no prefix that fits and meets the minimum | "At block {n}, a fill of this bet against the {listed} quotes listed for it needs more gas than one transaction may carry. The courier looked for a fill against fewer of them, taken in their order, that fits one transaction and meets this bet's minimum, and its search found none; that does not mean none exists. Nothing was sent. Sign the bet again with a smaller stake or a lower minimum." |
 | `refused` | `CHAIN_UNREACHABLE` | two rounds failed | "The courier could not read the chain to check this bet, after two tries. Nothing was sent. Sign the bet again." |
 | `refused` | `COURIER_FAULT` | the model and the contract disagree; a reason the decoder does not know; the bet's stored row no longer hashes to its key | "The courier's own check of this bet went wrong. That is the courier's fault, and it is recorded as one. Nothing was sent. Sign the bet again." |
-| `not sent` | none: `cross.reason` is `SENDER_NOT_BUILT`, and `cross.message` holds the sentence | the check found it ready | "The courier checked this bet at block {n} and found that it would fill as listed. The sender is a later build, so nothing was signed or sent." |
+| `refused` | `COURIER_CANNOT_SEND`, the wallet's form: `form: "wallet"`, with the POL held, the gas limit and the fee cap | the key's POL at H is under the gas limit times the fee cap | "At block {n} the courier's key holds {pol} POL, less than this fill may cost at the fee it would sign, {cost} POL. Nothing was sent. Next: read the courier's status again; its key must cover the gas requirement before it can send. Before signing another bet for this wager, establish at a compatible final block that the original signed order cannot fill again, by its expiry or an on-chain cancellation, and read its total filled at that block. Then, if the wager can still be placed, read the quotes again and sign only for the amount still unfilled." |
 
 **About the codes.**
 
@@ -245,7 +381,9 @@ is closed `not sent`.
 - `stopped` with no verdict is a stop that came while the bet waited, or one that came while it was held and whose
   check has not ended yet: `ended` says so (part 4).
 - A bet stopped while it is held is `stopped` with no verdict until its check ends; then its verdict is `STOPPED`.
-- `SENDER_NOT_BUILT` is the reason of this build only; the sender's build removes it.
+- `COURIER_CANNOT_SEND` has two forms. The relay's sender form says the courier's key is not the relay's sender; the
+  wallet's form, with `form: "wallet"`, says the key's POL at H does not cover the gas limit times the fee cap the
+  courier would sign. Tell them apart by those fields, never by the sentence.
 - Where the node takes no state override, the comparison of the courier's own working with the contract is skipped,
   and the Cross's figures say so.
 
@@ -418,15 +556,40 @@ unanswered. To learn which, read one of its orders by hash, or send the same mes
 recorded, the answer is `already stopped`.
 
 **Where a hand-off stood: the `handOff` field.** A transaction already handed to the node cannot be withdrawn by
-anyone, so once the courier sends bets, a stop's result for an order a Cross already names will say where that
-hand-off stood. The field has three states, and this build's answers carry none of them, since this build sends
-nothing: every carried order answers `stopped` or `already stopped` and no more. The sender's build fills it:
+anyone, so a stop's result for an order a Cross already names says where that hand-off stood. The field has three
+states. The answer carries it from the build that sends, on every successful result, `already stopped` included. It
+comes from the Cross that names the order, as the bet or as a quote listed, and that is not yet final; there is one
+at most. `bet` is that bet's hash, so its record can be read as the Cross settles; `block` is the block that holds
+the transaction, once a receipt is seen.
 
 | the Cross that names the order | the result | what follows |
 | -- | -- | -- |
-| not yet through the gate, signed or not | `stopped`, and no `handOff` | The gate finds the stop, and the Cross is closed without being handed to the node. |
-| through the gate, and the node's answer is on record | `stopped`, with `handOff: { txHash, state }`: handed to the node, or in a block that is not final | It may still fill. The order is stopped for every later Cross. |
-| through the gate, and no answer is on record | `stopped`, with `handOff: { txHash, state: "uncertain" }` | The courier does not know whether the node has it. It may still fill. |
+| none open; or open and not yet through the gate | `stopped`, and no `handOff` | The gate finds the stop, and the Cross is closed without being handed to the node. Next: the replacement can be posted to this courier now while this stop is retained; this does not cancel the old order on chain or at another courier. |
+| Through the gate, and a taken answer is on record or a receipt is pending final proof. | `stopped`, with `handOff: { txHash, state: "sent" or "pending", bet, block }`; `block` only once a receipt is seen | It may still fill. The order is stopped for every later Cross. Next: read the bet named by handOff.bet until its Cross is final before posting the replacement, or post now only if you accept that both may fill. To rule out a later fill of the old order at every courier, obtain a final on-chain cancellation or expiry proof and read its total before replacing it. |
+| Through the gate, with no recorded taken answer and no pending receipt, including a named error or any other unknown answer. | `stopped`, with `handOff: { txHash, state: "uncertain", bet }` | The courier does not know whether the node has it. It may still fill. Next: read the bet named by handOff.bet until its Cross is final before posting the replacement, or post now only if you accept that both may fill. To rule out a later fill of the old order at every courier, obtain a final on-chain cancellation or expiry proof and read its total before replacing it. |
+
+A Cross whose answer is unknown reads `uncertain` unless a receipt has made it `pending`; a named error is unknown
+too. If that receipt is orphaned, it returns to `sent` only when a taken answer was recorded, and otherwise to
+`uncertain`. A Cross settled `expired unmined` or `replaced` cannot fill this bet in that attempt and gives no
+`handOff`; nor does a confirmed or reverted Cross, whose outcome is on the order's record. An answer with no `handOff`
+does not say the order never filled before. A failure to read where the hand-off stood is the database's, answered
+`503`, never `stopped` with no `handOff`.
+
+**Reading the hand-off's state again.** Save `handOff.bet` when it is returned and read that bet by hash for its
+Cross's outcome. The account can also repeat its stop to read the current hand-off; an agent can do so only while its
+signing authority is live. If that authority ends, use the public bet record or an account-signed stop, not repeated
+messages from the former agent. Once the Cross is final the stop answer omits handOff; its absence is not itself a
+record of the bet's fill. A chain cancellation supplies this assurance only once it is proved at a compatible final
+block. A local stop binds only this courier and only while retained; a restore can lose it and another courier is
+not bound by it.
+
+**For makers.** While this courier retains the stop, a `stopped` answer with no `handOff` means nothing this courier
+sends can fill that order from the answer on. Next: the replacement can be posted now. With a `handOff`, the old order
+may still fill in that one transaction, and a replacement posted at once may fill beside it. Next: read the bet named
+by handOff.bet until its Cross is final before posting the replacement, or post now only if you accept that both may
+fill. To rule out a later fill of the old order at every courier, obtain a final on-chain cancellation or expiry proof
+and read its total before replacing it. A database restore can lose a stop; an on-chain cancellation is not lost with
+this courier's database.
 
 ### What a stop does not do
 
@@ -441,8 +604,9 @@ nothing: every carried order answers `stopped` or `already stopped` and no more.
 - **It does not reach the chain.** An order stopped here is still a valid signature on chain. It is filled by
   nothing this courier sends; it is not cancelled, and another courier the account registered can still fill it.
 - **It does not undo a mark.** A quote the chain showed ended (cancelled, or filled) is marked in the records at
-  the block that showed it. If that block is later reorganised away, the quote stays marked here until a later
-  build lifts the mark; a maker who wants it carried signs the quote again.
+  the block that showed it. A mark made at a block not yet final is read again once the final block reaches that
+  height: where the block is on the final block's chain the mark stands; where it is not, the order is read at the
+  final block, and the mark is written again there or lifted, and a quote with a stop on record is set stopped.
 - **It does not sweep.** A quote let expire is a row kept: nothing is deleted. An expired quote is marked when a
   read of its market next meets it, and a stop is the way to end a quote the book has not yet read.
 
@@ -468,12 +632,19 @@ All public, and each bounded: no read returns a list without a limit.
   by code, since this process started; `addressMinute` and `stopsMinute`, how many addresses hold a request, and
   a stop request, in the last minute, never which; the database's size and the bytes its tables take; and what is
   not yet built. `503 DATABASE_UNREADABLE` where the database cannot be read. `sender` names the relay's sender,
-  the courier's key (`COURIER_ADDRESS`, an address: this build holds no key), and its lane: the run that owns it,
-  the lane's epoch, and whether this process takes bets. `chainLimits` holds the most gas one transaction may carry
+  the courier's key (`COURIER_ADDRESS`), and its lane: the run that owns it, the lane's epoch, and whether this
+  process takes bets; then every lane, each with its open Cross: its state and, once recorded, its transaction hash
+  and nonce, and no bet hash; with no open Cross, the lane's open-Cross value is null; a transaction hash or nonce not
+  yet recorded is absent, not invented or null; the record and the lines remain the places for the bet's identity;
+  and, where it is
+  shut, the line that shut it and why: a nonce of its key the records do not explain, or a restore; and
+  `restoreHold`, where a restore holds the whole database: no lane, old or new, reserves, signs or hands off on it,
+  and the door takes no new bet. `node` says whether the node traces a transaction. `chainLimits` holds the most gas one transaction may carry
   on the chain. What the node can do (`node`) is each request the check makes, at the latest block's hash, at a
   block 50 back and at a hash no block has; the relay's storage slot 0 held to its sender; whether an override of
-  that slot is taken; a call whose answer depends on the block's time, at two hashes of two times; and the
-  finalized tag. While the node fails one the check needs, the door takes no order.
+  that slot is taken; a call whose answer depends on the block's time, at two hashes of two times; the finalized
+  tag; and the latest block's base fee and the tip the node suggests, which a Cross's fees are set from. While the
+  node fails one the check needs, the door takes no order.
 - `GET /v1/runs?after=&limit=`: the runs of the process, 100 to a page.
 - `GET /v1/book?gameId=[&after=scorer:lineTicks&limit=]`: the markets of a game that hold a live quote, 100 to a
   page, each side's count, at one block named by number, hash and time, with the final block beside it.
@@ -562,8 +733,13 @@ stops at: none is claimed.
 | `ORIGINAL_NOT_THE_HASH` | — | the stop, for one hash | The original's ten fields do not hash to the hash it names. |
 | `TOO_MANY_STOPS_AHEAD` | — | the stop, for one hash | The account's 32 stops ahead that still count. |
 | `CHAIN_UNREACHABLE` | 503 | the door, the stop, the book | The chain could not be read, twice; on the stop route, followed by the recipe. |
-| `DATABASE_UNREADABLE` | 503 | every `/v1` route that reads the database | The database could not be read; with `retryAfterSeconds` where the courier waited ten seconds for a connection and none came free. |
+| `DATABASE_UNREADABLE` | 503 | every `/v1` route that reads the database | The database could not be read; with `retryAfterSeconds` where the courier waited ten seconds for a connection and none came free. On `POST /v1/orders`: "A database or connection failure means this order may or may not have been recorded. Next: read the order by its hash, or post the same signed order again. Do not sign a new bet because an answer failed." |
 | `NOT_READY` | 503 | `/readyz` | The database did not answer. |
 | `INTERNAL_ERROR` | 500 | any | The courier failed on this request, by a fault of its own. |
+| `STOPPED_AT_GATE`, `COURIER_RESTARTED` | — | a bet's record, `cross.reason` | Why its Cross was closed `not sent` before the hand-off gate: a stop found at the gate; or the courier restarted, or another of its processes took over, before the gate. |
+| `NODE_REFUSED` | — | reserved | Kept in the schema and API vocabulary; this build never issues it. A named error after the hand-off gate is unknown and is settled from the chain, not closed not sent. |
+| `ACCOUNT_PAUSED` | — | reserved | Kept for the build that issues it, at the door, for a bet; this build never issues it. |
 
 A code with no status of its own (—) is a hash's result inside a stop's `200`, or a bet's verdict in its record.
+
+For a code it does not know, a client reads the HTTP status and any order record. At this door, 201 records a quote, 202 records a queued bet, and 200 returns an existing record. An explicit admission refusal does not accept the order, though it may record a refusal and charge admission budgets. A database or connection failure can leave acceptance uncertain: read the order by hash or repost the same signed order; do not sign a new bet merely because an answer failed. On a bet's record, its state says what became of the bet. Next: read the order by hash or repost the same signed order; do not sign a new bet merely because an answer failed.

@@ -152,6 +152,20 @@ ALTER TABLE orders SET (
   vacuum_index_cleanup = on
 );
 
+-- Whether a mark's block is shown to be on the final block's chain. A mark made at a block that is not yet final (the
+-- bet's check at its block, the door and a market's page at the block they read) is written false and read again once
+-- the final block reaches its height: shown on the final chain, it stands, now final; not, the order is read at the
+-- final block, and the mark is written again there, lifted, or set stopped where a stop stands. A mark made at the
+-- final block, and the expiry mark, which is made against the final block's time, are written true. Every mark that
+-- stood before this column is false, so the first read of the final block checks each.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS ended_final boolean NOT NULL DEFAULT false;
+
+-- The marks still to be read again, by their block: each read of the final block finds the ones at or under its
+-- height along it. It holds only those, and a mark leaves it once its block is shown on the final chain.
+CREATE INDEX IF NOT EXISTS orders_marks_not_final
+  ON orders (ended_block)
+  WHERE ended_block IS NOT NULL AND NOT ended_final;
+
 -- ──────────────────────────── stop messages ───────────────────────────────
 -- One row per stop message that stopped at least one order hash: the signed
 -- payload exactly, kept once however many hashes it stopped. `message` is
@@ -317,8 +331,10 @@ CREATE TABLE IF NOT EXISTS crosses (
   -- For a Cross that was replaced, the transaction that took its nonce; for one that reverted, the reason.
   replaced_by          text CHECK (replaced_by ~ '^0x[0-9a-f]{64}$'),
   revert_reason        text,
-  -- Why a Cross was closed not sent; empty for every other state. In this build one reason only, SENDER_NOT_BUILT:
-  -- the check found the bet ready, and the sender is a later build.
+  -- Why a Cross was closed not sent; empty for every other state. Two are written, both before the gate: a stop found
+  -- at the gate (STOPPED_AT_GATE); the courier restarted, or another of its processes took over, before the gate
+  -- (COURIER_RESTARTED). The third, NODE_REFUSED, is reserved: allowed here, and never written, since a node's named
+  -- error after the gate is not known.
   not_sent_reason      text,
   -- The check's figures: the final block and the time the candidate statement ran; the estimate, the limit and
   -- each step of the search for a shorter fill; the key's nonce, its POL and its coin, and the relay's coin, at the
@@ -334,19 +350,54 @@ CREATE TABLE IF NOT EXISTS crosses (
 ALTER TABLE crosses ADD COLUMN IF NOT EXISTS not_sent_reason text;
 ALTER TABLE crosses ADD COLUMN IF NOT EXISTS checked jsonb NOT NULL DEFAULT '{}'::jsonb;
 
+-- The sender's figures, on a crosses table that stood before them. The six times decide nothing: when the intent, the
+-- signed record, the gate, the node's answer, the first sight of a receipt and the outcome were written. The gas the
+-- receipt used and the price it paid, so what the Cross cost. A revert's evidence, the node's trace of the
+-- transaction or unavailable, and the trace's output, whole bytes of hex, kept to 32,768 hex digits, enough for a
+-- refusal that lists forty legs. Whether the transaction that took a replaced Cross's nonce is the courier's own. What
+-- the receipt recorded: each account's pulls, pay-backs and refused pay-backs, the totals, and the bet's filled amount
+-- at the outcome's final block, beside the check's figures.
+ALTER TABLE crosses ADD COLUMN IF NOT EXISTS intent_at timestamptz;
+ALTER TABLE crosses ADD COLUMN IF NOT EXISTS signed_at timestamptz;
+ALTER TABLE crosses ADD COLUMN IF NOT EXISTS gate_at timestamptz;
+ALTER TABLE crosses ADD COLUMN IF NOT EXISTS answered_at timestamptz;
+ALTER TABLE crosses ADD COLUMN IF NOT EXISTS receipt_seen_at timestamptz;
+ALTER TABLE crosses ADD COLUMN IF NOT EXISTS outcome_at timestamptz;
+ALTER TABLE crosses ADD COLUMN IF NOT EXISTS gas_used numeric(78, 0);
+ALTER TABLE crosses ADD COLUMN IF NOT EXISTS effective_gas_price numeric(78, 0);
+ALTER TABLE crosses ADD COLUMN IF NOT EXISTS revert_evidence text CHECK (revert_evidence IN ('trace', 'unavailable'));
+ALTER TABLE crosses ADD COLUMN IF NOT EXISTS revert_data text CHECK (revert_data ~ '^0x([0-9a-f]{2})*$' AND length(revert_data) <= 32770);
+ALTER TABLE crosses ADD COLUMN IF NOT EXISTS replaced_by_ours boolean;
+ALTER TABLE crosses ADD COLUMN IF NOT EXISTS recorded jsonb;
+
 -- The reasons a Cross is closed not sent, and that it has one exactly when it is: each added only where no
--- constraint of its name stands, as the stops' rule above is. The sender's build adds its own reasons: it drops the
--- first under its name and adds it again, as the legs' reasons are below.
+-- constraint of its name stands, as the stops' rule above is. The reasons are the sender's three. A table made by the
+-- earlier build holds the check with its one reason, SENDER_NOT_BUILT, the reason of a build that sent nothing: that
+-- check is dropped and added again under its name with the three, as the legs' reasons are below, once, and a later
+-- release reads the catalog alone and takes the three-reason check as it stands. A table that holds a row closed for
+-- SENDER_NOT_BUILT is refused, with the count, and nothing is changed: no such row is made up into another reason.
 DO $$
 DECLARE
   standing record;
+  earlier bigint;
 BEGIN
   SELECT c.contype, c.convalidated, pg_get_constraintdef(c.oid) AS definition INTO standing
   FROM pg_constraint c WHERE c.conrelid = 'crosses'::regclass AND c.conname = 'crosses_not_sent_reasons';
   IF NOT FOUND THEN
-    ALTER TABLE crosses ADD CONSTRAINT crosses_not_sent_reasons CHECK (not_sent_reason IN ('SENDER_NOT_BUILT'));
-  ELSIF standing.contype <> 'c' OR NOT standing.convalidated
-     OR standing.definition <> 'CHECK ((not_sent_reason = ''SENDER_NOT_BUILT''::text))' THEN
+    ALTER TABLE crosses ADD CONSTRAINT crosses_not_sent_reasons CHECK (not_sent_reason IN ('STOPPED_AT_GATE', 'COURIER_RESTARTED', 'NODE_REFUSED'));
+  ELSIF standing.contype = 'c' AND standing.convalidated
+     AND standing.definition = 'CHECK ((not_sent_reason = ANY (ARRAY[''STOPPED_AT_GATE''::text, ''COURIER_RESTARTED''::text, ''NODE_REFUSED''::text])))' THEN
+    NULL;
+  ELSIF standing.contype = 'c' AND standing.convalidated
+     AND standing.definition = 'CHECK ((not_sent_reason = ''SENDER_NOT_BUILT''::text))' THEN
+    SELECT count(*) INTO earlier FROM crosses WHERE not_sent_reason = 'SENDER_NOT_BUILT';
+    IF earlier > 0 THEN
+      RAISE EXCEPTION 'the crosses table holds % Cross rows closed not sent for SENDER_NOT_BUILT, the reason of a build that sent nothing; this schema has no such reason, and makes up no other for them', earlier
+        USING ERRCODE = 'check_violation';
+    END IF;
+    ALTER TABLE crosses DROP CONSTRAINT crosses_not_sent_reasons;
+    ALTER TABLE crosses ADD CONSTRAINT crosses_not_sent_reasons CHECK (not_sent_reason IN ('STOPPED_AT_GATE', 'COURIER_RESTARTED', 'NODE_REFUSED'));
+  ELSE
     RAISE EXCEPTION 'the crosses table holds a constraint named crosses_not_sent_reasons that is not the validated check this schema makes: %', standing.definition
       USING ERRCODE = 'invalid_table_definition';
   END IF;
@@ -359,8 +410,51 @@ BEGIN
     RAISE EXCEPTION 'the crosses table holds a constraint named crosses_not_sent_with_reason that is not the validated check this schema makes: %', standing.definition
       USING ERRCODE = 'invalid_table_definition';
   END IF;
+  -- The record says only what happened. A transaction's hash from the signed record on: every state but the intent,
+  -- a Cross closed not sent (before its signed record, or after), and a restored intent closed expired unmined on the
+  -- chain's proof, which no transaction of the courier's was found for. Handed to the node once from the gate on: none
+  -- before it; one for a Cross handing off, sent or unknown, and for the node's named refusal; none for a stop found
+  -- at the gate or a restart before it. After a restore the count is the evidence the copy kept and no more: a restored
+  -- Cross settled later from the chain keeps it, so a final state holds either.
+  SELECT c.contype, c.convalidated, pg_get_constraintdef(c.oid) AS definition INTO standing
+  FROM pg_constraint c WHERE c.conrelid = 'crosses'::regclass AND c.conname = 'crosses_hash_once_signed';
+  IF NOT FOUND THEN
+    ALTER TABLE crosses ADD CONSTRAINT crosses_hash_once_signed CHECK (tx_hash IS NOT NULL OR state IN ('intent', 'not sent', 'expired unmined'));
+  ELSIF standing.contype <> 'c' OR NOT standing.convalidated
+     OR standing.definition <> 'CHECK (((tx_hash IS NOT NULL) OR (state = ANY (ARRAY[''intent''::text, ''not sent''::text, ''expired unmined''::text]))))' THEN
+    RAISE EXCEPTION 'the crosses table holds a constraint named crosses_hash_once_signed that is not the validated check this schema makes: %', standing.definition
+      USING ERRCODE = 'invalid_table_definition';
+  END IF;
+  SELECT c.contype, c.convalidated, pg_get_constraintdef(c.oid) AS definition INTO standing
+  FROM pg_constraint c WHERE c.conrelid = 'crosses'::regclass AND c.conname = 'crosses_hand_offs_by_state';
+  IF NOT FOUND THEN
+    ALTER TABLE crosses ADD CONSTRAINT crosses_hand_offs_by_state CHECK (
+      (state IN ('intent', 'signed') AND hand_offs = 0)
+      OR (state IN ('handing off', 'sent', 'unknown') AND hand_offs = 1)
+      OR (state = 'not sent' AND ((not_sent_reason = 'NODE_REFUSED' AND hand_offs = 1) OR (not_sent_reason <> 'NODE_REFUSED' AND hand_offs = 0)))
+      OR state IN ('pending', 'confirmed', 'reverted', 'expired unmined', 'replaced'));
+  ELSIF standing.contype <> 'c' OR NOT standing.convalidated
+     OR standing.definition <> 'CHECK ((((state = ANY (ARRAY[''intent''::text, ''signed''::text])) AND (hand_offs = 0)) OR ((state = ANY (ARRAY[''handing off''::text, ''sent''::text, ''unknown''::text])) AND (hand_offs = 1)) OR ((state = ''not sent''::text) AND (((not_sent_reason = ''NODE_REFUSED''::text) AND (hand_offs = 1)) OR ((not_sent_reason <> ''NODE_REFUSED''::text) AND (hand_offs = 0)))) OR (state = ANY (ARRAY[''pending''::text, ''confirmed''::text, ''reverted''::text, ''expired unmined''::text, ''replaced''::text]))))' THEN
+    RAISE EXCEPTION 'the crosses table holds a constraint named crosses_hand_offs_by_state that is not the validated check this schema makes: %', standing.definition
+      USING ERRCODE = 'invalid_table_definition';
+  END IF;
 END
 $$;
+
+-- A key's Crosses by nonce: the nonce's floor and the search for what used a nonce read a key's handful along it.
+CREATE INDEX IF NOT EXISTS crosses_sender_nonce
+  ON crosses (sender, nonce)
+  WHERE nonce IS NOT NULL;
+
+-- A Cross's row is written five or six times, from its intent to its outcome: the orders table's maintenance, above,
+-- for the same reason.
+ALTER TABLE crosses SET (
+  autovacuum_vacuum_threshold = 2000,
+  autovacuum_vacuum_scale_factor = 0,
+  autovacuum_analyze_threshold = 2000,
+  autovacuum_analyze_scale_factor = 0,
+  vacuum_index_cleanup = on
+);
 
 -- A second lock on the same door as the lane's epoch, and not what ownership rests on: at most one Cross per
 -- sender key in a state that is not final.
@@ -425,11 +519,23 @@ CREATE INDEX IF NOT EXISTS events_report_lines
   ON events (number)
   WHERE kind IN ('condition opened', 'condition cleared', 'incident');
 
+-- The restore's lines: the database-wide hold the operator's shut writes, read before every reservation, at the door
+-- and at the take. Empty on a database never restored, so the read stays one lookup however long the history.
+CREATE INDEX IF NOT EXISTS events_restore_shut
+  ON events (number)
+  WHERE kind = 'incident' AND reason = 'RESTORE_SHUT';
+
 -- A bet's lines, by the bet's hash and in order: what GET /v1/orders/{hash} reads a bet's verdict along. The lines the
 -- bet's check writes carry the bet's hash in bet_hash.
 CREATE INDEX IF NOT EXISTS events_bet_lines
   ON events (bet_hash, number)
   WHERE bet_hash IS NOT NULL;
+
+-- An ACTION line once for each bet and case: the durable guard of the once-only rule. A line that asks for a person's
+-- look carries its case in facts.action.case; a second line of the same bet and case is refused, whatever wrote it.
+CREATE UNIQUE INDEX IF NOT EXISTS events_one_action_per_bet_and_case
+  ON events (bet_hash, ((facts->'action'->>'case')))
+  WHERE facts ? 'action';
 
 -- Nothing changes or removes a line once written.
 CREATE OR REPLACE FUNCTION events_append_only() RETURNS trigger
@@ -473,6 +579,41 @@ CREATE TABLE IF NOT EXISTS conditions (
 CREATE UNIQUE INDEX IF NOT EXISTS conditions_one_open_per_key
   ON conditions (key)
   WHERE cleared_at IS NULL;
+
+-- ──────────────────────────── the sender's columns of lanes ───────────────────
+-- Below the events table, since one of them names a line.
+--
+-- The line that shut the lane, while it is shut: the opening of cross-unreconciled (the key's nonce used by a
+-- transaction the records do not hold, or a search the node could not answer), or the incident a restore's shut
+-- wrote. Empty while the lane is open. The reservation and the door's check 17 require it empty. The operator's
+-- clear empties it for a lane shut for the first reason and refuses one shut at a restore; nothing else empties it.
+ALTER TABLE lanes ADD COLUMN IF NOT EXISTS shut_line bigint REFERENCES events (number);
+
+-- The key's nonces explained: every nonce below verified_nonce_to is explained, at the final block named beside it,
+-- by a transaction of this key shown on that block's chain. It rises only at a final block, and the block's number
+-- and hash are its anchor; 0, with no anchor, before the first.
+ALTER TABLE lanes ADD COLUMN IF NOT EXISTS verified_nonce_to bigint NOT NULL DEFAULT 0;
+ALTER TABLE lanes ADD COLUMN IF NOT EXISTS verified_block_number numeric(78, 0);
+ALTER TABLE lanes ADD COLUMN IF NOT EXISTS verified_block_hash text CHECK (verified_block_hash ~ '^0x[0-9a-f]{64}$');
+
+-- The watermark is whole: an anchor's number and hash together, and one wherever a nonce is explained. Added only
+-- where no constraint of its name stands, as the lanes' rule above is.
+DO $$
+DECLARE
+  standing record;
+BEGIN
+  SELECT c.contype, c.convalidated, pg_get_constraintdef(c.oid) AS definition INTO standing
+  FROM pg_constraint c WHERE c.conrelid = 'lanes'::regclass AND c.conname = 'lanes_watermark_anchored';
+  IF NOT FOUND THEN
+    ALTER TABLE lanes ADD CONSTRAINT lanes_watermark_anchored CHECK (
+      (verified_block_number IS NULL) = (verified_block_hash IS NULL) AND (verified_nonce_to = 0 OR verified_block_number IS NOT NULL));
+  ELSIF standing.contype <> 'c' OR NOT standing.convalidated
+     OR standing.definition <> 'CHECK ((((verified_block_number IS NULL) = (verified_block_hash IS NULL)) AND ((verified_nonce_to = 0) OR (verified_block_number IS NOT NULL))))' THEN
+    RAISE EXCEPTION 'the lanes table holds a constraint named lanes_watermark_anchored that is not the validated check this schema makes: %', standing.definition
+      USING ERRCODE = 'invalid_table_definition';
+  END IF;
+END
+$$;
 
 -- ──────────────────────────── accounts ────────────────────────────────────
 -- One row for each account that was ever admitted: its budget, a bucket and

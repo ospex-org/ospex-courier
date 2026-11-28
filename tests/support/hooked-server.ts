@@ -11,11 +11,21 @@ import { StartupRefused, startService } from '../../courier/startup';
 // is armed before the service starts, so the runner can be held at its first
 // reach of it: the take's wake. The faults are planted over the channel too.
 
+/** What the signer's seams do, as a test plants it: hand on another object, change the envelope, or nothing. */
+interface SignerFault {
+  /** Hand the signer a plain copy of the sealed send, which carries no mark; or the sealed send of an earlier reservation, kept here. */
+  substitute?: 'look-alike' | 'earlier' | null;
+  /** Try to change the sealed send in place before the signer reads it: its listed quotes reordered, one swapped for another, its gas. */
+  tamper?: 'reorder' | 'swap' | 'gas' | null;
+  /** The envelope's target or value, changed inside the signing path with every other input valid. */
+  envelope?: { to?: string; value?: string } | null;
+}
+
 type Message =
   | { type: 'arm'; id: number; point: HoldPoint; times: number | 'all' }
   | { type: 'disarm'; id: number; point: HoldPoint }
   | { type: 'go'; id: number; held: number }
-  | { type: 'fault'; id: number; skewPull?: Record<string, string>; listAsLive?: string[]; transactionGasCap?: string | null };
+  | { type: 'fault'; id: number; skewPull?: Record<string, string>; listAsLive?: string[]; transactionGasCap?: string | null; unhashBeforeSeal?: boolean; signer?: SignerFault };
 
 const send = (m: Record<string, unknown>) => process.send?.(m);
 
@@ -30,6 +40,22 @@ let heldCount = 0;
 const skew = new Map<string, bigint>();
 const live = new Set<string>();
 let gasCap: bigint | undefined;
+let unhash = false;
+let signerFault: SignerFault = {};
+/** The sealed sends the signer was handed, in order: the earlier one a substitution hands on. */
+const handed: unknown[] = [];
+/** The send the signer goes on with in its current attempt, as the seam handed it on: what that attempt's bytes are compared with. */
+let signing: unknown = null;
+
+/** The fields of a sealed send that its signed bytes must carry, as text, or null where the object has none of that shape. */
+function sealedFields(x: unknown): { nonce: string; gasLimit: string; maxFeePerGas: string; maxPriorityFeePerGas: string } | null {
+  const s = x as { nonce?: unknown; gas?: { limit?: unknown }; maxFeePerGas?: unknown; maxPriorityFeePerGas?: unknown } | null;
+  if (s === null || typeof s !== 'object') return null;
+  const { nonce, maxFeePerGas, maxPriorityFeePerGas } = s;
+  const limit = s.gas?.limit;
+  if (typeof nonce !== 'bigint' || typeof limit !== 'bigint' || typeof maxFeePerGas !== 'bigint' || typeof maxPriorityFeePerGas !== 'bigint') return null;
+  return { nonce: nonce.toString(), gasLimit: limit.toString(), maxFeePerGas: maxFeePerGas.toString(), maxPriorityFeePerGas: maxPriorityFeePerGas.toString() };
+}
 
 process.on('message', (raw: unknown) => {
   const m = raw as Message;
@@ -48,9 +74,29 @@ process.on('message', (raw: unknown) => {
       for (const q of m.listAsLive) live.add(q.toLowerCase());
     }
     if (m.transactionGasCap !== undefined) gasCap = m.transactionGasCap === null ? undefined : BigInt(m.transactionGasCap);
+    if (m.unhashBeforeSeal !== undefined) unhash = m.unhashBeforeSeal;
+    if (m.signer !== undefined) signerFault = m.signer;
   }
   send({ type: 'ack', id: m.id });
 });
+
+/**
+ * A try at changing the sealed send in place: each change is made as a caller would, and a frozen object refuses it.
+ * Judged by its effect: 'changed' only where the send reads otherwise after the try.
+ */
+function tamperWith(checked: unknown, how: NonNullable<SignerFault['tamper']>): string {
+  const c = checked as { resting: Array<{ hash: string }>; gas: { limit: bigint }; taking: { hash: string }; calldata: string };
+  const seen = () => JSON.stringify({ resting: c.resting.map((r) => r.hash), limit: c.gas.limit.toString(), taking: c.taking.hash });
+  const before = seen();
+  try {
+    if (how === 'reorder') c.resting.reverse();
+    else if (how === 'swap') c.resting[0] = c.taking;
+    else c.gas.limit = c.gas.limit - 1n;
+  } catch (err) {
+    return err instanceof TypeError ? 'refused: frozen' : 'refused';
+  }
+  return seen() === before ? 'unchanged' : 'changed';
+}
 
 const hooks: LaneHooks = {
   at(point: HoldPoint, bet: Hex | null): Promise<void> {
@@ -70,6 +116,27 @@ const hooks: LaneHooks = {
   },
   observe: (what, hashes) => {
     send({ type: 'observe', what, hashes });
+  },
+  unhashBeforeSeal: () => unhash,
+  signer: {
+    handed: (checked) => {
+      handed.push(checked);
+      const f = signerFault;
+      if (f.tamper !== undefined && f.tamper !== null) send({ type: 'tampered', how: f.tamper, result: tamperWith(checked, f.tamper) });
+      signing = f.substitute === 'look-alike' ? structuredClone(checked) : f.substitute === 'earlier' && handed.length >= 2 ? handed[handed.length - 2] : checked;
+      return signing;
+    },
+    envelope: (e) => {
+      const f = signerFault.envelope;
+      if (f === undefined || f === null) return e;
+      return { ...e, ...(f.to === undefined ? {} : { to: f.to as `0x${string}` }), ...(f.value === undefined ? {} : { value: BigInt(f.value) }) };
+    },
+    // Every signed attempt, at once: its bytes go to the test over the channel, never to the process's output, beside
+    // the fields of the sealed send the signer was handed for it, read as it signs.
+    signed: (raw) => {
+      send({ type: 'signed', raw, sealed: sealedFields(signing) });
+      signing = null;
+    },
   },
 };
 

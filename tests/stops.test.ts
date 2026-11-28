@@ -14,6 +14,7 @@ import { get, startCourier, type CourierProcess } from './support/courier';
 import { holdTheLane } from './support/lanehold';
 import { cancelOnChain, contractHash, grantAgent, nextOrderNumber, nonceOf, orderOn, post, postOrder, postOrderAs, refusedForm, revokeAgent, sign, wire, type Answer, type Order } from './support/orders';
 import type { Rig } from './support/rig';
+import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
 import { hashLockKey, outcomes, postStop, resultsOf, sendStop, signStop, stopBody, stopMessage, STOP_TYPE, type OriginalSent, type StopMessage } from './support/stops';
 
@@ -43,11 +44,7 @@ async function anotherCourier(): Promise<CourierProcess> {
   return courier;
 }
 
-after(async () => {
-  for (const courier of others) await courier.stop().catch(() => undefined);
-  await pool?.end();
-  await stack?.close();
-});
+after(() => closeEach(...others.map((courier) => () => courier.stop().catch(() => undefined)), () => pool?.end(), () => stack?.close()));
 
 const url = () => stack.courier.url;
 

@@ -7,6 +7,7 @@ import { openPool } from '../courier/records/store';
 import { get as getFrom, type HookControl } from './support/courier';
 import { orderOn, postOrder as postOrderFrom, sign, type Order, type Signed } from './support/orders';
 import type { Rig } from './support/rig';
+import { closeEach } from './support/close';
 import { startStack, type Stack } from './support/stack';
 
 // The walk and the netted pull against the contract itself: within the
@@ -37,14 +38,15 @@ const url = () => stack.courier.url;
 
 /**
  * Every test, and every case of the set, sends from a network address of its own, as the courier's other tests do, so the courier's count of an
- * address's minute, 600 requests, limits none: the last value of X-Forwarded-For, an address of 198.20.0.0/16 new for
- * each. The requests below go out from it unless a case names another address.
+ * address's minute, 600 requests, limits none: the last value of X-Forwarded-For, an address of 198.19.128.0/17 new for
+ * each, a part of the range kept for benchmarking that no other test uses. The requests below go out from it unless a
+ * case names another address.
  */
 let from: Record<string, string> = {};
 let nextAddress = 0;
 const ownAddress = (): Record<string, string> => {
   const n = nextAddress++;
-  return { 'x-forwarded-for': `198.20.${1 + Math.floor(n / 250)}.${1 + (n % 250)}` };
+  return { 'x-forwarded-for': `198.19.${128 + Math.floor(n / 250)}.${1 + (n % 250)}` };
 };
 beforeEach(() => {
   from = ownAddress();
@@ -54,14 +56,13 @@ const postOrder = (...a: Parameters<typeof postOrderFrom>) => postOrderFrom(a[0]
 
 before(async () => {
   stack = await startStack('differential', { hooked: true });
+  // The final block follows the head: a ready bet is now sent, and its Cross settles once a final block holds it.
+  stack.proxy.finalFollows(0n);
   rig = stack.rig;
   pool = openPool(stack.databaseUrl, null);
 });
 
-after(async () => {
-  await pool?.end();
-  await stack?.close();
-});
+after(() => closeEach(() => pool?.end(), () => stack?.close()));
 
 /** A small, fixed-seed generator: the same seed, the same cases, every run. */
 function generator(seed: number) {
@@ -90,11 +91,25 @@ async function freshAccount(on: Rig = rig): Promise<HDAccount> {
 let nextLine = 1;
 
 /** The bet's record once its check has written an outcome. */
+/** The states of a bet whose outcome is not yet written: waiting or being checked, or sent and not yet final. */
+const UNSETTLED = new Set(['queued', 'unknown', 'sent', 'pending']);
+
+/** The bet's record once its check is done: held at its intent, where the send begins, or with its outcome written. */
+async function atIntentOrJudged(hash: string, on = url()): Promise<Record<string, unknown>> {
+  for (let i = 0; i < 300; i++) {
+    const r = await get(on, `/v1/orders/${hash}`);
+    if (r.body.state === 'queued' && r.body.turn === 'sending') return r.body;
+    if (!UNSETTLED.has(String(r.body.state))) return r.body;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`the bet ${hash} was neither at its intent nor judged after 30 seconds`);
+}
+
 async function judged(hash: string, on = url()): Promise<Record<string, unknown>> {
   // Read every tenth of a second, at most 300 times: well under the address's 600 a minute.
   for (let i = 0; i < 300; i++) {
     const r = await get(on, `/v1/orders/${hash}`);
-    if (r.body.state !== 'queued') return r.body;
+    if (!UNSETTLED.has(String(r.body.state))) return r.body;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`the bet ${hash} was still queued after 30 seconds`);
@@ -113,14 +128,19 @@ interface Done {
   revert?: string;
 }
 
-/** One Cross, sent by the test from the relay's sender into a block whose time is `time`, on the chain as it stands. */
-async function crossAt(on: Rig, time: bigint, taking: Signed, resting: Signed[]): Promise<Done> {
+/**
+ * One Cross, sent by the test into a block whose time is `time`, on the chain as it stands: from the relay's sender, for a
+ * replay inside a snapshot taken back before the courier goes on; or through another courier, for the test's own set-up.
+ */
+async function crossAt(on: Rig, time: bigint, taking: Signed, resting: Signed[], via: 'the courier' | 'another courier' = 'the courier'): Promise<Done> {
   await on.setNextBlockTime(time);
   const add = (m: Map<string, bigint>, k: string, v: bigint) => m.set(k, (m.get(k) ?? 0n) + v);
   const done: Done = { filled: false, legs: [], pulled: new Map(), paidBack: new Map(), refused: new Map(), refusals: new Map() };
   let hash: Hex;
   try {
-    hash = await on.write(on.accounts.sender, on.addresses.relay, on.abis.OspexCourierRelay as Abi, 'cross', [taking, resting]);
+    hash = via === 'the courier'
+      ? await on.write(on.accounts.sender, on.addresses.relay, on.abis.OspexCourierRelay as Abi, 'cross', [taking, resting])
+      : await on.write(on.accounts.otherSender, on.addresses.otherRelay, on.abis.OspexCourierRelay as Abi, 'cross', [taking, resting]);
   } catch (err) {
     // A refused Cross mines nothing: the block's time is set again for whatever is sent next.
     done.revert = err instanceof Error ? err.message.slice(0, 200) : String(err);
@@ -167,7 +187,12 @@ const nonzero = (m: Map<string, bigint> | Record<string, string>) =>
       .sort((x, y) => ((x[0] as string) < (y[0] as string) ? -1 : 1)),
   );
 
-/** One case's quotes, the bet, and what the courier found; then the reference and the courier's own calldata, each from a snapshot at H into a block at T + 1, held to each other. */
+/**
+ * One case's quotes, the bet, and what the courier found; then the reference and the courier's own calldata, each from
+ * a snapshot at H into a block at T + 1, held to each other. A bet the courier finds ready is held at its intent, before
+ * anything is signed or sent, while the chain still stands at H: the replays are made and reverted there, and then the
+ * courier goes on to send and settle it.
+ */
 async function runCase(on: { rig: Rig; url: string; hooks: HookControl }, quotes: Array<{ who: HDAccount; order: Order }>, bettor: HDAccount, bet: Order): Promise<{ record: Record<string, unknown>; reference: Done; own: Done | null }> {
   const r = on.rig;
   const posted: Array<{ hash: string; signed: Signed; recordNumber: number }> = [];
@@ -179,29 +204,36 @@ async function runCase(on: { rig: Rig; url: string; hooks: HookControl }, quotes
   // The reference's candidates, frozen by the test: every quote of the case, in the published order (tick, then record).
   const frozen = [...posted].sort((a, b) => a.signed.order.oddsTick - b.signed.order.oddsTick || a.recordNumber - b.recordNumber);
   const betSigned: Signed = { order: bet, signature: await sign(bettor, bet, 31337, r.addresses.matching) };
+  await on.hooks.arm('after-intent');
   const b = await postOrder(on.url, r, bettor, 'take', bet);
   assert.equal(b.status, 202, JSON.stringify(b.body));
-  const record = await judged(b.body.orderHash as string, on.url);
-  const H = (record.state === 'not sent' ? (record.cross as { block: { time: string } }).block : (record.verdict as { block: { time: string } | null }).block) ?? null;
+  const first = await atIntentOrJudged(b.body.orderHash as string, on.url);
+  const sending = first.state === 'queued';
+  const held = sending ? await on.hooks.reached('after-intent') : null;
+  if (!sending) await on.hooks.disarm('after-intent');
+  const H = (sending ? (first.cross as { block: { time: string } }).block : (first.verdict as { block: { time: string } | null }).block) ?? null;
   const T = H === null ? await r.time() : BigInt(H.time);
   // From one snapshot at H, nothing sent between: the reference, then back, then the courier's own calldata.
   const snapshot = (await r.rpc('evm_snapshot', [])) as Hex;
   const reference = await crossAt(r, T + 1n, betSigned, frozen.map((f) => f.signed));
   await r.rpc('evm_revert', [snapshot]);
   let own: Done | null = null;
-  if (record.state === 'not sent') {
+  if (sending) {
     const again = (await r.rpc('evm_snapshot', [])) as Hex;
-    const legs = (record.cross as { legs: Array<{ orderHash: string }> }).legs.map((l) => posted.find((p) => p.hash === l.orderHash.toLowerCase())?.signed as Signed);
+    const legs = (first.cross as { legs: Array<{ orderHash: string }> }).legs.map((l) => posted.find((p) => p.hash === l.orderHash.toLowerCase())?.signed as Signed);
     own = await crossAt(r, T + 1n, betSigned, legs);
     await r.rpc('evm_revert', [again]);
   }
+  // The courier, held at its intent while the chain stood at H, goes on: it signs, hands off and settles.
+  if (held !== null) await on.hooks.go(held);
+  const record = sending ? await judged(b.body.orderHash as string, on.url) : first;
   return { record, reference, own };
 }
 
 /** The assertion: ready if and only if the reference fills and meets the bet's minimum; then the same legs, pulls, pay-backs and refused pay-backs as the reference, and as the courier's own calldata. */
 function holdsTo(label: string, record: Record<string, unknown>, reference: Done, own: Done | null): void {
-  const ready = record.state === 'not sent';
-  assert.equal(ready, reference.filled, `${label}: the courier ${ready ? 'found it ready' : `refused it ${JSON.stringify(record.verdict)}`}, the reference ${reference.filled ? 'filled' : `was refused (${reference.revert})`}`);
+  const ready = record.state === 'confirmed';
+  assert.equal(ready, reference.filled, `${label}: the courier ${ready ? 'found it ready' : `refused it ${JSON.stringify(record.verdict ?? record.state)}`}, the reference ${reference.filled ? 'filled' : `was refused (${reference.revert})`}`);
   if (!ready) return;
   const cross = record.cross as { legs: Array<{ orderHash: string; makerRisk: string; takerRisk: string }>; pulls: Record<string, string>; paysBack: Record<string, string>; paysBackRefused: Record<string, string> };
   const legs = cross.legs.map((l) => ({ orderHash: l.orderHash.toLowerCase(), makerRisk: BigInt(l.makerRisk), takerRisk: BigInt(l.takerRisk) }));
@@ -241,7 +273,7 @@ async function takesSideB(on: Rig, who: HDAccount, market: { scorer: Address; li
   const lots = fitting(drawn, p);
   const x: Order = { ...orderOn(on, X, { expiry: T + 600n, oddsTick: tick, riskAmount: lots * 100n, ...market }), positionType: 0 };
   const m: Order = { ...orderOn(on, who, { expiry: T + 25n, oddsTick: 100 + Math.floor(10_000 / (tick - 100)), riskAmount: stakeFor(lots, p), ...market }), positionType: 1 };
-  const sent = await crossAt(on, T + 1n, { order: m, signature: await sign(who, m, 31337, on.addresses.matching) }, [{ order: x, signature: await sign(X, x, 31337, on.addresses.matching) }]);
+  const sent = await crossAt(on, T + 1n, { order: m, signature: await sign(who, m, 31337, on.addresses.matching) }, [{ order: x, signature: await sign(X, x, 31337, on.addresses.matching) }], 'another courier');
   assert.equal(sent.filled, true, sent.revert);
 }
 
@@ -252,7 +284,7 @@ async function restsSideA(on: Rig, who: HDAccount, market: { scorer: Address; li
   const lots = fitting(drawn, BigInt(tick - 100));
   const q: Order = { ...orderOn(on, who, { expiry: T + 600n, oddsTick: tick, riskAmount: lots * 100n, ...market }), positionType: 0 };
   const y: Order = { ...orderOn(on, Y, { expiry: T + 25n, oddsTick: 100 + Math.floor(10_000 / (tick - 100)), riskAmount: stakeFor(lots, BigInt(tick - 100)), ...market }), positionType: 1 };
-  const sent = await crossAt(on, T + 1n, { order: y, signature: await sign(Y, y, 31337, on.addresses.matching) }, [{ order: q, signature: await sign(who, q, 31337, on.addresses.matching) }]);
+  const sent = await crossAt(on, T + 1n, { order: y, signature: await sign(Y, y, 31337, on.addresses.matching) }, [{ order: q, signature: await sign(who, q, 31337, on.addresses.matching) }], 'another courier');
   assert.equal(sent.filled, true, sent.revert);
 }
 
@@ -299,7 +331,7 @@ test(`the differential set: ${CASES} cases from the seed ${SEED}, each within th
     if (g.chance(0.15)) await rig.write(bettor, rig.addresses.coin, coin, 'approve', [rig.addresses.positions, BigInt(g.int(0, Number(stake)))]);
     const { record, reference, own } = await runCase({ rig, url: url(), hooks: stack.courier.hooks as HookControl }, quotes, bettor, bet);
     holdsTo(`case ${c}`, record, reference, own);
-    if (record.state === 'not sent') ready++;
+    if (record.state === 'confirmed') ready++;
     // The wallets back to the largest allowance, for the cases that follow.
     for (const who of new Set(quotes.map((q) => q.who))) await rig.write(who, rig.addresses.coin, coin, 'approve', [rig.addresses.positions, MAX]);
   }
@@ -343,12 +375,13 @@ test("a quote where nothing fits, then one that fits: the first at tick 150 with
   const bet: Order = { ...orderOn(rig, bettor, { expiry: T + 25n, oddsTick: 196, riskAmount: 10_000n, ...market }), positionType: 1 };
   const { record, reference, own } = await runCase({ rig, url: url(), hooks: stack.courier.hooks as HookControl }, quotes, bettor, bet);
   holdsTo('nothing fits, then a fit', record, reference, own);
-  assert.equal(record.state, 'not sent', JSON.stringify(record));
+  assert.equal(record.state, 'confirmed', JSON.stringify(record));
   assert.deepEqual(reference.legs.map((l) => l.makerRisk), [10_000n], 'the contract fills the second quote alone, 100 lots');
 });
 
 test("a pay-back the coin refuses: the maker paid back nothing, the amount still held for it; the courier's record names the refused pay-back as the contract records it, and the Cross is ready", async () => {
   const falseStack = await startStack('differential_false', { coin: 'FalseCoin', hooked: true });
+  falseStack.proxy.finalFollows(0n);
   try {
     const r = falseStack.rig;
     const M = await freshAccount(r);
@@ -371,6 +404,7 @@ test("a pay-back the coin refuses: the maker paid back nothing, the amount still
 
 test("a blocked maker with a survivor: the coin refuses the first maker's pull, which the model cannot see; the one-quote probe names it and the one re-walk lists the survivor alone, as the contract fills it; the blocked quote is named in the figures", async () => {
   const refusing = await startStack('differential_refusing', { coin: 'RefusingCoin', hooked: true });
+  refusing.proxy.finalFollows(0n);
   try {
     const r = refusing.rig;
     const [M1, M2] = [await freshAccount(r), await freshAccount(r)];
@@ -419,7 +453,7 @@ test("the skew: one predicted pull changed after selection, funds ample and the 
   }
   const bettor = await freshAccount();
   const b = await postOrder(url(), rig, bettor, 'take', { ...orderOn(rig, bettor, { expiry: (await rig.time()) + 25n, oddsTick: 200, riskAmount: 10_000n, ...market }), positionType: 1 });
-  assert.equal((await judged(b.body.orderHash as string)).state, 'not sent', 'the control');
+  assert.equal((await judged(b.body.orderHash as string)).state, 'confirmed', 'the control');
 });
 
 test("model or coin: a quote cancelled at H, listed as if live by a test's fault, with a survivor behind it and the comparison on: its leg is left unfilled, the one-quote probe names Cancelled and not PullRefused, so it is the courier's fault: COURIER_FAULT with an incident line", async () => {
@@ -478,6 +512,7 @@ test("model or coin, its second form: the same quote cancelled at H and listed a
 
 test("a refused maker ahead of a survivor that then fills more: the coin refuses the first maker's pull (tick 200, room 5,000), and the contract, skipping it, fills the survivor behind it (tick 202, room 10,000) for 98 lots where the walk listed 49. The leg left unfilled goes to the one-quote probe whatever else differs; the probe names PullRefused, and the one re-walk at the same block lists the survivor alone, 9,800 and 9,996, as the contract fills it: the bet is ready, and the refused quote is named in the figures", async () => {
   const refusing = await startStack('differential_refusing_more', { coin: 'RefusingCoin', hooked: true });
+  refusing.proxy.finalFollows(0n);
   try {
     const r = refusing.rig;
     const [M1, M2] = [await freshAccount(r), await freshAccount(r)];
@@ -508,6 +543,7 @@ test("a refused maker ahead of a survivor that then fills more: the coin refuses
 
 test("one maker behind two quotes, its pay-back refused at each visit: the maker, which holds side B (risk 3,000, profit 2,500, held 3,000), quotes twice at tick 204 with 2,400 of room each, and the coin refuses every transfer to it; the bet of 5,000 at tick 196 takes both, 4,992. The contract visits the maker once for each leg and refuses the same 700 at each, so 700 stays held, not 1,400: the courier records 700 refused, the reference counts the two refusals apart, and the Cross is ready", async () => {
   const falseStack = await startStack('differential_false_twice', { coin: 'FalseCoin', hooked: true });
+  falseStack.proxy.finalFollows(0n);
   try {
     const r = falseStack.rig;
     const M = await freshAccount(r);

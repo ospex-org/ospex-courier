@@ -1,10 +1,15 @@
 import { createServer, type Server } from 'node:http';
+import type { Address } from 'viem';
 import { checkNode, type NodeCheck } from './chain/node';
 import { chainId, createJsonRpc, describeNodeFailure, type JsonRpc } from './chain/rpc';
 import { readSet, SetRefused, type BettingSet } from './chain/set';
 import { createChainReader, type ChainReader } from './chain/snapshot';
 import { createLane } from './check/lane';
 import { NO_HOOKS, type LaneHooks } from './check/hooks';
+import { isSealedSend } from './check/precheck';
+import { repairMarks } from './send/marks';
+import { closeByRotation } from './send/operator';
+import { KeystoreRefused, openSigner, type Signer } from './send/signer';
 import { readCourierConfig, type CourierConfig } from './config';
 import { BOUNDS, createAddressLimiter, createCounters, TIMEOUTS } from './http/limits';
 import { createRequestHandler } from './http/service';
@@ -24,9 +29,36 @@ export class StartupRefused extends Error {
   }
 }
 
+/**
+ * The key's two settings and the keystore opened: the signer, or a refusal that names the settings and no value. The
+ * two settings are removed from `env` whatever the opening comes to, a refusal of either setting included, so nothing
+ * later in the process can read them.
+ */
+function openKey(
+  env: Record<string, string | undefined>,
+  at: { address: Address; relay: Address; matching: Address; chainId: bigint; laneNow: () => { epoch: bigint; reservation: bigint } | null; hooks: LaneHooks | undefined },
+): Signer {
+  try {
+    const json = (env.COURIER_KEYSTORE_JSON ?? '').trim();
+    const password = env.COURIER_KEYSTORE_PASSWORD ?? '';
+    const missing = [...(json === '' ? ['COURIER_KEYSTORE_JSON is not set'] : []), ...(password === '' ? ['COURIER_KEYSTORE_PASSWORD is not set'] : [])];
+    if (missing.length > 0) throw new StartupRefused(`settings: ${missing.join('; ')}`);
+    try {
+      return openSigner({ keystoreJson: json, keystorePassword: password, address: at.address, relay: at.relay, matching: at.matching, chainId: at.chainId, isSealed: isSealedSend, laneNow: at.laneNow, ...(at.hooks?.signer === undefined ? {} : { seams: at.hooks.signer }) });
+    } catch (err) {
+      if (!(err instanceof KeystoreRefused)) throw new StartupRefused('the key: COURIER_KEYSTORE_JSON could not be opened');
+      if (err.problem === 'wrong-password') throw new StartupRefused("the key: COURIER_KEYSTORE_PASSWORD does not open COURIER_KEYSTORE_JSON (the keystore's MAC does not match)");
+      if (err.problem === 'not-the-address') throw new StartupRefused('the key: COURIER_KEYSTORE_JSON holds a key whose address is not COURIER_ADDRESS');
+      throw new StartupRefused(`the key: COURIER_KEYSTORE_JSON could not be read as a keystore (${err.message.replace(/^keystore: /, '')})`);
+    }
+  } finally {
+    delete env.COURIER_KEYSTORE_JSON;
+    delete env.COURIER_KEYSTORE_PASSWORD;
+  }
+}
+
 /** What this build does not yet do, published on the status address. */
 export const NOT_YET_BUILT = [
-  'the sender and the key (the sender build): nothing is signed or sent; a bet found ready is closed not sent',
   'incidents and their cursor (the reports build)',
 ] as const;
 
@@ -106,8 +138,21 @@ export async function startService(env: Record<string, string | undefined>, opti
 
   // What the node can do, proved, from the key's address. The verdict is kept: while it fails one the pre-check needs,
   // the door takes no order (the node's gate), and it is served on the status address.
-  const node = await checkNode(rpc, { relay: set.relay, sender: config.courierAddress }, now);
+  const node = await checkNode(rpc, { relay: set.relay, sender: config.courierAddress, ...(config.traceCheckTransaction === undefined ? {} : { traceTransaction: config.traceCheckTransaction }) }, now);
   log(`courier: the node ${node.usable ? 'honours' : 'does not honour'} every request the pre-check makes at a block's hash; override ${node.overrideTaken.ok ? 'taken' : 'not taken'}`);
+
+  // The key: its two settings, read here and nowhere else, the keystore opened at once and the key turned into the
+  // signer's account, which is all that is kept. Once it is open the two settings leave this process's environment.
+  // A refusal names the settings and never a value.
+  let signer: Signer;
+  let laneHeld: () => { epoch: bigint; reservation: bigint } | null = () => null;
+  try {
+    signer = openKey(env, { address: config.courierAddress, relay: set.relay, matching: set.matching, chainId: set.chainId, laneNow: () => laneHeld(), hooks: options.hooks });
+  } catch (err) {
+    await store.close().catch(() => undefined);
+    throw err;
+  }
+  log(`courier: the key is open; it signs for ${signer.address} alone`);
 
   // This run.
   const run = await store.runs.start();
@@ -124,8 +169,10 @@ export async function startService(env: Record<string, string | undefined>, opti
     run,
     check: { chain, rpc, set, published, overrideTaken: node.overrideTaken.ok },
     hooks: options.hooks ?? NO_HOOKS,
+    signer,
     log,
   });
+  laneHeld = () => lane.held();
   let taken;
   try {
     taken = await lane.take({ chainId: set.chainId.toString(), entry: set.entryId.toString(), nodeUsable: node.usable });
@@ -134,6 +181,22 @@ export async function startService(env: Record<string, string | undefined>, opti
     throw new StartupRefused(`the lane could not be taken: ${databaseRefusal(err)}`);
   }
   log(`courier: lane ${config.courierAddress} taken at epoch ${taken.epoch}; ${taken.returned.length} held bet${taken.returned.length === 1 ? '' : 's'} back to waiting, ${taken.stopped.length} finished as stopped`);
+
+  // A rotation, read at the final block: a lane whose key is no longer the relay's sender is retired, and never
+  // reserves again; an ordinary hold on it closes with its line. A read that fails retires nothing now.
+  try {
+    const retired = await closeByRotation({ store, rpc, chain, set, run: run.id });
+    if (retired.length > 0) log(`courier: ${retired.length} lane${retired.length === 1 ? '' : 's'} retired: the relay's sender at the final block is another key`);
+  } catch (err) {
+    log(`courier: the read for retired lanes failed (${err instanceof Error ? err.name : typeof err}); none retired now`);
+  }
+  // The marks made at a block not yet final, read again at the take's F.
+  try {
+    const r = await repairMarks({ pool: store.pool, chain, rpc, set }, await chain.finalHeader());
+    if (r.final + r.rewritten + r.lifted + r.stopped > 0) log(`courier: marks read again at the final block: ${r.final} final, ${r.rewritten} written again, ${r.lifted} lifted, ${r.stopped} stopped`);
+  } catch (err) {
+    log(`courier: the marks could not be read again at the start (${err instanceof Error ? err.name : typeof err}); the next read of the final block reads them`);
+  }
 
   const counters = createCounters(now);
   const limiter = createAddressLimiter(BOUNDS.requestsPerAddressPerMinute);

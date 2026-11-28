@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { readFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { after, before, test } from 'node:test';
 import type pg from 'pg';
@@ -865,7 +866,9 @@ test('with the database stopped, the status answers 503 and claims nothing; /rea
     const posted = await postOrder(url, stack.rig, stack.rig.accounts.maker, 'rest', orderOn(stack.rig, stack.rig.accounts.maker, { expiry: T + 600n }));
     assert.equal(posted.status, 503, JSON.stringify(posted.body));
     assert.equal(posted.body.code, 'DATABASE_UNREADABLE');
-    assert.match(String(posted.body.error), /nothing was recorded/);
+    assert.equal(posted.body.error, 'A database or connection failure means this order may or may not have been recorded. Next: read the order by its hash, or post the same signed order again. Do not sign a new bet because an answer failed.', "the door's sentence, whole");
+    const page = readFileSync(new URL('../docs/API.md', import.meta.url), 'utf8');
+    assert.equal(page.split(String(posted.body.error)).length - 1, 1, 'the same sentence, once on the page');
   } finally {
     stack.dbRelay.restore();
   }

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import type pg from 'pg';
 import { applySchema, missingSchema, openPool, TABLES } from '../courier/records/store';
+import { closeEach } from './support/close';
 import { testServer } from './support/database';
 
 // db/schema.sql against a real Postgres: applied twice, the eleven tables, the
@@ -57,10 +58,7 @@ before(async () => {
   pool = openPool(url, null);
 });
 
-after(async () => {
-  await pool.end();
-  await db.end();
-});
+after(() => closeEach(() => pool.end(), () => db.end()));
 
 test('applied again, the schema is the same schema, and nothing is missing', async () => {
   await applySchema(pool);
@@ -152,11 +150,12 @@ test('one bet, one Cross; one transaction hash; one open Cross a lane', async ()
   await insertOrder(HASH('b1'), 'take');
   await insertOrder(HASH('b2'), 'take');
   await insertOrder(HASH('b3'), 'take');
+  // A Cross sent was handed to the node once: its count says so, as the sender's rule of the count by state asks.
   const cross = (bet: string, state: string, tx: string | null) =>
     pool.query(
-      `INSERT INTO crosses (bet_hash, lane, epoch, reservation, block_number, block_hash, block_time, state, tx_hash)
-       VALUES ($1, $2, 1, 1, 100, $3, 1794268800, $4, $5)`,
-      [bet, ADDRESS('9'), HASH('e'), state, tx],
+      `INSERT INTO crosses (bet_hash, lane, epoch, reservation, block_number, block_hash, block_time, state, tx_hash, hand_offs)
+       VALUES ($1, $2, 1, 1, 100, $3, 1794268800, $4, $5, $6)`,
+      [bet, ADDRESS('9'), HASH('e'), state, tx, state === 'sent' ? 1 : 0],
     );
   await cross(HASH('b1'), 'sent', HASH('71'));
   await refused(cross(HASH('b1'), 'intent', null), '23505', 'a second Cross for one bet');
@@ -496,7 +495,7 @@ const BEFORE_THE_LANE = `
 test("lanes and crosses as the schema before the lane made them, and events without the bet's index, are named by the start's probe and brought to this schema by applying it: the columns, the constraints, the index and the sequence read back as a database this schema made by itself; applied again, each new rule is the same constraint; and the rules hold", async () => {
   const fresh = { lanes: await tableShape(pool, 'lanes'), crosses: await tableShape(pool, 'crosses') };
   assert.ok(fresh.lanes.constraints.includes('lanes_reserved_at_with_bet c validated CHECK (((held_bet IS NULL) = (reserved_at IS NULL)))'), fresh.lanes.constraints.join(' | '));
-  assert.ok(fresh.crosses.constraints.includes("crosses_not_sent_reasons c validated CHECK ((not_sent_reason = 'SENDER_NOT_BUILT'::text))"), fresh.crosses.constraints.join(' | '));
+  assert.ok(fresh.crosses.constraints.includes("crosses_not_sent_reasons c validated CHECK ((not_sent_reason = ANY (ARRAY['STOPPED_AT_GATE'::text, 'COURIER_RESTARTED'::text, 'NODE_REFUSED'::text])))"), fresh.crosses.constraints.join(' | '));
   assert.ok(fresh.crosses.constraints.includes("crosses_not_sent_with_reason c validated CHECK (((state = 'not sent'::text) = (not_sent_reason IS NOT NULL)))"), fresh.crosses.constraints.join(' | '));
   const name = await db.createDatabase('lane_before');
   const older = openPool(db.urlFor(name), null);
@@ -529,9 +528,9 @@ test("lanes and crosses as the schema before the lane made them, and events with
         [HASH('b1'), ADDRESS('c'), HASH('d'), state, reason],
       );
     await refused(cross('not sent', null), '23514', 'a Cross not sent has its reason');
-    await refused(cross('intent', 'SENDER_NOT_BUILT'), '23514', 'only a Cross not sent has a reason');
+    await refused(cross('intent', 'COURIER_RESTARTED'), '23514', 'only a Cross not sent has a reason');
     await refused(cross('not sent', 'THE_NODE_SAID_NO'), '23514', 'a reason this build does not have');
-    await cross('not sent', 'SENDER_NOT_BUILT');
+    await cross('not sent', 'COURIER_RESTARTED');
     const checked = await older.query<{ checked: unknown }>('SELECT checked FROM crosses WHERE bet_hash = $1', [HASH('b1')]);
     assert.deepEqual(checked.rows[0]?.checked, {}, 'the figures start empty');
   } finally {
@@ -543,4 +542,152 @@ test('the courier\'s own budget row and an account\'s both fit the accounts tabl
   await pool.query("INSERT INTO accounts (account, budget) VALUES ('courier', 2400)");
   await pool.query('INSERT INTO accounts (account, budget) VALUES ($1, 240)', [ADDRESS('a')]);
   await refused(pool.query("INSERT INTO accounts (account, budget) VALUES ('maker', 240)"), '23514', 'a name that is not an address');
+});
+
+// ──────────────────────────── the sender's schema ────────────────────────────
+
+/** The sender's rules and indexes, by the catalog's own identity: what a drop and an add again would change. */
+async function senderRules(on: pg.Pool): Promise<Array<{ name: string; oid: string; definition: string }>> {
+  const { rows } = await on.query<{ name: string; oid: string; definition: string }>(
+    `SELECT c.conname AS name, c.oid::text AS oid, pg_get_constraintdef(c.oid) AS definition FROM pg_constraint c
+     WHERE c.conname IN ('crosses_not_sent_reasons', 'crosses_hash_once_signed', 'crosses_hand_offs_by_state', 'crosses_revert_evidence_check',
+       'crosses_revert_data_check', 'lanes_watermark_anchored', 'lanes_verified_block_hash_check', 'lanes_shut_line_fkey')
+     UNION ALL
+     SELECT i.relname, i.oid::text, pg_get_indexdef(i.oid) FROM pg_class i WHERE i.relkind = 'i' AND i.relname IN ('crosses_sender_nonce', 'orders_marks_not_final')`,
+  );
+  return [...rows].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+/** The sender's columns, as a table made before them lacks them. */
+const BEFORE_THE_SENDER = `
+  ALTER TABLE crosses DROP COLUMN intent_at, DROP COLUMN signed_at, DROP COLUMN gate_at, DROP COLUMN answered_at, DROP COLUMN receipt_seen_at,
+    DROP COLUMN outcome_at, DROP COLUMN gas_used, DROP COLUMN effective_gas_price, DROP COLUMN revert_evidence, DROP COLUMN revert_data,
+    DROP COLUMN replaced_by_ours, DROP COLUMN recorded;
+  ALTER TABLE lanes DROP COLUMN shut_line, DROP COLUMN verified_nonce_to, DROP COLUMN verified_block_number, DROP COLUMN verified_block_hash;
+  ALTER TABLE orders DROP COLUMN ended_final;`;
+
+test("the sender's columns, rules and indexes: applied again, each is the same, by its oid; a table made before them is named column by column by the start's probe and brought to this schema by applying it", async () => {
+  const rules = await senderRules(pool);
+  assert.deepEqual(rules.map((r) => r.name), ['crosses_hand_offs_by_state', 'crosses_hash_once_signed', 'crosses_not_sent_reasons', 'crosses_revert_data_check', 'crosses_revert_evidence_check', 'crosses_sender_nonce', 'lanes_shut_line_fkey', 'lanes_verified_block_hash_check', 'lanes_watermark_anchored', 'orders_marks_not_final']);
+  assert.match((rules.find((r) => r.name === 'crosses_not_sent_reasons') as { definition: string }).definition, /STOPPED_AT_GATE.*COURIER_RESTARTED.*NODE_REFUSED/);
+  assert.match((rules.find((r) => r.name === 'orders_marks_not_final') as { definition: string }).definition, /\(ended_block\) WHERE \(\(ended_block IS NOT NULL\) AND \(NOT ended_final\)\)$/);
+  assert.match((rules.find((r) => r.name === 'crosses_sender_nonce') as { definition: string }).definition, /\(sender, nonce\) WHERE \(nonce IS NOT NULL\)$/);
+  await applySchema(pool);
+  assert.deepEqual(await senderRules(pool), rules, 'nothing dropped, nothing added again');
+  const options = await pool.query<{ reloptions: string[] }>(`SELECT reloptions FROM pg_class WHERE relname = 'crosses' AND relkind = 'r'`);
+  assert.deepEqual([...(options.rows[0]?.reloptions ?? [])].sort(), ['autovacuum_analyze_scale_factor=0', 'autovacuum_analyze_threshold=2000', 'autovacuum_vacuum_scale_factor=0', 'autovacuum_vacuum_threshold=2000', 'vacuum_index_cleanup=on'], "the orders table's maintenance");
+
+  const name = await db.createDatabase('sender_before');
+  const older = openPool(db.urlFor(name), null);
+  try {
+    await applySchema(older);
+    const fresh = { lanes: await tableShape(older, 'lanes'), crosses: await tableShape(older, 'crosses'), orders: await tableShape(older, 'orders') };
+    await older.query(BEFORE_THE_SENDER);
+    assert.deepEqual((await missingSchema(older)).sort(), [
+      'crosses.answered_at', 'crosses.effective_gas_price', 'crosses.gas_used', 'crosses.gate_at', 'crosses.intent_at', 'crosses.outcome_at', 'crosses.receipt_seen_at',
+      'crosses.recorded', 'crosses.replaced_by_ours', 'crosses.revert_data', 'crosses.revert_evidence', 'crosses.signed_at',
+      'lanes.shut_line', 'lanes.verified_block_hash', 'lanes.verified_block_number', 'lanes.verified_nonce_to', 'orders.ended_final',
+    ]);
+    await applySchema(older);
+    assert.deepEqual(await missingSchema(older), []);
+    assert.deepEqual({ lanes: await tableShape(older, 'lanes'), crosses: await tableShape(older, 'crosses'), orders: await tableShape(older, 'orders') }, fresh, 'brought to this shape');
+  } finally {
+    await older.end();
+  }
+});
+
+test("a crosses table of the earlier build, its check of the one reason standing, takes the sender's three by applying the schema, once; with a Cross closed not sent for that reason the apply is refused with the count and changes nothing", async () => {
+  const name = await db.createDatabase('sender_reasons');
+  const older = openPool(db.urlFor(name), null);
+  try {
+    await applySchema(older);
+    // The earlier build's check, under its name.
+    await older.query(`ALTER TABLE crosses DROP CONSTRAINT crosses_not_sent_reasons; ALTER TABLE crosses ADD CONSTRAINT crosses_not_sent_reasons CHECK (not_sent_reason IN ('SENDER_NOT_BUILT'))`);
+    const run = Number((await older.query<{ id: string }>('INSERT INTO runs DEFAULT VALUES RETURNING id')).rows[0]?.id);
+    await older.query('INSERT INTO lanes (sender, epoch, owner_run) VALUES ($1, 1, $2)', [ADDRESS('9'), run]);
+    await insertOrder(HASH('c1'), 'take', { bet_state: 'sent' }, older);
+    await older.query(
+      `INSERT INTO crosses (bet_hash, lane, epoch, reservation, block_number, block_hash, block_time, state, hand_offs, not_sent_reason) VALUES ($1, $2, 1, 1, 1, $3, 1, 'not sent', 0, 'SENDER_NOT_BUILT')`,
+      [HASH('c1'), ADDRESS('9'), HASH('d')],
+    );
+    const earlier = await older.query<{ def: string }>(`SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname = 'crosses_not_sent_reasons'`);
+    await assert.rejects(applySchema(older), (err: unknown) => {
+      assert.equal((err as { code?: string }).code, '23514', String(err));
+      assert.match((err as Error).message, /holds 1 Cross rows closed not sent for SENDER_NOT_BUILT/);
+      return true;
+    });
+    const after_ = await older.query<{ def: string }>(`SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname = 'crosses_not_sent_reasons'`);
+    assert.deepEqual(after_.rows, earlier.rows, 'refused, and nothing changed');
+    assert.equal(Number((await older.query<{ n: number }>(`SELECT count(*)::int AS n FROM crosses WHERE not_sent_reason = 'SENDER_NOT_BUILT'`)).rows[0]?.n), 1, 'the row stands as it was');
+    // With no such row, the apply takes the three reasons; applied again, the check is the one it made.
+    await older.query('DELETE FROM legs; DELETE FROM crosses');
+    await applySchema(older);
+    const three = await older.query<{ oid: string; def: string }>(`SELECT oid::text AS oid, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname = 'crosses_not_sent_reasons'`);
+    assert.match(three.rows[0]?.def ?? '', /STOPPED_AT_GATE.*COURIER_RESTARTED.*NODE_REFUSED/);
+    await applySchema(older);
+    const again = await older.query<{ oid: string; def: string }>(`SELECT oid::text AS oid, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname = 'crosses_not_sent_reasons'`);
+    assert.deepEqual(again.rows, three.rows, 'taken as it stands');
+  } finally {
+    await older.end();
+  }
+});
+
+test("the sender's rules hold, each refusal beside a row that is taken: the transaction's hash from the signed record on, the hand-off count by state, a revert's evidence and its bytes, the watermark and its anchor, the line that shuts a lane, and a mark's place among the marks still to be read again", async () => {
+  const run = Number((await pool.query<{ id: string }>('INSERT INTO runs DEFAULT VALUES RETURNING id')).rows[0]?.id);
+  let n = 0;
+  const lane = () => ADDRESS(`5${(++n).toString(16)}`);
+  // Each Cross on a lane of its own, since a lane holds one open Cross.
+  const cross = async (fields: Record<string, unknown>) => {
+    const sender = lane();
+    const bet = HASH(`d${n.toString(16)}`);
+    await pool.query('INSERT INTO lanes (sender, epoch, owner_run) VALUES ($1, 1, $2)', [sender, run]);
+    await insertOrder(bet, 'take', { bet_state: 'sent' });
+    const row: Record<string, unknown> = { bet_hash: bet, lane: sender, epoch: 1, reservation: 1, block_number: 1, block_hash: HASH('e'), block_time: 1, ...fields };
+    const cols = Object.keys(row);
+    return pool.query(`INSERT INTO crosses (${cols.join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')})`, Object.values(row));
+  };
+  const tx = (seed: string) => HASH(`ab${seed}`);
+  // The hash: required from the signed record on; not for the intent, a Cross closed not sent, or a restored intent closed expired unmined.
+  await refused(cross({ state: 'signed', hand_offs: 0 }), '23514', 'a signed record with no hash');
+  await cross({ state: 'signed', hand_offs: 0, tx_hash: tx('1') });
+  await refused(cross({ state: 'confirmed', hand_offs: 1 }), '23514', 'an outcome with no hash');
+  await cross({ state: 'intent', hand_offs: 0 });
+  await cross({ state: 'not sent', hand_offs: 0, not_sent_reason: 'COURIER_RESTARTED' });
+  await cross({ state: 'expired unmined', hand_offs: 0 });
+  // The count: none before the gate; one handing off, sent or unknown, and for the node's refusal; none for the gate's stop or a restart.
+  await refused(cross({ state: 'intent', hand_offs: 1 }), '23514', 'an intent handed off');
+  await refused(cross({ state: 'handing off', hand_offs: 0, tx_hash: tx('2') }), '23514', 'handing off, never handed');
+  await cross({ state: 'handing off', hand_offs: 1, tx_hash: tx('3') });
+  await refused(cross({ state: 'sent', hand_offs: 0, tx_hash: tx('4') }), '23514', 'sent, never handed');
+  await cross({ state: 'unknown', hand_offs: 1, tx_hash: tx('5') });
+  await refused(cross({ state: 'not sent', hand_offs: 0, not_sent_reason: 'NODE_REFUSED', tx_hash: tx('6') }), '23514', 'the reserved NODE_REFUSED value requires one recorded hand-off');
+  await cross({ state: 'not sent', hand_offs: 1, not_sent_reason: 'NODE_REFUSED', tx_hash: tx('7') });
+  await refused(cross({ state: 'not sent', hand_offs: 1, not_sent_reason: 'STOPPED_AT_GATE', tx_hash: tx('8') }), '23514', 'the gate stopped what it handed on');
+  await cross({ state: 'not sent', hand_offs: 0, not_sent_reason: 'STOPPED_AT_GATE', tx_hash: tx('9') });
+  // A final state holds either: a restored Cross settled later keeps the count its copy kept.
+  await cross({ state: 'confirmed', hand_offs: 0, tx_hash: tx('a') });
+  await cross({ state: 'confirmed', hand_offs: 1, tx_hash: tx('b') });
+  await refused(cross({ state: 'not sent', hand_offs: 0, not_sent_reason: 'SENDER_NOT_BUILT' }), '23514', 'the earlier build\'s reason');
+  // A revert's evidence and its bytes.
+  await refused(cross({ state: 'reverted', hand_offs: 1, tx_hash: tx('c'), revert_evidence: 'replay' }), '23514', 'a reason from a replay');
+  await refused(cross({ state: 'reverted', hand_offs: 1, tx_hash: tx('d'), revert_data: '0xABCD' }), '23514', 'bytes not lower-case hex');
+  await refused(cross({ state: 'reverted', hand_offs: 1, tx_hash: tx('e'), revert_data: `0x${'ab'.repeat(16_385)}` }), '23514', 'bytes past 32,768 hex digits');
+  await cross({ state: 'reverted', hand_offs: 1, tx_hash: tx('f'), revert_evidence: 'trace', revert_data: `0x${'ab'.repeat(16_384)}` });
+  await cross({ state: 'reverted', hand_offs: 1, tx_hash: tx('10'), revert_evidence: 'unavailable' });
+  // The watermark: explained nonces carry their anchor, whole.
+  const sender = lane();
+  await pool.query('INSERT INTO lanes (sender, epoch, owner_run) VALUES ($1, 1, $2)', [sender, run]);
+  await refused(pool.query('UPDATE lanes SET verified_nonce_to = 3 WHERE sender = $1', [sender]), '23514', 'a watermark with no anchor');
+  await refused(pool.query('UPDATE lanes SET verified_nonce_to = 3, verified_block_number = 9 WHERE sender = $1', [sender]), '23514', 'an anchor with no hash');
+  await pool.query('UPDATE lanes SET verified_nonce_to = 3, verified_block_number = 9, verified_block_hash = $2 WHERE sender = $1', [sender, HASH('f')]);
+  // The line that shuts a lane is a line of the records.
+  await refused(pool.query('UPDATE lanes SET shut_line = 987654321 WHERE sender = $1', [sender]), '23503', 'a line the records do not hold');
+  const line = Number((await pool.query<{ number: string }>("INSERT INTO events (run, kind, reason) VALUES ($1, 'condition opened', 'cross-unreconciled') RETURNING number", [run])).rows[0]?.number);
+  await pool.query('UPDATE lanes SET shut_line = $2 WHERE sender = $1', [sender, line]);
+  // A mark made at a block not yet final is among those to be read again; once final, it is not.
+  await insertOrder(HASH('ad'), 'rest', { ended: 'cancelled', ended_at: new Date(), ended_block: '41', ended_block_hash: HASH('b') });
+  const waiting = async () => (await pool.query<{ hash: string }>('SELECT hash FROM orders WHERE ended_block IS NOT NULL AND NOT ended_final AND hash = $1', [HASH('ad')])).rows.length;
+  assert.equal(await waiting(), 1, 'written false by default');
+  await pool.query('UPDATE orders SET ended_final = true WHERE hash = $1', [HASH('ad')]);
+  assert.equal(await waiting(), 0);
 });

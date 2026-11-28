@@ -8,9 +8,11 @@ import {
   ExecutionReverted,
   headerByNumber,
   headerByTag,
+  maxPriorityFee,
   multicallAt,
   NodeFailure,
   storageAt,
+  traceOf,
   transactionCountAt,
   type Header,
   type JsonRpc,
@@ -29,9 +31,13 @@ import {
 // hashes of two different times, a call that succeeds while the block's time is
 // under the later block's and is refused from that second on: the call, its
 // estimate and the call at the estimated limit, each at the same hash, so a
-// node that runs a call named by a hash at another block's time is seen. The
-// verdicts are on the status address; while one the pre-check needs fails, the
-// door takes no order.
+// node that runs a call named by a hash at another block's time is seen. For the
+// sender it holds the latest block to its base fee and the node to a suggested
+// tip, and where a setting names a transaction of the chain that reverted, it
+// traces that transaction with the call tracer, to an output. The verdicts are
+// on the status address; while one the pre-check or the sender needs fails, the
+// door takes no order. The trace is not one of them: a node that cannot trace
+// leaves the reasons of reverted Crosses unavailable, and refuses nothing.
 
 export interface Outcome {
   ok: boolean;
@@ -60,7 +66,17 @@ export interface NodeCheck {
   timedCall: Outcome;
   /** Whether the node answers the finalized tag with a block at or under the latest. */
   finalized: Outcome;
-  /** Every request the pre-check needs held, at both hashes and refused at the unknown one; the relay's slot is its sender; the timed call ran at each block's time; and finalized answered. An override is not needed: without one the comparison is skipped. */
+  /** Whether the latest block carries its base fee: the fee cap the sender signs is set from it. */
+  baseFee: Outcome;
+  /** Whether the node suggests a tip: eth_maxPriorityFeePerGas answers a quantity. */
+  tip: Outcome;
+  /**
+   * Whether the node traces a mined transaction with the call tracer to an output: tried on the transaction the
+   * setting TRACE_CHECK_TRANSACTION names, a transaction of the chain that reverted; not tried without one. A node
+   * that cannot trace is not refused: the reasons of reverted Crosses read unavailable.
+   */
+  trace: Outcome & { tried: boolean };
+  /** Every request the pre-check needs held, at both hashes and refused at the unknown one; the relay's slot is its sender; the timed call ran at each block's time; finalized answered; and the base fee and the tip are there. An override is not needed: without one the comparison is skipped. The trace is not needed either. */
   usable: boolean;
 }
 
@@ -103,6 +119,8 @@ export interface NodeCheckTargets {
   relay: Address;
   /** The address the calls are made from and whose transaction count is read: COURIER_ADDRESS, the key's address. */
   sender: Address;
+  /** A mined transaction of the chain that reverted, which the trace is tried on: TRACE_CHECK_TRANSACTION. None: the trace is not tried. */
+  traceTransaction?: Hex;
 }
 
 /**
@@ -124,7 +142,7 @@ export async function checkNode(rpc: JsonRpc, targets: NodeCheckTargets, now: ()
     latest = await headerByTag(rpc, 'latest');
   } catch (err) {
     const saw = failed(err);
-    return { checkedAt, latest: null, back: null, verdicts: [], relaySenderSlot: saw, overrideTaken: saw, timedCall: saw, finalized: saw, usable: false };
+    return { checkedAt, latest: null, back: null, verdicts: [], relaySenderSlot: saw, overrideTaken: saw, timedCall: saw, finalized: saw, baseFee: saw, tip: saw, trace: { ...saw, tried: false }, usable: false };
   }
   const backNumber = latest.number >= BLOCKS_BACK ? latest.number - BLOCKS_BACK : 0n;
   let back: Header | null = null;
@@ -167,8 +185,8 @@ export async function checkNode(rpc: JsonRpc, targets: NodeCheckTargets, now: ()
     ),
   );
 
-  // The exact call, from the sender to the relay. This build holds no key and signs nothing, so the call is the
-  // relay's own read of its sender: the method and the block parameter are the same ones the Cross's call uses.
+  // The exact call, from the sender to the relay. The check signs nothing, so the call is the relay's own read of
+  // its sender: the method and the block parameter are the same ones the Cross's call uses.
   verdicts.push(
     await three(
       'eth_call from the sender to the relay',
@@ -243,13 +261,29 @@ export async function checkNode(rpc: JsonRpc, targets: NodeCheckTargets, now: ()
     }
   })();
 
-  // The finalized tag: a block at or under the latest.
+  // The finalized tag: a block at or under a latest header read after it, so that a check slowed past blocks does not
+  // hold a later final block to an earlier head.
   const finalized = await expectAnswer(
-    () => headerByTag(rpc, 'finalized'),
-    (h) => (h.number <= latest.number ? null : `finalized (${h.number}) is above latest (${latest.number})`),
+    async () => {
+      const final = await headerByTag(rpc, 'finalized');
+      return { final, after: await headerByTag(rpc, 'latest') };
+    },
+    ({ final, after }) => (final.number <= after.number ? null : `finalized (${final.number}) is above latest (${after.number})`),
   );
 
-  const usable = verdicts.every((v) => v.atLatest.ok && v.atBlockBack.ok && v.atUnknownHash.ok) && relaySenderSlot.ok && timedCall.ok && finalized.ok;
+  // The base fee of the latest block, which the sender's fee cap is set from.
+  const baseFee: Outcome = latest.baseFee === undefined ? { ok: false, saw: 'the latest block carries no base fee' } : { ok: true, saw: 'answered as expected' };
+
+  // The tip the node suggests.
+  const tip = await expectAnswer(() => maxPriorityFee(rpc), () => null);
+
+  // The trace of a transaction of the chain that reverted, where one is named: an output from the top call.
+  const trace: NodeCheck['trace'] =
+    targets.traceTransaction === undefined
+      ? { ok: false, saw: 'not tried: no transaction is named to trace', tried: false }
+      : { ...(await expectAnswer(() => traceOf(rpc, targets.traceTransaction as Hex), (t) => (t.output === null || t.output === '0x' ? 'the trace holds no output' : null))), tried: true };
+
+  const usable = verdicts.every((v) => v.atLatest.ok && v.atBlockBack.ok && v.atUnknownHash.ok) && relaySenderSlot.ok && timedCall.ok && finalized.ok && baseFee.ok && tip.ok;
   return {
     checkedAt,
     latest: { number: latest.number.toString(), hash: latest.hash },
@@ -259,6 +293,9 @@ export async function checkNode(rpc: JsonRpc, targets: NodeCheckTargets, now: ()
     overrideTaken,
     timedCall,
     finalized,
+    baseFee,
+    tip,
+    trace,
     usable,
   };
 }

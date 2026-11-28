@@ -60,8 +60,10 @@ export interface Rig {
     timelockKey: HDAccount;
     maker: HDAccount;
     taker: HDAccount;
-    /** The relay's first sender: an address with no key in this build's courier. */
+    /** The relay's first sender: the courier's key, account 4 of the local chain's published test accounts. */
     sender: HDAccount;
+    /** Another courier's sender: the key of a second relay the funded accounts register, for the tests' own Crosses. */
+    otherSender: HDAccount;
     creator: HDAccount;
     stranger: HDAccount;
   };
@@ -78,6 +80,8 @@ export interface Rig {
     spread: Address;
     total: Address;
     relay: Address;
+    /** Another courier's relay: the tests send their own Crosses through it, so the courier's key sends only its own. */
+    otherRelay: Address;
     signpost: Address;
   };
   /** The betting entry's number on the signpost. */
@@ -160,8 +164,11 @@ async function startAnvil(genesisTime?: bigint): Promise<ChainProcess> {
 /**
  * Starts the rig. `genesisTime` starts the chain's clock at that second instead of the wall clock's: a chain a day
  * behind the wall clock is made so, since a running chain's time never goes back. `coin` chooses the set's coin.
+ * `blockTime` puts the chain on a clock once the set is deployed and the accounts funded: a block every that many
+ * seconds, with its pool open, so a transaction waits for the next block and a test can place one of its own, at a
+ * higher tip, before another in the same block. Without it every transaction is mined at once, in a block of its own.
  */
-export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin' | 'RefusingCoin' | 'FalseCoin' } = {}): Promise<Rig> {
+export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin' | 'RefusingCoin' | 'FalseCoin'; blockTime?: number } = {}): Promise<Rig> {
   const anvil = await startAnvil(options.genesisTime);
   const url = `http://127.0.0.1:${anvil.port}`;
   const transport = http(url, { retryCount: 0 });
@@ -176,6 +183,7 @@ export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin
     sender: account(4),
     creator: account(5),
     stranger: account(6),
+    otherSender: account(7),
   };
   const wallet = (who: HDAccount) => createWalletClient({ account: who, chain, transport });
   const rpc = async (method: string, params: unknown[]): Promise<unknown> => {
@@ -241,8 +249,9 @@ export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin
   await write(accounts.deployer, core, coreAbi, 'bootstrapModules', [types, [markets, positions, matching, moneyline, spread, total]]);
   await write(accounts.deployer, core, coreAbi, 'finalize');
 
-  // The relay, with its first sender.
+  // The relay, with its first sender; and another courier's, with a sender of its own.
   const relay = await deploy(accounts.deployer, 'OspexCourierRelay.sol', 'OspexCourierRelay', [matching, accounts.sender.address]);
+  const otherRelay = await deploy(accounts.deployer, 'OspexCourierRelay.sol', 'OspexCourierRelay', [matching, accounts.otherSender.address]);
 
   // The signpost: the games set is its first entry, written by the constructor; the betting set is added through
   // the timelock, as a set is listed live.
@@ -274,6 +283,7 @@ export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin
     await write(accounts.deployer, coin, coinAbi, 'mint', [who.address, PURSE]);
     await write(who, coin, coinAbi, 'approve', [positions, 2n ** 256n - 1n]);
     await write(who, matching, matchingAbi, 'registerCourier', [relay]);
+    await write(who, matching, matchingAbi, 'registerCourier', [otherRelay]);
   };
   for (const who of [accounts.maker, accounts.taker]) await fund(who);
   await write(accounts.deployer, coin, coinAbi, 'mint', [accounts.creator.address, PURSE]);
@@ -305,12 +315,18 @@ export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin
   // the head: the node check's timed call needs two blocks of two times.
   await rpc('anvil_mine', ['0x3c', '0x1']);
 
+  // The clock, where one is asked for: from here a block every `blockTime` seconds, and no block for a transaction alone.
+  if (options.blockTime !== undefined) {
+    await rpc('evm_setAutomine', [false]);
+    await rpc('evm_setIntervalMining', [options.blockTime]);
+  }
+
   return {
     url,
     anvil,
     publicClient,
     accounts,
-    addresses: { timelock, coin, reporter, games, core, markets, positions, matching, moneyline, spread, total, relay, signpost },
+    addresses: { timelock, coin, reporter, games, core, markets, positions, matching, moneyline, spread, total, relay, otherRelay, signpost },
     bettingEntryId,
     gameId,
     abis,
@@ -339,11 +355,19 @@ export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin
     },
     createGame,
     async close() {
-      anvil.process.kill();
+      const child = anvil.process;
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      // The chain's process is held from here until it has exited, and the wait's own timer too: a file's close goes
+      // on to drop its database after this, and a test process with nothing else left to wait on would otherwise end
+      // first, with the close never finished and the database left behind.
+      child.ref();
       await new Promise<void>((resolve) => {
-        if (anvil.process.exitCode !== null) return resolve();
-        anvil.process.once('exit', () => resolve());
-        setTimeout(resolve, 2_000).unref();
+        const timer = setTimeout(resolve, 2_000);
+        child.once('exit', () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        child.kill();
       });
     },
   };

@@ -12,9 +12,12 @@
     "start": "node --import tsx courier/server.ts",
     "db:apply": "node --import tsx scripts/apply-schema.ts",
     "check:node": "node --import tsx scripts/check-node.ts",
+    "operator": "node --import tsx scripts/operator.ts",
     "typecheck": "tsc --noEmit",
     "build:contracts": "cd contracts && forge build --skip test",
-    "test": "tsx --test --test-timeout=600000 tests/config.test.ts tests/limits.test.ts tests/schema.test.ts tests/sql.test.ts tests/store.test.ts tests/abi.test.ts tests/rig.test.ts tests/node.test.ts tests/status.test.ts tests/orders.test.ts tests/stops.test.ts tests/book.test.ts tests/budgets.test.ts tests/burst.test.ts tests/cost.test.ts tests/precheck.test.ts tests/lane.test.ts tests/differential.test.ts"
+    "test": "yarn test:main && yarn test:cost",
+    "test:main": "tsx --test --test-timeout=600000 tests/config.test.ts tests/limits.test.ts tests/schema.test.ts tests/sql.test.ts tests/store.test.ts tests/abi.test.ts tests/rig.test.ts tests/harness.test.ts tests/client.test.ts tests/signer.test.ts tests/nonce.test.ts tests/wire.test.ts tests/node.test.ts tests/status.test.ts tests/orders.test.ts tests/stops.test.ts tests/book.test.ts tests/budgets.test.ts tests/burst.test.ts tests/cost-candidates.test.ts tests/precheck.test.ts tests/lane.test.ts tests/differential.test.ts tests/sender.test.ts tests/sendonce.test.ts tests/sendonce-two.test.ts tests/sendonce-named.test.ts tests/sendonce-named-two.test.ts tests/restore.test.ts tests/rotation.test.ts tests/marks.test.ts tests/outcome.test.ts tests/receipts.test.ts tests/userside.test.ts tests/lane-measured.test.ts tests/keyuse.test.ts tests/named-refused-1.test.ts tests/named-refused-2.test.ts tests/named-accepted-1.test.ts tests/named-accepted-2.test.ts tests/named-ends.test.ts tests/named-walk.test.ts tests/named-sides.test.ts",
+    "test:cost": "tsx --test --test-timeout=600000 --test-concurrency=1 tests/cost.test.ts tests/cost-sender.test.ts tests/cost-sent.test.ts tests/cost-sent-ended.test.ts"
   },
   "dependencies": {
     "pg": "8.23.0",
