@@ -130,10 +130,13 @@ async function freePort(): Promise<number> {
   });
 }
 
-async function startAnvil(genesisTime?: bigint): Promise<ChainProcess> {
+async function startAnvil(genesisTime?: bigint, keptStates?: number): Promise<ChainProcess> {
   const port = await freePort();
   const at = genesisTime === undefined ? [] : ['--timestamp', genesisTime.toString()];
-  const child = spawn('anvil', ['--port', String(port), '--host', '127.0.0.1', '--chain-id', String(CHAIN_ID), '--silent', ...at], {
+  // A chain that keeps only its latest states: its blocks and receipts are all kept, and so is the state at each of
+  // the latest blocks, the number given; it mines tens of thousands of empty blocks about twice as fast.
+  const kept = keptStates === undefined ? [] : ['--prune-history', String(keptStates)];
+  const child = spawn('anvil', ['--port', String(port), '--host', '127.0.0.1', '--chain-id', String(CHAIN_ID), '--silent', ...at, ...kept], {
     stdio: 'ignore',
     env: { ...process.env, FOUNDRY_DISABLE_NIGHTLY_WARNING: '1' },
   });
@@ -167,9 +170,11 @@ async function startAnvil(genesisTime?: bigint): Promise<ChainProcess> {
  * `blockTime` puts the chain on a clock once the set is deployed and the accounts funded: a block every that many
  * seconds, with its pool open, so a transaction waits for the next block and a test can place one of its own, at a
  * higher tip, before another in the same block. Without it every transaction is mined at once, in a block of its own.
+ * `keptStates` keeps the state at only that many of the latest blocks, every block and receipt still kept: for a chain
+ * that must grow by a day of blocks inside a test's time.
  */
-export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin' | 'RefusingCoin' | 'FalseCoin'; blockTime?: number } = {}): Promise<Rig> {
-  const anvil = await startAnvil(options.genesisTime);
+export async function startRig(options: { genesisTime?: bigint; coin?: 'TestCoin' | 'RefusingCoin' | 'FalseCoin'; blockTime?: number; keptStates?: number } = {}): Promise<Rig> {
+  const anvil = await startAnvil(options.genesisTime, options.keptStates);
   const url = `http://127.0.0.1:${anvil.port}`;
   const transport = http(url, { retryCount: 0 });
   const chain = { id: CHAIN_ID, name: 'rig', nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [url] } } } as const;
