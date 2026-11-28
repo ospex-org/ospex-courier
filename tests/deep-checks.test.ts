@@ -228,3 +228,44 @@ test("a count below a watermark whose deep anchor the chain does bear out: the a
   const sent = await oneCent(stack, pool, B, game);
   assert.equal(sent.cross.state, 'confirmed', JSON.stringify(sent.cross));
 });
+
+test("a deep header the node refuses on both of the reader's attempts, with words of its own: the bet is refused as the chain unreachable, with nothing signed; the node's words reach no line of the courier's, no row of its records and no answer it serves; the node answering again, the next bet fills once", async () => {
+  await earlierThenQuiet();
+  const head = await headNow();
+  const WORDS = 'planted-node-words at http://node.example.test/planted-path';
+  let refused = 0;
+  stack.proxy.rule('eth_getBlockByNumber', {
+    kind: 'refuseIf',
+    refuse: (p) => typeof p[0] === 'string' && /^0x[0-9a-fA-F]+$/.test(p[0]) && BigInt(p[0]) + 260n < head && (refused++, true),
+    code: -32000,
+    message: WORDS,
+  });
+  const signedBefore = hooks().signed.length;
+  let bet = '';
+  try {
+    const { game, B } = await market();
+    const T = await stack.rig.time();
+    const b: Order = { ...orderOn(stack.rig, B, { expiry: T + 30n, oddsTick: 196, riskAmount: 10_000n, gameId: game }), positionType: 1 };
+    const posted = await postOrder(stack.courier.url, stack.rig, B, 'take', b, { 'x-forwarded-for': '198.18.246.5' });
+    assert.equal(posted.status, 202, JSON.stringify(posted.body));
+    bet = String(posted.body.orderHash).toLowerCase();
+    const end = await until(stack, async () => (await pool.query<{ bet_state: string }>('SELECT bet_state FROM orders WHERE hash = $1', [bet])).rows[0]?.bet_state, (s) => s === 'refused' || s === 'lapsed', 60_000, 'the bet at its end');
+    assert.equal(end, 'refused');
+    assert.ok(refused >= 2, `the deep header refused on both attempts: ${refused}`);
+    const line = await pool.query<{ reason: string; facts: Record<string, unknown> }>(`SELECT reason, facts FROM events WHERE bet_hash = $1 AND kind = 'bet refused'`, [bet]);
+    assert.equal(line.rows[0]?.reason, 'CHAIN_UNREACHABLE', JSON.stringify(line.rows));
+    assert.equal(hooks().signed.length, signedBefore, 'nothing signed');
+  } finally {
+    stack.proxy.rule('eth_getBlockByNumber', null);
+  }
+  const rows = await pool.query<{ t: string }>(`SELECT coalesce(string_agg(e.facts::text || ' ' || coalesce(e.reason, ''), ' '), '') AS t FROM events e`);
+  const conditions = await pool.query<{ t: string }>(`SELECT coalesce(string_agg(row_to_json(c)::text, ' '), '') AS t FROM conditions c`);
+  const served = await fetch(`${stack.courier.url}/v1/orders/${bet}`).then((r) => r.text());
+  const status = await fetch(`${stack.courier.url}/v1/status`).then((r) => r.text());
+  for (const [where, text] of [['the lines', stack.courier.lines.join('\n')], ['the events', rows.rows[0]?.t ?? ''], ['the conditions', conditions.rows[0]?.t ?? ''], ["the bet's record", served], ['the status', status]] as const) {
+    assert.ok(!/planted/.test(text), `the node's words in ${where}`);
+  }
+  const { game, B } = await market();
+  const sent = await oneCent(stack, pool, B, game);
+  assert.equal(sent.cross.state, 'confirmed', JSON.stringify(sent.cross));
+});
